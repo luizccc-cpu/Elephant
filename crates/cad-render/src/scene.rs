@@ -105,18 +105,50 @@ impl RenderScene {
         scene
     }
 
-    /// Append live rubber-band preview geometry and optional OSnap crosshair marker.
+    /// Append live rubber-band / parametric preview geometry and optional OSnap crosshair marker.
     pub fn push_preview(&mut self, previews: &[Geometry], snap_point: Option<DVec3>) {
         let preview_color = [0.25, 0.85, 1.0, 1.0];
+        let shaded_preview = [0.20, 0.72, 0.90, 0.45];
         for geom in previews {
-            if let Geometry::Curve(curve) = geom {
-                let pts = curve.sample_polyline(48);
-                for pair in pts.windows(2) {
-                    self.push_line(
-                        [pair[0].x as f32, pair[0].y as f32, pair[0].z as f32],
-                        [pair[1].x as f32, pair[1].y as f32, pair[1].z as f32],
+            match geom {
+                Geometry::Curve(curve) => {
+                    let pts = curve.sample_polyline(48);
+                    for pair in pts.windows(2) {
+                        self.push_line(
+                            [pair[0].x as f32, pair[0].y as f32, pair[0].z as f32],
+                            [pair[1].x as f32, pair[1].y as f32, pair[1].z as f32],
+                            preview_color,
+                        );
+                    }
+                }
+                Geometry::Surface(surf) => {
+                    let mesh = surf.tessellate(24, 8);
+                    self.push_mesh(
+                        &mesh.positions,
+                        &mesh.normals,
+                        &mesh.indices,
+                        shaded_preview,
                         preview_color,
+                        DisplayMode::Ghosted,
+                        false,
                     );
+                }
+                Geometry::Mesh(mesh) => {
+                    self.push_mesh(
+                        &mesh.positions,
+                        &mesh.normals,
+                        &mesh.indices,
+                        shaded_preview,
+                        preview_color,
+                        DisplayMode::Ghosted,
+                        false,
+                    );
+                }
+                Geometry::Point(p) => {
+                    let pf = [p.x as f32, p.y as f32, p.z as f32];
+                    let d = 0.2_f32;
+                    self.push_line([pf[0] - d, pf[1], pf[2]], [pf[0] + d, pf[1], pf[2]], preview_color);
+                    self.push_line([pf[0], pf[1] - d, pf[2]], [pf[0], pf[1] + d, pf[2]], preview_color);
                 }
             }
         }

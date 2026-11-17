@@ -7,6 +7,7 @@ use cad_io::{export_from_document, import_into_document, open_project_file};
 use cad_render::{
     CadWgpuState, DisplayMode, RenderScene, ViewportCamera, ViewportKind, ViewportPaintCallback,
 };
+use cad_script::{DEFAULT_SAMPLE_SCRIPT, NodeKind, ParametricGraph, run_rhai_script};
 use eframe::egui;
 
 fn main() -> eframe::Result<()> {
@@ -58,6 +59,13 @@ const KNOWN_COMMANDS: &[&str] = &[
     "Help",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolPanelTab {
+    None,
+    Parametric,
+    Script,
+}
+
 struct ElephantApp {
     doc: Document,
     cameras: [ViewportCamera; 4],
@@ -71,6 +79,9 @@ struct ElephantApp {
     new_layer_name: String,
     cursor_world: Option<DVec3>,
     last_snap_kind: Option<SnapKind>,
+    tool_tab: ToolPanelTab,
+    parametric_graph: ParametricGraph,
+    script_source: String,
 }
 
 impl ElephantApp {
@@ -96,6 +107,9 @@ impl ElephantApp {
             new_layer_name: String::new(),
             cursor_world: None,
             last_snap_kind: None,
+            tool_tab: ToolPanelTab::None,
+            parametric_graph: ParametricGraph::default(),
+            script_source: DEFAULT_SAMPLE_SCRIPT.to_string(),
         };
         app.populate_starter_scene();
         app
@@ -616,6 +630,24 @@ impl eframe::App for ElephantApp {
                         ui.close_menu();
                     }
                 });
+                ui.menu_button("Tools", |ui| {
+                    if ui.button("Parametric Graph (Grasshopper-style)").clicked() {
+                        self.tool_tab = if self.tool_tab == ToolPanelTab::Parametric {
+                            ToolPanelTab::None
+                        } else {
+                            ToolPanelTab::Parametric
+                        };
+                        ui.close_menu();
+                    }
+                    if ui.button("Rhai Script Editor").clicked() {
+                        self.tool_tab = if self.tool_tab == ToolPanelTab::Script {
+                            ToolPanelTab::None
+                        } else {
+                            ToolPanelTab::Script
+                        };
+                        ui.close_menu();
+                    }
+                });
             });
 
             ui.separator();
@@ -774,8 +806,100 @@ impl eframe::App for ElephantApp {
             });
         });
 
+        if self.tool_tab != ToolPanelTab::None {
+            egui::SidePanel::left("tools_panel")
+                .default_width(310.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.tool_tab,
+                            ToolPanelTab::Parametric,
+                            "Parametric Graph",
+                        );
+                        ui.selectable_value(
+                            &mut self.tool_tab,
+                            ToolPanelTab::Script,
+                            "Rhai Script",
+                        );
+                        if ui.small_button("X").clicked() {
+                            self.tool_tab = ToolPanelTab::None;
+                        }
+                    });
+                    ui.separator();
+
+                    match self.tool_tab {
+                        ToolPanelTab::Parametric => {
+                            ui.checkbox(&mut self.parametric_graph.live_preview, "Live 3D Preview");
+                            if ui.button("Bake to Document").clicked() {
+                                let n = self.parametric_graph.bake_into(&mut self.doc);
+                                self.log(format!("Baked {n} parametric object(s)."));
+                            }
+                            ui.separator();
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                for node in &mut self.parametric_graph.nodes {
+                                    ui.group(|ui| {
+                                        ui.strong(&node.label);
+                                        match &mut node.kind {
+                                            NodeKind::NumberSlider { value, min, max } => {
+                                                ui.add(
+                                                    egui::Slider::new(value, *min..=*max)
+                                                        .text("Value"),
+                                                );
+                                            }
+                                            NodeKind::LinearArray { step_x, step_y, .. } => {
+                                                ui.add(
+                                                    egui::Slider::new(step_x, 0.5..=12.0)
+                                                        .text("Step X"),
+                                                );
+                                                ui.add(
+                                                    egui::Slider::new(step_y, -12.0..=12.0)
+                                                        .text("Step Y"),
+                                                );
+                                            }
+                                            _ => {
+                                                ui.weak("Connected node");
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                        ToolPanelTab::Script => {
+                            if ui.button("Run Script").clicked() {
+                                match run_rhai_script(&self.script_source, &mut self.doc) {
+                                    Ok(res) => {
+                                        for l in res.logs {
+                                            self.log(format!("[Script] {l}"));
+                                        }
+                                        self.log(format!(
+                                            "Script created {} object(s).",
+                                            res.created_count
+                                        ));
+                                    }
+                                    Err(e) => self.log(format!("Script error: {e}")),
+                                }
+                            }
+                            ui.separator();
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.script_source)
+                                        .code_editor()
+                                        .desired_rows(18)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            });
+                        }
+                        ToolPanelTab::None => {}
+                    }
+                });
+        }
+
         let cplane = self.cameras[self.active_viewport].cplane;
         let mut scene = RenderScene::build(&self.doc, self.display_mode, &cplane);
+        if self.parametric_graph.live_preview {
+            let param_geoms = self.parametric_graph.evaluate();
+            scene.push_preview(&param_geoms, None);
+        }
         if self.session.is_active() {
             let previews = self.session.preview_geometry(self.cursor_world, &cplane);
             let snap_marker = if self.last_snap_kind.is_some() {
