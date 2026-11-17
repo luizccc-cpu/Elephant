@@ -11,6 +11,9 @@ pub enum ActiveTool {
     Circle { center: Option<DVec3> },
     Polygon { center: Option<DVec3>, sides: usize },
     Box { base: Option<DVec3>, corner: Option<DVec3> },
+    Cylinder { center: Option<DVec3>, radius: Option<f64> },
+    Cone { center: Option<DVec3>, radius: Option<f64> },
+    Revolve { axis_start: Option<DVec3> },
     Move { base: Option<DVec3> },
     Copy { base: Option<DVec3> },
     Rotate { center: Option<DVec3>, ref_vec: Option<DVec3> },
@@ -72,6 +75,8 @@ impl CommandSession {
             ActiveTool::Circle { center } => *center,
             ActiveTool::Polygon { center, .. } => *center,
             ActiveTool::Box { base, .. } => *base,
+            ActiveTool::Cylinder { center, .. } | ActiveTool::Cone { center, .. } => *center,
+            ActiveTool::Revolve { axis_start } => *axis_start,
             ActiveTool::Move { base } | ActiveTool::Copy { base } => *base,
             ActiveTool::Rotate { center, .. } => *center,
             ActiveTool::Scale { origin, .. } => *origin,
@@ -101,6 +106,14 @@ impl CommandSession {
             ActiveTool::Box { base: None, .. } => "First corner of box base",
             ActiveTool::Box { corner: None, .. } => "Other corner of box base",
             ActiveTool::Box { .. } => "Height of box (click or enter number)",
+            ActiveTool::Cylinder { center: None, .. } => "Base center of cylinder",
+            ActiveTool::Cylinder { radius: None, .. } => "Radius of cylinder (click or enter number)",
+            ActiveTool::Cylinder { .. } => "Height of cylinder (click or enter number)",
+            ActiveTool::Cone { center: None, .. } => "Base center of cone",
+            ActiveTool::Cone { radius: None, .. } => "Radius of cone (click or enter number)",
+            ActiveTool::Cone { .. } => "Height of cone (click or enter number)",
+            ActiveTool::Revolve { axis_start: None } => "Start of revolve axis",
+            ActiveTool::Revolve { axis_start: Some(_) } => "End of revolve axis",
             ActiveTool::Move { base: None } => "Point to move from",
             ActiveTool::Move { base: Some(_) } => "Point to move to",
             ActiveTool::Copy { base: None } => "Point to copy from",
@@ -157,6 +170,31 @@ impl CommandSession {
                     base: None,
                     corner: None,
                 };
+                Some(self.prompt().to_string())
+            }
+            "cylinder" => {
+                self.tool = ActiveTool::Cylinder {
+                    center: None,
+                    radius: None,
+                };
+                Some(self.prompt().to_string())
+            }
+            "cone" => {
+                self.tool = ActiveTool::Cone {
+                    center: None,
+                    radius: None,
+                };
+                Some(self.prompt().to_string())
+            }
+            "revolve" => {
+                let has_curve = doc
+                    .objects
+                    .values()
+                    .any(|o| o.selected && matches!(o.geometry, Geometry::Curve(_)));
+                if !has_curve {
+                    return Some("Select a profile curve to revolve first.".to_string());
+                }
+                self.tool = ActiveTool::Revolve { axis_start: None };
                 Some(self.prompt().to_string())
             }
             "move" => {
@@ -320,6 +358,83 @@ impl CommandSession {
                         "Created Box ({:.2} x {:.2} x {:.2}).",
                         size.x, size.y, size.z
                     ))
+                }
+            }
+            ActiveTool::Cylinder { center, radius } => {
+                if center.is_none() {
+                    *center = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                } else if radius.is_none() {
+                    let c = center.unwrap();
+                    *radius = Some(c.distance(pt).max(0.05));
+                    CommandOutcome::msg(self.prompt())
+                } else {
+                    let c = center.unwrap();
+                    let r = radius.unwrap();
+                    let h = (pt - c).dot(cplane.z_axis);
+                    let h = if h.abs() < 1e-3 { 3.0 } else { h };
+                    doc.add_object(
+                        "Cylinder",
+                        Geometry::Mesh(TriangleMesh::from_cylinder(c, r, h, 32)),
+                    );
+                    self.tool = ActiveTool::Idle;
+                    CommandOutcome::done(format!("Created Cylinder (r={r:.2}, h={h:.2})."))
+                }
+            }
+            ActiveTool::Cone { center, radius } => {
+                if center.is_none() {
+                    *center = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                } else if radius.is_none() {
+                    let c = center.unwrap();
+                    *radius = Some(c.distance(pt).max(0.05));
+                    CommandOutcome::msg(self.prompt())
+                } else {
+                    let c = center.unwrap();
+                    let r = radius.unwrap();
+                    let h = (pt - c).dot(cplane.z_axis);
+                    let h = if h.abs() < 1e-3 { 3.0 } else { h };
+                    doc.add_object(
+                        "Cone",
+                        Geometry::Mesh(TriangleMesh::from_cone(c, r, h, 32)),
+                    );
+                    self.tool = ActiveTool::Idle;
+                    CommandOutcome::done(format!("Created Cone (r={r:.2}, h={h:.2})."))
+                }
+            }
+            ActiveTool::Revolve { axis_start } => {
+                if let Some(a) = *axis_start {
+                    let dir = (pt - a).normalize_or_zero();
+                    if dir.length_squared() < 1e-6 {
+                        self.tool = ActiveTool::Idle;
+                        return CommandOutcome::done("Revolve axis is degenerate.");
+                    }
+                    let curves: Vec<_> = doc
+                        .objects
+                        .values()
+                        .filter(|o| o.selected)
+                        .filter_map(|o| match &o.geometry {
+                            Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                    let count = curves.len();
+                    for (lid, c) in curves {
+                        let mesh = TriangleMesh::revolve_curve(
+                            &c,
+                            a,
+                            dir,
+                            std::f64::consts::TAU,
+                            24,
+                            32,
+                        );
+                        doc.add_object_on_layer("Revolve", lid, Geometry::Mesh(mesh));
+                    }
+                    self.tool = ActiveTool::Idle;
+                    CommandOutcome::done(format!("Revolved {count} curve(s) 360 deg."))
+                } else {
+                    *axis_start = Some(pt);
+                    CommandOutcome::msg(self.prompt())
                 }
             }
             ActiveTool::Move { base } => {
@@ -618,13 +733,32 @@ impl CommandSession {
 
         if let Ok(val) = trimmed.parse::<f64>() {
             match &self.tool {
-                ActiveTool::Circle { center: Some(c) } => {
+                ActiveTool::Circle { center: Some(c) }
+            | ActiveTool::Cylinder {
+                center: Some(c),
+                radius: None,
+            }
+            | ActiveTool::Cone {
+                center: Some(c),
+                radius: None,
+            } => {
                     let pt = *c + cplane.x_axis * val;
                     return Some(self.on_point(pt, doc, cplane));
                 }
                 ActiveTool::Box {
                     base: Some(_),
                     corner: Some(c),
+                } => {
+                    let pt = *c + cplane.z_axis * val;
+                    return Some(self.on_point(pt, doc, cplane));
+                }
+                ActiveTool::Cylinder {
+                    center: Some(c),
+                    radius: Some(_),
+                }
+                | ActiveTool::Cone {
+                    center: Some(c),
+                    radius: Some(_),
                 } => {
                     let pt = *c + cplane.z_axis * val;
                     return Some(self.on_point(pt, doc, cplane));
@@ -702,6 +836,7 @@ impl CommandSession {
         match &self.tool {
             ActiveTool::Line { start: Some(s) }
             | ActiveTool::Mirror { start: Some(s) }
+            | ActiveTool::Revolve { axis_start: Some(s) }
             | ActiveTool::Distance { first: Some(s) } => {
                 vec![Geometry::Curve(NurbsCurve::line(*s, cur))]
             }
@@ -727,7 +862,15 @@ impl CommandSession {
             } => NurbsCurve::arc_3pt(*a, *b, cur)
                 .map(|c| vec![Geometry::Curve(c)])
                 .unwrap_or_default(),
-            ActiveTool::Circle { center: Some(c) } => {
+            ActiveTool::Circle { center: Some(c) }
+            | ActiveTool::Cylinder {
+                center: Some(c),
+                radius: None,
+            }
+            | ActiveTool::Cone {
+                center: Some(c),
+                radius: None,
+            } => {
                 let r = c.distance(cur);
                 if r > 1e-4 {
                     let mut plane = *cplane;

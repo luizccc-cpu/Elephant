@@ -1,10 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use cad_commands::{CommandSession, SnapConfig, SnapKind};
-use cad_doc::Document;
-use cad_geom::{DMat4, DVec3, Geometry, NurbsCurve, NurbsSurface, Plane, TriangleMesh};
+use cad_doc::{Document, ObjectId};
+use cad_geom::{
+    BooleanOp, DMat4, DVec3, Geometry, NurbsCurve, NurbsSurface, Plane, TriangleMesh, mesh_boolean,
+};
 use cad_io::{export_from_document, import_into_document, open_project_file};
 use cad_render::{
     CadWgpuState, DisplayMode, RenderScene, ViewportCamera, ViewportKind, ViewportPaintCallback,
@@ -53,8 +56,20 @@ const KNOWN_COMMANDS: &[&str] = &[
     "Polygon",
     "Ellipse",
     "Box",
+    "Cylinder",
+    "Cone",
+    "Torus",
+    "Plane",
     "Sphere",
     "Extrude",
+    "PlanarSrf",
+    "Loft",
+    "Revolve",
+    "BooleanUnion",
+    "BooleanDifference",
+    "BooleanIntersection",
+    "PointsOn",
+    "PointsOff",
     "Join",
     "Explode",
     "Offset",
@@ -140,6 +155,14 @@ struct NamedView {
     cameras: [ViewportCamera; 4],
 }
 
+#[derive(Debug, Clone)]
+struct GripDrag {
+    viewport_idx: usize,
+    object_id: ObjectId,
+    cp_index: usize,
+    last_world: DVec3,
+}
+
 struct ElephantApp {
     doc: Document,
     cameras: [ViewportCamera; 4],
@@ -154,6 +177,8 @@ struct ElephantApp {
     gumball_drag: Option<GumballDrag>,
     gumball_prompt: Option<GumballNumericPrompt>,
     marquee: Option<MarqueeDrag>,
+    points_on_objects: HashSet<ObjectId>,
+    grip_drag: Option<GripDrag>,
     command_input: String,
     command_log: Vec<String>,
     command_history: Vec<String>,
@@ -191,6 +216,8 @@ impl ElephantApp {
             gumball_drag: None,
             gumball_prompt: None,
             marquee: None,
+            points_on_objects: HashSet::new(),
+            grip_drag: None,
             command_input: String::new(),
             command_log: vec![
                 "Elephant CAD initialized (local clean-room engine). Type 'Help' for commands."
@@ -419,8 +446,94 @@ impl ElephantApp {
                 self.doc.add_object("Line", Geometry::Curve(c));
                 self.log(format!("Created Line (0,0,0) -> ({len},0,0)."));
             }
+            "cylinder" => {
+                let r = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.5);
+                let h = args.get(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(4.0);
+                self.doc.add_object(
+                    "Cylinder",
+                    Geometry::Mesh(TriangleMesh::from_cylinder(DVec3::ZERO, r, h, 32)),
+                );
+                self.log(format!("Created Cylinder (r={r}, h={h})."));
+            }
+            "cone" => {
+                let r = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(2.0);
+                let h = args.get(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(4.0);
+                self.doc.add_object(
+                    "Cone",
+                    Geometry::Mesh(TriangleMesh::from_cone(DVec3::ZERO, r, h, 32)),
+                );
+                self.log(format!("Created Cone (r={r}, h={h})."));
+            }
+            "torus" => {
+                let maj = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(3.0);
+                let min = args.get(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
+                self.doc.add_object(
+                    "Torus",
+                    Geometry::Mesh(TriangleMesh::from_torus(DVec3::ZERO, maj, min, 32, 16)),
+                );
+                self.log(format!("Created Torus (R={maj}, r={min})."));
+            }
+            "plane" => {
+                let w = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(6.0);
+                let h = args.get(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(w);
+                self.doc.add_object(
+                    "Plane",
+                    Geometry::Surface(NurbsSurface::plane_rect(&cplane, w, h)),
+                );
+                self.log(format!("Created Plane ({w} x {h})."));
+            }
             "extrude" => {
                 let h = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(3.0);
+                let dir = cplane.z_axis * h;
+                let curves: Vec<_> = self
+                    .doc
+                    .objects
+                    .values()
+                    .filter(|o| o.selected)
+                    .filter_map(|o| match &o.geometry {
+                        Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                if curves.is_empty() {
+                    self.log("Select one or more curves first, then run Extrude.");
+                } else {
+                    for (lid, c) in &curves {
+                        if let Some(solid) = TriangleMesh::extrude_closed_curve(c, dir) {
+                            self.doc.add_object_on_layer("ExtrudeSolid", *lid, Geometry::Mesh(solid));
+                        } else {
+                            let surf = NurbsSurface::extrude_curve(c, dir);
+                            self.doc.add_object_on_layer("Extrude", *lid, Geometry::Surface(surf));
+                        }
+                    }
+                    self.log(format!("Extruded {} curve(s) by {h}.", curves.len()));
+                }
+            }
+            "planarsrf" => {
+                let curves: Vec<_> = self
+                    .doc
+                    .objects
+                    .values()
+                    .filter(|o| o.selected)
+                    .filter_map(|o| match &o.geometry {
+                        Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                let mut created = 0;
+                for (lid, c) in &curves {
+                    if let Some(mesh) = TriangleMesh::from_planar_curve(c) {
+                        self.doc.add_object_on_layer("PlanarSrf", *lid, Geometry::Mesh(mesh));
+                        created += 1;
+                    }
+                }
+                if created == 0 {
+                    self.log("Select closed planar curve(s) first, then run PlanarSrf.");
+                } else {
+                    self.log(format!("Created {created} planar surface(s)."));
+                }
+            }
+            "loft" => {
                 let curves: Vec<NurbsCurve> = self
                     .doc
                     .objects
@@ -431,15 +544,58 @@ impl ElephantApp {
                         _ => None,
                     })
                     .collect();
-                if curves.is_empty() {
-                    self.log("Select one or more curves first, then run Extrude.");
+                if let Some(mesh) = TriangleMesh::loft_curves(&curves, 32) {
+                    self.doc.add_object("Loft", Geometry::Mesh(mesh));
+                    self.log(format!("Lofted {} curves.", curves.len()));
                 } else {
-                    for c in &curves {
-                        let surf = NurbsSurface::extrude_curve(c, DVec3::new(0.0, 0.0, h));
-                        self.doc.add_object("Extrude", Geometry::Surface(surf));
-                    }
-                    self.log(format!("Extruded {} curve(s) by Z = {h}.", curves.len()));
+                    self.log("Select 2 or more curves to Loft.");
                 }
+            }
+            "booleanunion" | "booleandifference" | "booleanintersection" => {
+                let op = match cmd.as_str() {
+                    "booleanunion" => BooleanOp::Union,
+                    "booleandifference" => BooleanOp::Difference,
+                    _ => BooleanOp::Intersection,
+                };
+                let meshes: Vec<_> = self
+                    .doc
+                    .objects
+                    .values()
+                    .filter(|o| o.selected)
+                    .filter_map(|o| match &o.geometry {
+                        Geometry::Mesh(m) => Some((o.layer_id, m.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                if meshes.len() < 2 {
+                    self.log("Select 2 or more solid meshes for Boolean operation.");
+                } else {
+                    let lid = meshes[0].0;
+                    let mut acc = meshes[0].1.clone();
+                    for (_, m) in &meshes[1..] {
+                        acc = mesh_boolean(&acc, m, op);
+                    }
+                    self.doc.remove_selected();
+                    self.doc.add_object_on_layer("Boolean", lid, Geometry::Mesh(acc));
+                    self.log(format!("Completed {cmd} on {} meshes.", meshes.len()));
+                }
+            }
+            "pointson" => {
+                let mut added = 0;
+                for (id, obj) in &self.doc.objects {
+                    if obj.selected
+                        && matches!(obj.geometry, Geometry::Curve(_) | Geometry::Surface(_))
+                        && self.points_on_objects.insert(id)
+                    {
+                        added += 1;
+                    }
+                }
+                self.log(format!("Control points on ({added} added, {} active).", self.points_on_objects.len()));
+            }
+            "pointsoff" => {
+                self.points_on_objects.clear();
+                self.grip_drag = None;
+                self.log("Control points turned off.");
             }
             "move" => {
                 let dx = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
@@ -894,12 +1050,59 @@ impl ElephantApp {
                     }
                 }
 
-                // Primary drag: Gumball or Marquee selection (when session is idle)
+                // Compute NURBS control point grips for PointsOn objects
+                struct CpGrip {
+                    object_id: ObjectId,
+                    cp_index: usize,
+                    screen: egui::Pos2,
+                    world: DVec3,
+                }
+                let mut cp_grips: Vec<CpGrip> = Vec::new();
+                let mut cp_polygons: Vec<Vec<egui::Pos2>> = Vec::new();
+                if !self.points_on_objects.is_empty() && !self.session.is_active() {
+                    for &oid in &self.points_on_objects {
+                        let Some(obj) = self.doc.objects.get(oid) else {
+                            continue;
+                        };
+                        if !obj.visible {
+                            continue;
+                        }
+                        let cps: &[cad_geom::ControlPoint] = match &obj.geometry {
+                            Geometry::Curve(c) => &c.control_points,
+                            Geometry::Surface(s) => &s.control_points,
+                            _ => &[],
+                        };
+                        let mut poly = Vec::with_capacity(cps.len());
+                        for (ci, cp) in cps.iter().enumerate() {
+                            if let Some(sp) = Self::world_to_screen(cp.position, &vp_cols, rect) {
+                                poly.push(sp);
+                                cp_grips.push(CpGrip {
+                                    object_id: oid,
+                                    cp_index: ci,
+                                    screen: sp,
+                                    world: cp.position,
+                                });
+                            }
+                        }
+                        if poly.len() >= 2 && matches!(obj.geometry, Geometry::Curve(_)) {
+                            cp_polygons.push(poly);
+                        }
+                    }
+                }
+
+                // Primary drag: Control Points, Gumball, or Marquee selection (when session is idle)
                 if !self.session.is_active() {
                     if response.drag_started_by(egui::PointerButton::Primary) {
                         self.active_viewport = idx;
                         if let Some(pos) = response.interact_pointer_pos() {
-                            if let Some((axis, mode, axis_screen_dir, px_per_world)) =
+                            if let Some(g) = cp_grips.iter().find(|g| pos.distance(g.screen) <= 9.0) {
+                                self.grip_drag = Some(GripDrag {
+                                    viewport_idx: idx,
+                                    object_id: g.object_id,
+                                    cp_index: g.cp_index,
+                                    last_world: g.world,
+                                });
+                            } else if let Some((axis, mode, axis_screen_dir, px_per_world)) =
                                 hit_gumball(pos)
                             {
                                 self.gumball_drag = Some(GumballDrag {
@@ -920,6 +1123,44 @@ impl ElephantApp {
                                     current: pos,
                                 });
                             }
+                        }
+                    }
+
+                    if let Some(mut gd) = self.grip_drag.take() {
+                        if gd.viewport_idx == idx {
+                            if response.dragged_by(egui::PointerButton::Primary) {
+                                if let Some(pos) = response.interact_pointer_pos() {
+                                    let ndc_x = ((pos.x - rect.left()) / rect.width().max(1.0)) * 2.0 - 1.0;
+                                    let ndc_y = 1.0 - ((pos.y - rect.top()) / rect.height().max(1.0)) * 2.0;
+                                    let ray = self.cameras[idx].screen_to_ray(ndc_x as f64, ndc_y as f64, aspect);
+                                    let mut drag_plane = cplane;
+                                    drag_plane.origin = gd.last_world;
+                                    if let Some(new_pt) = drag_plane.intersect_ray(&ray) {
+                                        if let Some(obj) = self.doc.objects.get_mut(gd.object_id) {
+                                            match &mut obj.geometry {
+                                                Geometry::Curve(c) => {
+                                                    if let Some(cp) = c.control_points.get_mut(gd.cp_index) {
+                                                        cp.position = new_pt;
+                                                    }
+                                                }
+                                                Geometry::Surface(s) => {
+                                                    if let Some(cp) = s.control_points.get_mut(gd.cp_index) {
+                                                        cp.position = new_pt;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                            obj.refresh_aabb();
+                                            gd.last_world = new_pt;
+                                            self.doc.rebuild_spatial_index();
+                                            self.scene_dirty = true;
+                                        }
+                                    }
+                                }
+                                self.grip_drag = Some(gd);
+                            }
+                        } else {
+                            self.grip_drag = Some(gd);
                         }
                     }
 
@@ -1135,6 +1376,25 @@ impl ElephantApp {
                     );
                 }
 
+                // Draw NURBS control points (PointsOn)
+                if !cp_grips.is_empty() {
+                    for poly in &cp_polygons {
+                        painter.add(egui::Shape::line(
+                            poly.clone(),
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(160, 165, 175)),
+                        ));
+                    }
+                    for g in &cp_grips {
+                        let r = egui::Rect::from_center_size(g.screen, egui::vec2(6.0, 6.0));
+                        painter.rect(
+                            r,
+                            0.0,
+                            egui::Color32::from_rgb(245, 90, 210),
+                            egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
+                        );
+                    }
+                }
+
                 // Draw Marquee selection rectangle
                 if let Some(m) = &self.marquee {
                     if m.viewport_idx == idx {
@@ -1183,6 +1443,12 @@ impl eframe::App for ElephantApp {
         }
         if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
             self.execute_command("Delete");
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F10)) {
+            self.execute_command("PointsOn");
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            self.execute_command("PointsOff");
         }
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
@@ -1261,9 +1527,30 @@ impl eframe::App for ElephantApp {
                         "Circle",
                         "Polygon",
                         "Ellipse",
+                        "Plane",
                         "Box",
+                        "Cylinder",
+                        "Cone",
+                        "Torus",
                         "Sphere",
+                    ] {
+                        if ui.button(cmd).clicked() {
+                            self.execute_command(cmd);
+                            ui.close_menu();
+                        }
+                    }
+                });
+                ui.menu_button("Solid", |ui| {
+                    for cmd in [
                         "Extrude",
+                        "PlanarSrf",
+                        "Loft",
+                        "Revolve",
+                        "BooleanUnion",
+                        "BooleanDifference",
+                        "BooleanIntersection",
+                        "PointsOn",
+                        "PointsOff",
                     ] {
                         if ui.button(cmd).clicked() {
                             self.execute_command(cmd);

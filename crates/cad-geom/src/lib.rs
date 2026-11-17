@@ -1,11 +1,13 @@
 //! Clean-room NURBS curves/surfaces, meshes, and geometric primitives for Elephant.
 
+pub mod csg;
 pub mod error;
 pub mod mesh;
 pub mod nurbs_curve;
 pub mod nurbs_surface;
 
 pub use cad_math::{Aabb, DMat4, DVec3, Plane, Ray, Tolerances};
+pub use csg::{BooleanOp, mesh_boolean};
 pub use error::GeomError;
 pub use mesh::TriangleMesh;
 pub use nurbs_curve::{ControlPoint, NurbsCurve};
