@@ -11,3 +11,4 @@ cad-doc = { path = "../../crates/cad-doc" }
 cad-io = { path = "../../crates/cad-io" }
 cad-commands = { path = "../../crates/cad-commands" }
 cad-render = { path = "../../crates/cad-render" }
+eframe.workspace = true

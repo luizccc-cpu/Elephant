@@ -9,3 +9,4 @@ cad-math = { path = "../cad-math" }
 cad-geom = { path = "../cad-geom" }
 cad-doc = { path = "../cad-doc" }
 bytemuck.workspace = true
+eframe.workspace = true
