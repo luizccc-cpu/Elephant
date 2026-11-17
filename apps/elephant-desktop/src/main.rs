@@ -47,14 +47,28 @@ fn main() -> eframe::Result<()> {
 const KNOWN_COMMANDS: &[&str] = &[
     "Line",
     "Polyline",
+    "Rectangle",
+    "Arc",
     "Circle",
+    "Polygon",
+    "Ellipse",
     "Box",
     "Sphere",
     "Extrude",
+    "Join",
+    "Explode",
+    "Offset",
+    "Fillet",
     "Move",
     "Copy",
     "Rotate",
     "Scale",
+    "Mirror",
+    "ArrayLinear",
+    "ArrayPolar",
+    "Distance",
+    "Length",
+    "Area",
     "Delete",
     "SelAll",
     "SelNone",
@@ -433,6 +447,126 @@ impl ElephantApp {
             "selnone" => {
                 self.doc.clear_selection();
                 self.log("Selection cleared.");
+            }
+            "ellipse" => {
+                let rx = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(4.0);
+                let ry = args.get(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(2.0);
+                match NurbsCurve::ellipse(&cplane, rx, ry) {
+                    Ok(c) => {
+                        self.doc.add_object("Ellipse", Geometry::Curve(c));
+                        self.log(format!("Created Ellipse (rx={rx}, ry={ry})."));
+                    }
+                    Err(e) => self.log(format!("Ellipse error: {e}")),
+                }
+            }
+            "join" => {
+                let mut curves = Vec::new();
+                for obj in self.doc.objects.values() {
+                    if obj.selected {
+                        if let Geometry::Curve(c) = &obj.geometry {
+                            curves.push(c.clone());
+                        }
+                    }
+                }
+                if curves.len() < 2 {
+                    self.log("Select 2 or more curves to join.");
+                } else {
+                    let joined = NurbsCurve::join_curves(&curves, 1e-3);
+                    let removed = self.doc.remove_selected();
+                    let count = joined.len();
+                    for c in joined {
+                        self.doc.add_object("Join", Geometry::Curve(c));
+                    }
+                    self.log(format!("Joined {removed} curve(s) into {count} curve(s)."));
+                }
+            }
+            "explode" => {
+                let mut pieces = Vec::new();
+                for obj in self.doc.objects.values() {
+                    if obj.selected {
+                        if let Geometry::Curve(c) = &obj.geometry {
+                            let segs = c.explode_segments();
+                            if segs.len() > 1 {
+                                pieces.extend(segs.into_iter().map(|s| (obj.layer_id, s)));
+                            }
+                        }
+                    }
+                }
+                if pieces.is_empty() {
+                    self.log("Select one or more polylines to explode.");
+                } else {
+                    let removed = self.doc.remove_selected();
+                    let count = pieces.len();
+                    for (lid, seg) in pieces {
+                        self.doc.add_object_on_layer("Explode", lid, Geometry::Curve(seg));
+                    }
+                    self.log(format!("Exploded {removed} polyline(s) into {count} segments."));
+                }
+            }
+            "fillet" => {
+                let radius = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
+                let lines: Vec<_> = self
+                    .doc
+                    .objects
+                    .values()
+                    .filter(|o| o.selected)
+                    .filter_map(|o| match &o.geometry {
+                        Geometry::Curve(c) if c.degree == 1 && c.control_points.len() == 2 => {
+                            Some((o.layer_id, c.control_points[0].position, c.control_points[1].position))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if lines.len() != 2 {
+                    self.log("Select exactly 2 line segments to fillet, then run Fillet [radius].");
+                } else if let Some((la, lb, arc)) =
+                    NurbsCurve::fillet_two_lines(lines[0].1, lines[0].2, lines[1].1, lines[1].2, radius)
+                {
+                    let lid = lines[0].0;
+                    self.doc.remove_selected();
+                    self.doc.add_object_on_layer("FilletLine", lid, Geometry::Curve(la));
+                    self.doc.add_object_on_layer("FilletLine", lid, Geometry::Curve(lb));
+                    self.doc.add_object_on_layer("FilletArc", lid, Geometry::Curve(arc));
+                    self.log(format!("Filleted 2 lines with radius {radius:.3}."));
+                } else {
+                    self.log("Could not fillet the selected lines (parallel, non-coplanar, or radius too large).");
+                }
+            }
+            "length" => {
+                let mut total = 0.0;
+                let mut count = 0;
+                for obj in self.doc.objects.values() {
+                    if obj.selected {
+                        if let Geometry::Curve(c) = &obj.geometry {
+                            total += c.length_approx(64);
+                            count += 1;
+                        }
+                    }
+                }
+                if count == 0 {
+                    self.log("Select one or more curves to measure Length.");
+                } else {
+                    self.log(format!("Total length of {count} curve(s): {total:.4}"));
+                }
+            }
+            "area" => {
+                let mut total = 0.0;
+                let mut count = 0;
+                for obj in self.doc.objects.values() {
+                    if obj.selected {
+                        if let Geometry::Curve(c) = &obj.geometry {
+                            if c.is_closed() {
+                                total += c.planar_area_approx(&cplane, 64);
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+                if count == 0 {
+                    self.log("Select one or more closed planar curves to measure Area.");
+                } else {
+                    self.log(format!("Total planar area of {count} closed curve(s): {total:.4}"));
+                }
             }
             "undo" => match self.doc.undo() {
                 Some(label) => self.log(format!("Undid '{label}'.")),
@@ -1036,7 +1170,26 @@ impl eframe::App for ElephantApp {
                     }
                 });
                 ui.menu_button("Create", |ui| {
-                    for cmd in ["Line", "Polyline", "Circle", "Box", "Sphere", "Extrude"] {
+                    for cmd in [
+                        "Line",
+                        "Polyline",
+                        "Rectangle",
+                        "Arc",
+                        "Circle",
+                        "Polygon",
+                        "Ellipse",
+                        "Box",
+                        "Sphere",
+                        "Extrude",
+                    ] {
+                        if ui.button(cmd).clicked() {
+                            self.execute_command(cmd);
+                            ui.close_menu();
+                        }
+                    }
+                });
+                ui.menu_button("Curve", |ui| {
+                    for cmd in ["Join", "Explode", "Offset", "Fillet", "Distance", "Length", "Area"] {
                         if ui.button(cmd).clicked() {
                             self.execute_command(cmd);
                             ui.close_menu();
@@ -1044,7 +1197,15 @@ impl eframe::App for ElephantApp {
                     }
                 });
                 ui.menu_button("Transform", |ui| {
-                    for cmd in ["Move", "Copy", "Rotate", "Scale"] {
+                    for cmd in [
+                        "Move",
+                        "Copy",
+                        "Rotate",
+                        "Scale",
+                        "Mirror",
+                        "ArrayLinear",
+                        "ArrayPolar",
+                    ] {
                         if ui.button(cmd).clicked() {
                             self.execute_command(cmd);
                             ui.close_menu();

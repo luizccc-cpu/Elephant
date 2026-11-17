@@ -6,12 +6,20 @@ pub enum ActiveTool {
     Idle,
     Line { start: Option<DVec3> },
     Polyline { points: Vec<DVec3> },
+    Rectangle { corner1: Option<DVec3> },
+    Arc { p0: Option<DVec3>, p1: Option<DVec3> },
     Circle { center: Option<DVec3> },
+    Polygon { center: Option<DVec3>, sides: usize },
     Box { base: Option<DVec3>, corner: Option<DVec3> },
     Move { base: Option<DVec3> },
     Copy { base: Option<DVec3> },
     Rotate { center: Option<DVec3>, ref_vec: Option<DVec3> },
     Scale { origin: Option<DVec3>, ref_dist: Option<f64> },
+    Mirror { start: Option<DVec3> },
+    Offset { distance: f64 },
+    ArrayLinear { count: usize, base: Option<DVec3> },
+    ArrayPolar { count: usize },
+    Distance { first: Option<DVec3> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,12 +67,18 @@ impl CommandSession {
         match &self.tool {
             ActiveTool::Line { start } => *start,
             ActiveTool::Polyline { points } => points.last().copied(),
+            ActiveTool::Rectangle { corner1 } => *corner1,
+            ActiveTool::Arc { p0, p1 } => p1.or(*p0),
             ActiveTool::Circle { center } => *center,
+            ActiveTool::Polygon { center, .. } => *center,
             ActiveTool::Box { base, .. } => *base,
             ActiveTool::Move { base } | ActiveTool::Copy { base } => *base,
             ActiveTool::Rotate { center, .. } => *center,
             ActiveTool::Scale { origin, .. } => *origin,
-            ActiveTool::Idle => None,
+            ActiveTool::Mirror { start } => *start,
+            ActiveTool::ArrayLinear { base, .. } => *base,
+            ActiveTool::Distance { first } => *first,
+            ActiveTool::Offset { .. } | ActiveTool::ArrayPolar { .. } | ActiveTool::Idle => None,
         }
     }
 
@@ -75,8 +89,15 @@ impl CommandSession {
             ActiveTool::Line { start: Some(_) } => "End of line (click, x,y,z, or distance)",
             ActiveTool::Polyline { points } if points.is_empty() => "Start of polyline",
             ActiveTool::Polyline { .. } => "Next point of polyline (Right-click or Enter to finish)",
+            ActiveTool::Rectangle { corner1: None } => "First corner of rectangle",
+            ActiveTool::Rectangle { corner1: Some(_) } => "Other corner of rectangle",
+            ActiveTool::Arc { p0: None, .. } => "Start of 3-point arc",
+            ActiveTool::Arc { p1: None, .. } => "Point on arc",
+            ActiveTool::Arc { .. } => "End of arc",
             ActiveTool::Circle { center: None } => "Center of circle",
             ActiveTool::Circle { center: Some(_) } => "Radius (click or enter number)",
+            ActiveTool::Polygon { center: None, .. } => "Center of polygon (or enter NumSides)",
+            ActiveTool::Polygon { center: Some(_), .. } => "Corner point / radius of polygon",
             ActiveTool::Box { base: None, .. } => "First corner of box base",
             ActiveTool::Box { corner: None, .. } => "Other corner of box base",
             ActiveTool::Box { .. } => "Height of box (click or enter number)",
@@ -90,6 +111,14 @@ impl CommandSession {
             ActiveTool::Scale { origin: None, .. } => "Origin point for scale",
             ActiveTool::Scale { ref_dist: None, .. } => "Scale factor or first reference point",
             ActiveTool::Scale { .. } => "Second reference point",
+            ActiveTool::Mirror { start: None } => "Start of mirror plane",
+            ActiveTool::Mirror { start: Some(_) } => "End of mirror plane",
+            ActiveTool::Offset { .. } => "Side to offset (click side, or enter distance)",
+            ActiveTool::ArrayLinear { base: None, .. } => "Base point for linear array (or enter count)",
+            ActiveTool::ArrayLinear { base: Some(_), .. } => "Second reference point (step spacing)",
+            ActiveTool::ArrayPolar { .. } => "Center of polar array (or enter count)",
+            ActiveTool::Distance { first: None } => "First point for distance",
+            ActiveTool::Distance { first: Some(_) } => "Second point for distance",
         }
     }
 
@@ -104,8 +133,23 @@ impl CommandSession {
                 self.tool = ActiveTool::Polyline { points: Vec::new() };
                 Some(self.prompt().to_string())
             }
+            "rectangle" | "rect" => {
+                self.tool = ActiveTool::Rectangle { corner1: None };
+                Some(self.prompt().to_string())
+            }
+            "arc" => {
+                self.tool = ActiveTool::Arc { p0: None, p1: None };
+                Some(self.prompt().to_string())
+            }
             "circle" => {
                 self.tool = ActiveTool::Circle { center: None };
+                Some(self.prompt().to_string())
+            }
+            "polygon" => {
+                self.tool = ActiveTool::Polygon {
+                    center: None,
+                    sides: 6,
+                };
                 Some(self.prompt().to_string())
             }
             "box" => {
@@ -147,6 +191,45 @@ impl CommandSession {
                     origin: None,
                     ref_dist: None,
                 };
+                Some(self.prompt().to_string())
+            }
+            "mirror" => {
+                if !has_selection {
+                    return Some("Select objects to mirror first.".to_string());
+                }
+                self.tool = ActiveTool::Mirror { start: None };
+                Some(self.prompt().to_string())
+            }
+            "offset" => {
+                let has_curve = doc
+                    .objects
+                    .values()
+                    .any(|o| o.selected && matches!(o.geometry, Geometry::Curve(_)));
+                if !has_curve {
+                    return Some("Select a curve to offset first.".to_string());
+                }
+                self.tool = ActiveTool::Offset { distance: 1.0 };
+                Some(self.prompt().to_string())
+            }
+            "arraylinear" | "array" => {
+                if !has_selection {
+                    return Some("Select objects to array first.".to_string());
+                }
+                self.tool = ActiveTool::ArrayLinear {
+                    count: 4,
+                    base: None,
+                };
+                Some(self.prompt().to_string())
+            }
+            "arraypolar" => {
+                if !has_selection {
+                    return Some("Select objects to polar-array first.".to_string());
+                }
+                self.tool = ActiveTool::ArrayPolar { count: 6 };
+                Some(self.prompt().to_string())
+            }
+            "distance" | "dist" => {
+                self.tool = ActiveTool::Distance { first: None };
                 Some(self.prompt().to_string())
             }
             _ => None,
@@ -329,6 +412,191 @@ impl CommandSession {
                     CommandOutcome::done(format!("Scaled {n} object(s) by {factor:.3}."))
                 }
             }
+            ActiveTool::Rectangle { corner1 } => {
+                if let Some(c1) = *corner1 {
+                    match NurbsCurve::rectangle(cplane, c1, pt) {
+                        Ok(rect) => {
+                            doc.add_object("Rectangle", Geometry::Curve(rect));
+                            self.tool = ActiveTool::Idle;
+                            CommandOutcome::done("Created Rectangle.")
+                        }
+                        Err(e) => {
+                            self.tool = ActiveTool::Idle;
+                            CommandOutcome::done(format!("Rectangle error: {e}"))
+                        }
+                    }
+                } else {
+                    *corner1 = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                }
+            }
+            ActiveTool::Arc { p0, p1 } => {
+                if p0.is_none() {
+                    *p0 = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                } else if p1.is_none() {
+                    *p1 = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                } else {
+                    let a = p0.unwrap();
+                    let b = p1.unwrap();
+                    match NurbsCurve::arc_3pt(a, b, pt) {
+                        Ok(arc) => {
+                            doc.add_object("Arc", Geometry::Curve(arc));
+                            self.tool = ActiveTool::Idle;
+                            CommandOutcome::done("Created 3-point Arc.")
+                        }
+                        Err(e) => {
+                            self.tool = ActiveTool::Idle;
+                            CommandOutcome::done(format!("Arc error: {e}"))
+                        }
+                    }
+                }
+            }
+            ActiveTool::Polygon { center, sides } => {
+                if let Some(c) = *center {
+                    let n_sides = *sides;
+                    match NurbsCurve::polygon(cplane, c, pt, n_sides) {
+                        Ok(poly) => {
+                            doc.add_object("Polygon", Geometry::Curve(poly));
+                            self.tool = ActiveTool::Idle;
+                            CommandOutcome::done(format!("Created {n_sides}-sided Polygon."))
+                        }
+                        Err(e) => {
+                            self.tool = ActiveTool::Idle;
+                            CommandOutcome::done(format!("Polygon error: {e}"))
+                        }
+                    }
+                } else {
+                    *center = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                }
+            }
+            ActiveTool::Mirror { start } => {
+                if let Some(a) = *start {
+                    let dir = (pt - a).normalize_or_zero();
+                    let n = cplane.z_axis.cross(dir).normalize_or_zero();
+                    if n.length_squared() < 1e-6 {
+                        self.tool = ActiveTool::Idle;
+                        return CommandOutcome::done("Mirror line is degenerate.");
+                    }
+                    let refl = DMat4::from_cols_array(&[
+                        1.0 - 2.0 * n.x * n.x, -2.0 * n.y * n.x, -2.0 * n.z * n.x, 0.0,
+                        -2.0 * n.x * n.y, 1.0 - 2.0 * n.y * n.y, -2.0 * n.z * n.y, 0.0,
+                        -2.0 * n.x * n.z, -2.0 * n.y * n.z, 1.0 - 2.0 * n.z * n.z, 0.0,
+                        0.0, 0.0, 0.0, 1.0,
+                    ]);
+                    let mat = DMat4::from_translation(a) * refl * DMat4::from_translation(-a);
+                    let copies: Vec<_> = doc
+                        .objects
+                        .values()
+                        .filter(|o| o.selected)
+                        .map(|o| {
+                            let mut g = o.geometry.clone();
+                            g.transform(&mat);
+                            (o.layer_id, g)
+                        })
+                        .collect();
+                    let count = copies.len();
+                    for (lid, g) in copies {
+                        doc.add_object_on_layer("Mirror", lid, g);
+                    }
+                    self.tool = ActiveTool::Idle;
+                    CommandOutcome::done(format!("Mirrored {count} object(s)."))
+                } else {
+                    *start = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                }
+            }
+            ActiveTool::Offset { distance } => {
+                let d = *distance;
+                let curves: Vec<_> = doc
+                    .objects
+                    .values()
+                    .filter(|o| o.selected)
+                    .filter_map(|o| match &o.geometry {
+                        Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                let mut created = 0;
+                for (lid, c) in &curves {
+                    if let Ok(off) = c.offset_in_plane(cplane, d, pt) {
+                        doc.add_object_on_layer("Offset", *lid, Geometry::Curve(off));
+                        created += 1;
+                    }
+                }
+                self.tool = ActiveTool::Idle;
+                CommandOutcome::done(format!("Offset {created} curve(s) by {d:.3}."))
+            }
+            ActiveTool::ArrayLinear { count, base } => {
+                if let Some(b) = *base {
+                    let step = pt - b;
+                    let total_copies = *count;
+                    let selected: Vec<_> = doc
+                        .objects
+                        .values()
+                        .filter(|o| o.selected)
+                        .map(|o| (o.layer_id, o.geometry.clone()))
+                        .collect();
+                    let mut created = 0;
+                    for i in 1..total_copies {
+                        let mat = DMat4::from_translation(step * i as f64);
+                        for (lid, g) in &selected {
+                            let mut ng = g.clone();
+                            ng.transform(&mat);
+                            doc.add_object_on_layer("ArrayLinear", *lid, ng);
+                            created += 1;
+                        }
+                    }
+                    self.tool = ActiveTool::Idle;
+                    CommandOutcome::done(format!("Linear array created {created} copy/copies."))
+                } else {
+                    *base = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                }
+            }
+            ActiveTool::ArrayPolar { count } => {
+                let total = *count;
+                let selected: Vec<_> = doc
+                    .objects
+                    .values()
+                    .filter(|o| o.selected)
+                    .map(|o| (o.layer_id, o.geometry.clone()))
+                    .collect();
+                let mut created = 0;
+                for i in 1..total {
+                    let angle = std::f64::consts::TAU * (i as f64 / total as f64);
+                    let mat = DMat4::from_translation(pt)
+                        * DMat4::from_axis_angle(cplane.z_axis, angle)
+                        * DMat4::from_translation(-pt);
+                    for (lid, g) in &selected {
+                        let mut ng = g.clone();
+                        ng.transform(&mat);
+                        doc.add_object_on_layer("ArrayPolar", *lid, ng);
+                        created += 1;
+                    }
+                }
+                self.tool = ActiveTool::Idle;
+                CommandOutcome::done(format!("Polar array created {created} copy/copies."))
+            }
+            ActiveTool::Distance { first } => {
+                if let Some(a) = *first {
+                    let d = pt - a;
+                    let dist = d.length();
+                    let dx = d.dot(cplane.x_axis);
+                    let dy = d.dot(cplane.y_axis);
+                    let ang = dy.atan2(dx).to_degrees();
+                    self.tool = ActiveTool::Idle;
+                    CommandOutcome::done(format!(
+                        "Distance = {dist:.4} (dx={dx:.3}, dy={dy:.3}, dz={:.3}, angle={ang:.2} deg)",
+                        d.z
+                    ))
+                } else {
+                    *first = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                }
+            }
         }
     }
 
@@ -387,6 +655,40 @@ impl CommandSession {
                         "Scaled {n} object(s) by {val:.3}."
                     )));
                 }
+                ActiveTool::Polygon { center: None, .. } if val >= 3.0 => {
+                    let n_sides = (val.round() as usize).max(3);
+                    self.tool = ActiveTool::Polygon {
+                        center: None,
+                        sides: n_sides,
+                    };
+                    return Some(CommandOutcome::msg(format!(
+                        "Polygon sides = {n_sides}. Center of polygon"
+                    )));
+                }
+                ActiveTool::Offset { .. } if val.abs() > 1e-6 => {
+                    self.tool = ActiveTool::Offset { distance: val.abs() };
+                    return Some(CommandOutcome::msg(format!(
+                        "Offset distance = {:.3}. Click side to offset",
+                        val.abs()
+                    )));
+                }
+                ActiveTool::ArrayLinear { base: None, .. } if val >= 2.0 => {
+                    let n = (val.round() as usize).max(2);
+                    self.tool = ActiveTool::ArrayLinear {
+                        count: n,
+                        base: None,
+                    };
+                    return Some(CommandOutcome::msg(format!(
+                        "Linear array count = {n}. Base point"
+                    )));
+                }
+                ActiveTool::ArrayPolar { .. } if val >= 2.0 => {
+                    let n = (val.round() as usize).max(2);
+                    self.tool = ActiveTool::ArrayPolar { count: n };
+                    return Some(CommandOutcome::msg(format!(
+                        "Polar array count = {n}. Center of polar array"
+                    )));
+                }
                 _ => {}
             }
         }
@@ -398,7 +700,11 @@ impl CommandSession {
             return Vec::new();
         };
         match &self.tool {
-            ActiveTool::Line { start: Some(s) } => vec![Geometry::Curve(NurbsCurve::line(*s, cur))],
+            ActiveTool::Line { start: Some(s) }
+            | ActiveTool::Mirror { start: Some(s) }
+            | ActiveTool::Distance { first: Some(s) } => {
+                vec![Geometry::Curve(NurbsCurve::line(*s, cur))]
+            }
             ActiveTool::Polyline { points } if !points.is_empty() => {
                 let mut pts = points.clone();
                 pts.push(cur);
@@ -406,6 +712,21 @@ impl CommandSession {
                     .map(|c| vec![Geometry::Curve(c)])
                     .unwrap_or_default()
             }
+            ActiveTool::Rectangle { corner1: Some(c1) } => {
+                NurbsCurve::rectangle(cplane, *c1, cur)
+                    .map(|c| vec![Geometry::Curve(c)])
+                    .unwrap_or_default()
+            }
+            ActiveTool::Arc {
+                p0: Some(a),
+                p1: None,
+            } => vec![Geometry::Curve(NurbsCurve::line(*a, cur))],
+            ActiveTool::Arc {
+                p0: Some(a),
+                p1: Some(b),
+            } => NurbsCurve::arc_3pt(*a, *b, cur)
+                .map(|c| vec![Geometry::Curve(c)])
+                .unwrap_or_default(),
             ActiveTool::Circle { center: Some(c) } => {
                 let r = c.distance(cur);
                 if r > 1e-4 {
@@ -418,18 +739,23 @@ impl CommandSession {
                     Vec::new()
                 }
             }
+            ActiveTool::Polygon {
+                center: Some(c),
+                sides,
+            } => NurbsCurve::polygon(cplane, *c, cur, *sides)
+                .map(|p| vec![Geometry::Curve(p)])
+                .unwrap_or_default(),
             ActiveTool::Box {
                 base: Some(b),
                 corner: None,
             } => {
-                let p1 = DVec3::new(cur.x, b.y, b.z);
-                let p2 = DVec3::new(cur.x, cur.y, b.z);
-                let p3 = DVec3::new(b.x, cur.y, b.z);
-                NurbsCurve::polyline(&[*b, p1, p2, p3, *b])
+                NurbsCurve::rectangle(cplane, *b, cur)
                     .map(|c| vec![Geometry::Curve(c)])
                     .unwrap_or_default()
             }
-            ActiveTool::Move { base: Some(b) } | ActiveTool::Copy { base: Some(b) } => {
+            ActiveTool::Move { base: Some(b) }
+            | ActiveTool::Copy { base: Some(b) }
+            | ActiveTool::ArrayLinear { base: Some(b), .. } => {
                 vec![Geometry::Curve(NurbsCurve::line(*b, cur))]
             }
             _ => Vec::new(),
