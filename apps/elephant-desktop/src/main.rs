@@ -3,6 +3,7 @@ use std::sync::Arc;
 use cad_commands::{CommandSession, SnapConfig, SnapKind};
 use cad_doc::Document;
 use cad_geom::{DMat4, DVec3, Geometry, NurbsCurve, NurbsSurface, Plane, TriangleMesh};
+use cad_io::{export_from_document, import_into_document, open_project_file};
 use cad_render::{
     CadWgpuState, DisplayMode, RenderScene, ViewportCamera, ViewportKind, ViewportPaintCallback,
 };
@@ -155,6 +156,65 @@ impl ElephantApp {
         }
     }
 
+    fn open_project_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Elephant Project", &["elephant", "json"])
+            .pick_file()
+        {
+            match open_project_file(&path) {
+                Ok(doc) => {
+                    self.session.cancel();
+                    self.doc = doc;
+                    self.zoom_extents_all();
+                    self.log(format!("Opened {}", path.display()));
+                }
+                Err(e) => self.log(format!("Open failed: {e}")),
+            }
+        }
+    }
+
+    fn save_project_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Elephant Project", &["elephant"])
+            .set_file_name("model.elephant")
+            .save_file()
+        {
+            match export_from_document(&path, &self.doc) {
+                Ok(()) => self.log(format!("Saved {}", path.display())),
+                Err(e) => self.log(format!("Save failed: {e}")),
+            }
+        }
+    }
+
+    fn import_mesh_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("3D Mesh (OBJ, STL)", &["obj", "stl"])
+            .pick_file()
+        {
+            match import_into_document(&path, &mut self.doc) {
+                Ok(n) => {
+                    self.zoom_extents_all();
+                    self.log(format!("Imported {n} object(s) from {}", path.display()));
+                }
+                Err(e) => self.log(format!("Import failed: {e}")),
+            }
+        }
+    }
+
+    fn export_mesh_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Wavefront OBJ", &["obj"])
+            .add_filter("Binary STL", &["stl"])
+            .set_file_name("export.obj")
+            .save_file()
+        {
+            match export_from_document(&path, &self.doc) {
+                Ok(()) => self.log(format!("Exported {}", path.display())),
+                Err(e) => self.log(format!("Export failed: {e}")),
+            }
+        }
+    }
+
     fn execute_command(&mut self, raw: &str) {
         let trimmed = raw.trim();
         let cplane = self.cameras[self.active_viewport].cplane;
@@ -303,6 +363,18 @@ impl ElephantApp {
                 self.session.cancel();
                 self.doc = Document::new();
                 self.log("Created new empty document.");
+            }
+            "open" => {
+                self.open_project_dialog();
+            }
+            "save" => {
+                self.save_project_dialog();
+            }
+            "import" => {
+                self.import_mesh_dialog();
+            }
+            "export" => {
+                self.export_mesh_dialog();
             }
             "help" => {
                 self.log("Interactive: Line, Polyline, Circle, Box, Move, Copy, Rotate, Scale | Quick: Sphere [r], Extrude [h], Delete, Undo, Redo, ZoomExtents (ZE), Wireframe, Shaded, Ghosted, New");
@@ -463,6 +535,24 @@ impl eframe::App for ElephantApp {
                         self.execute_command("New");
                         ui.close_menu();
                     }
+                    if ui.button("Open (.elephant)...").clicked() {
+                        self.open_project_dialog();
+                        ui.close_menu();
+                    }
+                    if ui.button("Save As (.elephant)...").clicked() {
+                        self.save_project_dialog();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Import (.obj / .stl)...").clicked() {
+                        self.import_mesh_dialog();
+                        ui.close_menu();
+                    }
+                    if ui.button("Export (.obj / .stl)...").clicked() {
+                        self.export_mesh_dialog();
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Exit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
