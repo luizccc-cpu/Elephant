@@ -104,11 +104,14 @@ impl ViewportCamera {
     pub fn proj_matrix(&self, aspect: f64) -> DMat4 {
         let aspect = aspect.max(0.05);
         if self.is_perspective {
-            DMat4::perspective_rh(self.fov_y_rad, aspect, 0.05, 5000.0)
+            let near = (self.distance * 0.001).max(0.05);
+            let far = (self.distance * 25.0).max(50_000.0);
+            DMat4::perspective_rh(self.fov_y_rad, aspect, near, far)
         } else {
             let hh = self.ortho_half_height.max(0.1);
             let hw = hh * aspect;
-            DMat4::orthographic_rh(-hw, hw, -hh, hh, -5000.0, 5000.0)
+            let z_extent = (hh * 25.0).max(50_000.0);
+            DMat4::orthographic_rh(-hw, hw, -hh, hh, -z_extent, z_extent)
         }
     }
 
@@ -151,9 +154,9 @@ impl ViewportCamera {
     pub fn zoom(&mut self, scroll_delta: f64) {
         let factor = (1.0 - scroll_delta * 0.0015).clamp(0.5, 2.0);
         if self.is_perspective {
-            self.distance = (self.distance * factor).clamp(0.5, 2000.0);
+            self.distance = (self.distance * factor).clamp(0.1, 10_000_000.0);
         } else {
-            self.ortho_half_height = (self.ortho_half_height * factor).clamp(0.2, 2000.0);
+            self.ortho_half_height = (self.ortho_half_height * factor).clamp(0.1, 10_000_000.0);
         }
     }
 
@@ -166,8 +169,8 @@ impl ViewportCamera {
         }
         self.target = aabb.center();
         let radius = (aabb.size().length() * 0.5).max(1.0);
-        self.distance = (radius * 2.4).clamp(2.0, 1500.0);
-        self.ortho_half_height = (radius * 1.4).clamp(1.0, 1500.0);
+        self.distance = (radius * 2.2).clamp(1.0, 10_000_000.0);
+        self.ortho_half_height = (radius * 1.15).clamp(0.5, 10_000_000.0);
     }
 }
 

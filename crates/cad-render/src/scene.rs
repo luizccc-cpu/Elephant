@@ -37,6 +37,7 @@ pub struct LineVertex {
 
 #[derive(Debug, Default, Clone)]
 pub struct RenderScene {
+    pub version: u64,
     pub mesh_vertices: Vec<MeshVertex>,
     pub mesh_indices: Vec<u32>,
     pub line_vertices: Vec<LineVertex>,
@@ -45,9 +46,26 @@ pub struct RenderScene {
 const SELECTION_COLOR: [f32; 4] = [1.0, 0.85, 0.12, 1.0];
 
 impl RenderScene {
-    pub fn build(doc: &Document, mode: DisplayMode, cplane: &Plane) -> Self {
-        let mut scene = Self::default();
-        scene.push_cplane_grid(cplane, 20, 1.0);
+    pub fn build(doc: &Document, mode: DisplayMode, cplane: &Plane, version: u64) -> Self {
+        let mut scene = Self {
+            version,
+            ..Default::default()
+        };
+        let mut total_aabb = cad_math::Aabb::EMPTY;
+        for (_, obj) in &doc.objects {
+            if let Some(layer) = doc.layers.get(obj.layer_id) {
+                if layer.visible {
+                    total_aabb = total_aabb.union(&obj.aabb);
+                }
+            }
+        }
+        let grid_step = if total_aabb.is_empty() {
+            1.0
+        } else {
+            let max_dim = total_aabb.size().max_element().max(1.0);
+            10.0_f64.powf((max_dim / 30.0).log10().floor()).max(1.0)
+        };
+        scene.push_cplane_grid(cplane, 20, grid_step);
 
         for (_, obj) in &doc.objects {
             let Some(layer) = doc.layers.get(obj.layer_id) else {
@@ -83,13 +101,25 @@ impl RenderScene {
                     scene.push_line([pf[0], pf[1], pf[2] - d], [pf[0], pf[1], pf[2] + d], base_color);
                 }
                 Geometry::Curve(curve) => {
-                    let pts = curve.sample_polyline(48);
-                    for pair in pts.windows(2) {
-                        scene.push_line(
-                            [pair[0].x as f32, pair[0].y as f32, pair[0].z as f32],
-                            [pair[1].x as f32, pair[1].y as f32, pair[1].z as f32],
-                            base_color,
-                        );
+                    if curve.degree == 1 {
+                        for pair in curve.control_points.windows(2) {
+                            let a = pair[0].position;
+                            let b = pair[1].position;
+                            scene.push_line(
+                                [a.x as f32, a.y as f32, a.z as f32],
+                                [b.x as f32, b.y as f32, b.z as f32],
+                                base_color,
+                            );
+                        }
+                    } else {
+                        let pts = curve.sample_polyline(32);
+                        for pair in pts.windows(2) {
+                            scene.push_line(
+                                [pair[0].x as f32, pair[0].y as f32, pair[0].z as f32],
+                                [pair[1].x as f32, pair[1].y as f32, pair[1].z as f32],
+                                base_color,
+                            );
+                        }
                     }
                 }
                 Geometry::Surface(surf) => {

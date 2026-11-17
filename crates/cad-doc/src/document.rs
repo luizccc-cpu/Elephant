@@ -25,7 +25,7 @@ impl Default for Document {
 impl Document {
     pub fn new() -> Self {
         let mut layers = SlotMap::with_key();
-        let active_layer = layers.insert(Layer::new("Default", [20, 20, 20, 255]));
+        let active_layer = layers.insert(Layer::new("Default", [215, 220, 228, 255]));
         Self {
             tolerances: Tolerances::default(),
             layers,

@@ -15,22 +15,23 @@ struct UniformData {
     view_proj: [[f32; 4]; 4],
 }
 
-struct ViewportBuffers {
+struct ViewportUniform {
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+}
+
+/// Shared `wgpu` pipelines, shared scene GPU buffers, and per-viewport uniforms.
+pub struct CadWgpuState {
+    mesh_pipeline: wgpu::RenderPipeline,
+    line_pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    viewports: HashMap<u8, ViewportUniform>,
+    uploaded_version: u64,
     mesh_vb: Option<wgpu::Buffer>,
     mesh_ib: Option<wgpu::Buffer>,
     mesh_index_count: u32,
     line_vb: Option<wgpu::Buffer>,
     line_vertex_count: u32,
-}
-
-/// Shared `wgpu` pipelines and per-viewport buffers stored in `egui_wgpu::CallbackResources`.
-pub struct CadWgpuState {
-    mesh_pipeline: wgpu::RenderPipeline,
-    line_pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-    viewports: HashMap<u8, ViewportBuffers>,
 }
 
 impl CadWgpuState {
@@ -139,6 +140,12 @@ impl CadWgpuState {
             line_pipeline,
             bind_group_layout,
             viewports: HashMap::new(),
+            uploaded_version: 0,
+            mesh_vb: None,
+            mesh_ib: None,
+            mesh_index_count: 0,
+            line_vb: None,
+            line_vertex_count: 0,
         }
     }
 }
@@ -189,14 +196,9 @@ impl egui_wgpu::CallbackTrait for ViewportPaintCallback {
                     resource: uniform_buffer.as_entire_binding(),
                 }],
             });
-            ViewportBuffers {
+            ViewportUniform {
                 uniform_buffer,
                 bind_group,
-                mesh_vb: None,
-                mesh_ib: None,
-                mesh_index_count: 0,
-                line_vb: None,
-                line_vertex_count: 0,
             }
         });
 
@@ -208,31 +210,34 @@ impl egui_wgpu::CallbackTrait for ViewportPaintCallback {
             }),
         );
 
-        if !self.scene.mesh_vertices.is_empty() && !self.scene.mesh_indices.is_empty() {
-            entry.mesh_vb = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("cad_mesh_vb"),
-                contents: bytemuck::cast_slice(&self.scene.mesh_vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            }));
-            entry.mesh_ib = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("cad_mesh_ib"),
-                contents: bytemuck::cast_slice(&self.scene.mesh_indices),
-                usage: wgpu::BufferUsages::INDEX,
-            }));
-            entry.mesh_index_count = self.scene.mesh_indices.len() as u32;
-        } else {
-            entry.mesh_index_count = 0;
-        }
+        if state.uploaded_version != self.scene.version {
+            state.uploaded_version = self.scene.version;
+            if !self.scene.mesh_vertices.is_empty() && !self.scene.mesh_indices.is_empty() {
+                state.mesh_vb = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("cad_mesh_vb"),
+                    contents: bytemuck::cast_slice(&self.scene.mesh_vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }));
+                state.mesh_ib = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("cad_mesh_ib"),
+                    contents: bytemuck::cast_slice(&self.scene.mesh_indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                }));
+                state.mesh_index_count = self.scene.mesh_indices.len() as u32;
+            } else {
+                state.mesh_index_count = 0;
+            }
 
-        if !self.scene.line_vertices.is_empty() {
-            entry.line_vb = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("cad_line_vb"),
-                contents: bytemuck::cast_slice(&self.scene.line_vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            }));
-            entry.line_vertex_count = self.scene.line_vertices.len() as u32;
-        } else {
-            entry.line_vertex_count = 0;
+            if !self.scene.line_vertices.is_empty() {
+                state.line_vb = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("cad_line_vb"),
+                    contents: bytemuck::cast_slice(&self.scene.line_vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }));
+                state.line_vertex_count = self.scene.line_vertices.len() as u32;
+            } else {
+                state.line_vertex_count = 0;
+            }
         }
 
         Vec::new()
@@ -251,22 +256,22 @@ impl egui_wgpu::CallbackTrait for ViewportPaintCallback {
             return;
         };
 
-        if vp.line_vertex_count > 0 {
-            if let Some(vb) = &vp.line_vb {
+        if state.line_vertex_count > 0 {
+            if let Some(vb) = &state.line_vb {
                 render_pass.set_pipeline(&state.line_pipeline);
                 render_pass.set_bind_group(0, &vp.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, vb.slice(..));
-                render_pass.draw(0..vp.line_vertex_count, 0..1);
+                render_pass.draw(0..state.line_vertex_count, 0..1);
             }
         }
 
-        if vp.mesh_index_count > 0 {
-            if let (Some(vb), Some(ib)) = (&vp.mesh_vb, &vp.mesh_ib) {
+        if state.mesh_index_count > 0 {
+            if let (Some(vb), Some(ib)) = (&state.mesh_vb, &state.mesh_ib) {
                 render_pass.set_pipeline(&state.mesh_pipeline);
                 render_pass.set_bind_group(0, &vp.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, vb.slice(..));
                 render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..vp.mesh_index_count, 0, 0..1);
+                render_pass.draw_indexed(0..state.mesh_index_count, 0, 0..1);
             }
         }
     }

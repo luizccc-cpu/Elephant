@@ -84,6 +84,9 @@ struct ElephantApp {
     tool_tab: ToolPanelTab,
     parametric_graph: ParametricGraph,
     script_source: String,
+    cached_scene: Option<Arc<RenderScene>>,
+    scene_version: u64,
+    scene_dirty: bool,
 }
 
 impl ElephantApp {
@@ -112,6 +115,9 @@ impl ElephantApp {
             tool_tab: ToolPanelTab::None,
             parametric_graph: ParametricGraph::default(),
             script_source: DEFAULT_SAMPLE_SCRIPT.to_string(),
+            cached_scene: None,
+            scene_version: 1,
+            scene_dirty: true,
         };
         app.populate_starter_scene();
         app
@@ -181,6 +187,7 @@ impl ElephantApp {
                 Ok(doc) => {
                     self.session.cancel();
                     self.doc = doc;
+                    self.scene_dirty = true;
                     self.zoom_extents_all();
                     self.log(format!("Opened {}", path.display()));
                 }
@@ -209,6 +216,7 @@ impl ElephantApp {
         {
             match import_into_document(&path, &mut self.doc) {
                 Ok(n) => {
+                    self.scene_dirty = true;
                     self.zoom_extents_all();
                     self.log(format!("Imported {n} object(s) from {}", path.display()));
                 }
@@ -232,6 +240,7 @@ impl ElephantApp {
     }
 
     fn execute_command(&mut self, raw: &str) {
+        self.scene_dirty = true;
         let trimmed = raw.trim();
         let cplane = self.cameras[self.active_viewport].cplane;
 
@@ -511,6 +520,7 @@ impl ElephantApp {
                         if let Some(hit_id) = self.doc.pick_ray(&ray) {
                             self.doc.set_selected(hit_id, true);
                         }
+                        self.scene_dirty = true;
                     }
                 }
             }
@@ -612,14 +622,17 @@ impl eframe::App for ElephantApp {
                 ui.menu_button("View", |ui| {
                     if ui.button("Wireframe").clicked() {
                         self.display_mode = DisplayMode::Wireframe;
+                        self.scene_dirty = true;
                         ui.close_menu();
                     }
                     if ui.button("Shaded").clicked() {
                         self.display_mode = DisplayMode::Shaded;
+                        self.scene_dirty = true;
                         ui.close_menu();
                     }
                     if ui.button("Ghosted").clicked() {
                         self.display_mode = DisplayMode::Ghosted;
+                        self.scene_dirty = true;
                         ui.close_menu();
                     }
                     ui.separator();
@@ -729,7 +742,9 @@ impl eframe::App for ElephantApp {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.checkbox(&mut layer.locked, "Lock");
-                                    ui.checkbox(&mut layer.visible, "Vis");
+                                    if ui.checkbox(&mut layer.visible, "Vis").changed() {
+                                        self.scene_dirty = true;
+                                    }
                                 },
                             );
                         });
@@ -834,6 +849,7 @@ impl eframe::App for ElephantApp {
                             ui.checkbox(&mut self.parametric_graph.live_preview, "Live 3D Preview");
                             if ui.button("Bake to Document").clicked() {
                                 let n = self.parametric_graph.bake_into(&mut self.doc);
+                                self.scene_dirty = true;
                                 self.log(format!("Baked {n} parametric object(s)."));
                             }
                             ui.separator();
@@ -870,6 +886,7 @@ impl eframe::App for ElephantApp {
                             if ui.button("Run Script").clicked() {
                                 match run_rhai_script(&self.script_source, &mut self.doc) {
                                     Ok(res) => {
+                                        self.scene_dirty = true;
                                         for l in res.logs {
                                             self.log(format!("[Script] {l}"));
                                         }
@@ -897,21 +914,27 @@ impl eframe::App for ElephantApp {
         }
 
         let cplane = self.cameras[self.active_viewport].cplane;
-        let mut scene = RenderScene::build(&self.doc, self.display_mode, &cplane);
-        if self.parametric_graph.live_preview {
-            let param_geoms = self.parametric_graph.evaluate();
-            scene.push_preview(&param_geoms, None);
+        let has_dynamic_preview = self.session.is_active() || self.parametric_graph.live_preview;
+        if self.scene_dirty || has_dynamic_preview || self.cached_scene.is_none() {
+            self.scene_version = self.scene_version.wrapping_add(1).max(1);
+            let mut built = RenderScene::build(&self.doc, self.display_mode, &cplane, self.scene_version);
+            if self.parametric_graph.live_preview {
+                let param_geoms = self.parametric_graph.evaluate();
+                built.push_preview(&param_geoms, None);
+            }
+            if self.session.is_active() {
+                let previews = self.session.preview_geometry(self.cursor_world, &cplane);
+                let snap_marker = if self.last_snap_kind.is_some() {
+                    self.cursor_world
+                } else {
+                    None
+                };
+                built.push_preview(&previews, snap_marker);
+            }
+            self.cached_scene = Some(Arc::new(built));
+            self.scene_dirty = false;
         }
-        if self.session.is_active() {
-            let previews = self.session.preview_geometry(self.cursor_world, &cplane);
-            let snap_marker = if self.last_snap_kind.is_some() {
-                self.cursor_world
-            } else {
-                None
-            };
-            scene.push_preview(&previews, snap_marker);
-        }
-        let scene = Arc::new(scene);
+        let scene = Arc::clone(self.cached_scene.as_ref().unwrap());
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::from_rgb(28, 30, 34)))
@@ -919,9 +942,10 @@ impl eframe::App for ElephantApp {
                 if let Some(max_idx) = self.maximized_viewport {
                     self.draw_viewport(ui, max_idx, &scene);
                 } else {
+                    ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
                     let avail = ui.available_size();
-                    let half_w = (avail.x - 4.0).max(32.0) * 0.5;
-                    let half_h = (avail.y - 4.0).max(32.0) * 0.5;
+                    let half_w = (avail.x - 2.0).max(32.0) * 0.5;
+                    let half_h = (avail.y - 2.0).max(32.0) * 0.5;
 
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
