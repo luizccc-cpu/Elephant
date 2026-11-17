@@ -333,7 +333,7 @@ impl ElephantApp {
 
     fn import_mesh_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("3D Files (.3dm, .obj, .stl)", &["3dm", "obj", "stl"])
+            .add_filter("CAD / 3D Files (.3dm, .dxf, .obj, .stl)", &["3dm", "dxf", "obj", "stl"])
             .pick_file()
         {
             match import_into_document(&path, &mut self.doc) {
@@ -351,6 +351,9 @@ impl ElephantApp {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Wavefront OBJ", &["obj"])
             .add_filter("Binary STL", &["stl"])
+            .add_filter("glTF Binary (.glb)", &["glb"])
+            .add_filter("AutoCAD DXF (.dxf)", &["dxf"])
+            .add_filter("Scalable Vector Graphics (.svg)", &["svg"])
             .set_file_name("export.obj")
             .save_file()
         {
@@ -1565,11 +1568,11 @@ impl eframe::App for ElephantApp {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Import (.3dm / .obj / .stl)...").clicked() {
+                    if ui.button("Import (.3dm / .dxf / .obj / .stl)...").clicked() {
                         self.import_mesh_dialog();
                         ui.close_menu();
                     }
-                    if ui.button("Export (.obj / .stl)...").clicked() {
+                    if ui.button("Export (.obj / .stl / .glb / .dxf / .svg)...").clicked() {
                         self.export_mesh_dialog();
                         ui.close_menu();
                     }

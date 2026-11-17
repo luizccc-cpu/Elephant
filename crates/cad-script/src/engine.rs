@@ -60,6 +60,37 @@ pub fn run_rhai_script(source: &str, doc: &mut Document) -> Result<ScriptResult,
         });
     }
     {
+        let p = Rc::clone(&pending);
+        engine.register_fn("add_cylinder", move |cx: f64, cy: f64, cz: f64, r: f64, h: f64| {
+            let mesh = TriangleMesh::from_cylinder(DVec3::new(cx, cy, cz), r.max(0.01), h, 32);
+            p.borrow_mut().push(("ScriptCylinder".to_string(), Geometry::Mesh(mesh)));
+        });
+    }
+    {
+        let p = Rc::clone(&pending);
+        engine.register_fn("add_cone", move |cx: f64, cy: f64, cz: f64, r: f64, h: f64| {
+            let mesh = TriangleMesh::from_cone(DVec3::new(cx, cy, cz), r.max(0.01), h, 32);
+            p.borrow_mut().push(("ScriptCone".to_string(), Geometry::Mesh(mesh)));
+        });
+    }
+    {
+        let p = Rc::clone(&pending);
+        engine.register_fn("add_torus", move |cx: f64, cy: f64, cz: f64, maj: f64, min: f64| {
+            let mesh = TriangleMesh::from_torus(DVec3::new(cx, cy, cz), maj.max(0.02), min.max(0.01), 32, 16);
+            p.borrow_mut().push(("ScriptTorus".to_string(), Geometry::Mesh(mesh)));
+        });
+    }
+    {
+        let p = Rc::clone(&pending);
+        engine.register_fn("add_rectangle", move |x0: f64, y0: f64, z0: f64, x1: f64, y1: f64| {
+            let mut plane = Plane::world_xy();
+            plane.origin = DVec3::new(x0, y0, z0);
+            if let Ok(rect) = NurbsCurve::rectangle(&plane, DVec3::new(x0, y0, z0), DVec3::new(x1, y1, z0)) {
+                p.borrow_mut().push(("ScriptRect".to_string(), Geometry::Curve(rect)));
+            }
+        });
+    }
+    {
         let l = Rc::clone(&logs);
         engine.register_fn("log", move |msg: &str| {
             l.borrow_mut().push(msg.to_string());

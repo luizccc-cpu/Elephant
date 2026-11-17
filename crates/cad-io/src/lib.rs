@@ -1,9 +1,12 @@
-//! File format importers and exporters (.elephant, .obj, .stl) for Elephant.
+//! File format importers and exporters (.elephant, .3dm, .dxf, .obj, .stl, .svg, .glb) for Elephant.
 
+pub mod dxf;
 pub mod error;
+pub mod gltf;
 pub mod obj;
 pub mod project;
 pub mod stl;
+pub mod svg;
 pub mod threedom;
 
 use std::path::Path;
@@ -31,6 +34,10 @@ pub fn import_into_document(path: &Path, doc: &mut Document) -> Result<usize, Io
             let bytes = std::fs::read(path)?;
             threedom::import_3dm_bytes(&bytes, doc)
         }
+        "dxf" => {
+            let text = std::fs::read_to_string(path)?;
+            dxf::import_dxf_str(&text, doc)
+        }
         other => Err(IoError::UnsupportedExtension(other.to_string())),
     }
 }
@@ -49,6 +56,21 @@ pub fn export_from_document(path: &Path, doc: &Document) -> Result<(), IoError> 
         }
         "stl" => {
             let bytes = stl::export_stl_bytes(doc);
+            std::fs::write(path, bytes)?;
+            Ok(())
+        }
+        "dxf" => {
+            let text = dxf::export_dxf_string(doc);
+            std::fs::write(path, text)?;
+            Ok(())
+        }
+        "svg" => {
+            let text = svg::export_svg_string(doc);
+            std::fs::write(path, text)?;
+            Ok(())
+        }
+        "glb" => {
+            let bytes = gltf::export_glb_bytes(doc);
             std::fs::write(path, bytes)?;
             Ok(())
         }
