@@ -126,6 +126,38 @@ impl Document {
         }
     }
 
+    pub fn select_all(&mut self) -> usize {
+        let mut count = 0;
+        for (_, obj) in &mut self.objects {
+            let unlocked = self
+                .layers
+                .get(obj.layer_id)
+                .map(|l| l.visible && !l.locked)
+                .unwrap_or(true);
+            if unlocked {
+                obj.selected = true;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub fn selection_aabb(&self) -> Option<Aabb> {
+        let mut out = Aabb::EMPTY;
+        let mut any = false;
+        for (_, obj) in &self.objects {
+            if obj.selected {
+                out = out.union(&obj.aabb);
+                any = true;
+            }
+        }
+        if any && !out.is_empty() {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
     /// Pick the closest visible, unlocked object intersected by `ray`.
     pub fn pick_ray(&self, ray: &Ray) -> Option<ObjectId> {
         for (id, _) in self.spatial.query_ray_candidates(ray) {

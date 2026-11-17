@@ -56,6 +56,8 @@ const KNOWN_COMMANDS: &[&str] = &[
     "Rotate",
     "Scale",
     "Delete",
+    "SelAll",
+    "SelNone",
     "Undo",
     "Redo",
     "ZoomExtents",
@@ -73,6 +75,40 @@ enum ToolPanelTab {
     Script,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GumballMode {
+    Move,
+    Rotate,
+}
+
+#[derive(Debug, Clone)]
+struct GumballDrag {
+    viewport_idx: usize,
+    axis: usize,
+    mode: GumballMode,
+    origin: DVec3,
+    last_pos: egui::Pos2,
+    axis_screen_dir: egui::Vec2,
+    px_per_world: f64,
+    total_amount: f64,
+    moved: bool,
+}
+
+#[derive(Debug, Clone)]
+struct GumballNumericPrompt {
+    axis: usize,
+    mode: GumballMode,
+    text: String,
+    just_opened: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MarqueeDrag {
+    viewport_idx: usize,
+    start: egui::Pos2,
+    current: egui::Pos2,
+}
+
 struct ElephantApp {
     doc: Document,
     cameras: [ViewportCamera; 4],
@@ -81,8 +117,15 @@ struct ElephantApp {
     display_mode: DisplayMode,
     session: CommandSession,
     snap: SnapConfig,
+    gumball_enabled: bool,
+    gumball_drag: Option<GumballDrag>,
+    gumball_prompt: Option<GumballNumericPrompt>,
+    marquee: Option<MarqueeDrag>,
     command_input: String,
     command_log: Vec<String>,
+    command_history: Vec<String>,
+    history_cursor: Option<usize>,
+    last_command: Option<String>,
     new_layer_name: String,
     cursor_world: Option<DVec3>,
     last_snap_kind: Option<SnapKind>,
@@ -109,11 +152,18 @@ impl ElephantApp {
             display_mode: DisplayMode::Shaded,
             session: CommandSession::default(),
             snap: SnapConfig::default(),
+            gumball_enabled: true,
+            gumball_drag: None,
+            gumball_prompt: None,
+            marquee: None,
             command_input: String::new(),
             command_log: vec![
                 "Elephant CAD initialized (local clean-room engine). Type 'Help' for commands."
                     .to_string(),
             ],
+            command_history: Vec::new(),
+            history_cursor: None,
+            last_command: None,
             new_layer_name: String::new(),
             cursor_world: None,
             last_snap_kind: None,
@@ -262,8 +312,19 @@ impl ElephantApp {
         }
 
         if trimmed.is_empty() {
+            if let Some(prev) = self.last_command.clone() {
+                self.execute_command(&prev);
+            }
             return;
         }
+        self.history_cursor = None;
+        if self.command_history.last().map(|s| s.as_str()) != Some(trimmed) {
+            self.command_history.push(trimmed.to_string());
+            if self.command_history.len() > 100 {
+                self.command_history.remove(0);
+            }
+        }
+        self.last_command = Some(trimmed.to_string());
         self.log(format!("> {trimmed}"));
         let mut parts = trimmed.split_whitespace();
         let cmd = parts.next().unwrap_or("").to_ascii_lowercase();
@@ -365,6 +426,14 @@ impl ElephantApp {
                 let n = self.doc.remove_selected();
                 self.log(format!("Deleted {n} object(s)."));
             }
+            "selall" => {
+                let n = self.doc.select_all();
+                self.log(format!("Selected {n} object(s)."));
+            }
+            "selnone" => {
+                self.doc.clear_selection();
+                self.log("Selection cleared.");
+            }
             "undo" => match self.doc.undo() {
                 Some(label) => self.log(format!("Undid '{label}'.")),
                 None => self.log("Nothing to undo."),
@@ -407,10 +476,59 @@ impl ElephantApp {
                 self.export_mesh_dialog();
             }
             "help" => {
-                self.log("Interactive: Line, Polyline, Circle, Box, Move, Copy, Rotate, Scale | Quick: Sphere [r], Extrude [h], Delete, Undo, Redo, ZoomExtents (ZE), Wireframe, Shaded, Ghosted, New");
+                self.log("Interactive: Line, Polyline, Circle, Box, Move, Copy, Rotate, Scale | Quick: Sphere [r], Extrude [h], Delete, SelAll, SelNone, Undo, Redo, ZoomExtents (ZE), Wireframe, Shaded, Ghosted, New");
             }
             _ => {
                 self.log(format!("Unknown command '{cmd}'. Type 'Help' for available commands."));
+            }
+        }
+    }
+
+    fn world_to_screen(pt: DVec3, m: &[f32; 16], rect: egui::Rect) -> Option<egui::Pos2> {
+        let (x, y, z) = (pt.x as f32, pt.y as f32, pt.z as f32);
+        let cx = m[0] * x + m[4] * y + m[8] * z + m[12];
+        let cy = m[1] * x + m[5] * y + m[9] * z + m[13];
+        let cw = m[3] * x + m[7] * y + m[11] * z + m[15];
+        if cw <= 1e-4 {
+            return None;
+        }
+        let ndc_x = cx / cw;
+        let ndc_y = cy / cw;
+        Some(egui::pos2(
+            rect.left() + (ndc_x * 0.5 + 0.5) * rect.width(),
+            rect.top() + (0.5 - ndc_y * 0.5) * rect.height(),
+        ))
+    }
+
+    fn dist_point_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+        let ab = b - a;
+        let len_sq = ab.length_sq();
+        if len_sq < 1e-6 {
+            return p.distance(a);
+        }
+        let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
+        p.distance(a + ab * t)
+    }
+
+    fn apply_raw_selected_transform(&mut self, mat: &DMat4) {
+        for (_, obj) in &mut self.doc.objects {
+            if obj.selected {
+                obj.geometry.transform(mat);
+                obj.refresh_aabb();
+            }
+        }
+        self.doc.rebuild_spatial_index();
+        self.scene_dirty = true;
+    }
+
+    fn gumball_matrix(axis: usize, mode: GumballMode, origin: DVec3, amount: f64) -> DMat4 {
+        let dir = [DVec3::X, DVec3::Y, DVec3::Z][axis];
+        match mode {
+            GumballMode::Move => DMat4::from_translation(dir * amount),
+            GumballMode::Rotate => {
+                DMat4::from_translation(origin)
+                    * DMat4::from_axis_angle(dir, amount)
+                    * DMat4::from_translation(-origin)
             }
         }
     }
@@ -454,6 +572,79 @@ impl ElephantApp {
 
                 let aspect = (rect.width() / rect.height().max(1.0)) as f64;
                 let cplane = self.cameras[idx].cplane;
+                let vp_cols = self.cameras[idx].view_proj_f32(aspect).to_cols_array();
+
+                // Compute Gumball handles if enabled and objects are selected
+                struct GumballHandle {
+                    axis: usize,
+                    p0: egui::Pos2,
+                    tip: egui::Pos2,
+                    rot_pos: egui::Pos2,
+                    px_per_world: f64,
+                }
+                let mut gumball_origin = DVec3::ZERO;
+                let mut gumball_handles: Vec<GumballHandle> = Vec::new();
+                if self.gumball_enabled && !self.session.is_active() {
+                    if let Some(aabb) = self.doc.selection_aabb() {
+                        gumball_origin = aabb.center();
+                        if let Some(p0) = Self::world_to_screen(gumball_origin, &vp_cols, rect) {
+                            let axes = [DVec3::X, DVec3::Y, DVec3::Z];
+                            let mut px_per_unit = [0.0_f64; 3];
+                            for (a, dir) in axes.iter().enumerate() {
+                                if let Some(p1) =
+                                    Self::world_to_screen(gumball_origin + *dir, &vp_cols, rect)
+                                {
+                                    px_per_unit[a] = (p1 - p0).length() as f64;
+                                }
+                            }
+                            let max_px = px_per_unit
+                                .iter()
+                                .copied()
+                                .fold(0.0_f64, f64::max)
+                                .max(1e-4);
+                            let world_len = 64.0 / max_px;
+                            for (a, dir) in axes.iter().enumerate() {
+                                if px_per_unit[a] > 1e-4 {
+                                    if let Some(tip) = Self::world_to_screen(
+                                        gumball_origin + *dir * world_len,
+                                        &vp_cols,
+                                        rect,
+                                    ) {
+                                        let len_px = (tip - p0).length();
+                                        if len_px >= 10.0 {
+                                            let rot_pos = p0 + (tip - p0) * 0.52;
+                                            gumball_handles.push(GumballHandle {
+                                                axis: a,
+                                                p0,
+                                                tip,
+                                                rot_pos,
+                                                px_per_world: px_per_unit[a],
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let hit_gumball = |pos: egui::Pos2| -> Option<(usize, GumballMode, egui::Vec2, f64)> {
+                    for h in &gumball_handles {
+                        if pos.distance(h.rot_pos) <= 9.0 {
+                            let dir = (h.tip - h.p0).normalized();
+                            return Some((h.axis, GumballMode::Rotate, dir, h.px_per_world));
+                        }
+                    }
+                    for h in &gumball_handles {
+                        if Self::dist_point_to_segment(pos, h.p0, h.tip) <= 8.0
+                            || pos.distance(h.tip) <= 10.0
+                        {
+                            let dir = (h.tip - h.p0).normalized();
+                            return Some((h.axis, GumballMode::Move, dir, h.px_per_world));
+                        }
+                    }
+                    None
+                };
 
                 if response.hovered() {
                     self.active_viewport = idx;
@@ -493,12 +684,166 @@ impl ElephantApp {
                     } else {
                         self.cameras[idx].pan(delta.x as f64, delta.y as f64, rect.height() as f64);
                     }
-                } else if response.clicked_by(egui::PointerButton::Secondary)
-                    && self.session.is_active()
-                {
-                    let outcome = self.session.finish_or_cancel(&mut self.doc);
-                    for m in outcome.messages {
-                        self.log(m);
+                } else if response.clicked_by(egui::PointerButton::Secondary) {
+                    if self.session.is_active() {
+                        let outcome = self.session.finish_or_cancel(&mut self.doc);
+                        for m in outcome.messages {
+                            self.log(m);
+                        }
+                    } else if let Some(prev) = self.last_command.clone() {
+                        self.execute_command(&prev);
+                    }
+                }
+
+                // Primary drag: Gumball or Marquee selection (when session is idle)
+                if !self.session.is_active() {
+                    if response.drag_started_by(egui::PointerButton::Primary) {
+                        self.active_viewport = idx;
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            if let Some((axis, mode, axis_screen_dir, px_per_world)) =
+                                hit_gumball(pos)
+                            {
+                                self.gumball_drag = Some(GumballDrag {
+                                    viewport_idx: idx,
+                                    axis,
+                                    mode,
+                                    origin: gumball_origin,
+                                    last_pos: pos,
+                                    axis_screen_dir,
+                                    px_per_world,
+                                    total_amount: 0.0,
+                                    moved: false,
+                                });
+                            } else {
+                                self.marquee = Some(MarqueeDrag {
+                                    viewport_idx: idx,
+                                    start: pos,
+                                    current: pos,
+                                });
+                            }
+                        }
+                    }
+
+                    if let Some(mut drag) = self.gumball_drag.take() {
+                        if drag.viewport_idx == idx {
+                            if response.dragged_by(egui::PointerButton::Primary) {
+                                if let Some(pos) = response.interact_pointer_pos() {
+                                    let delta = pos - drag.last_pos;
+                                    drag.last_pos = pos;
+                                    let d_amt = match drag.mode {
+                                        GumballMode::Move => {
+                                            let px = delta.dot(drag.axis_screen_dir) as f64;
+                                            px / drag.px_per_world.max(1e-4)
+                                        }
+                                        GumballMode::Rotate => {
+                                            (delta.x - delta.y) as f64 * 0.01
+                                        }
+                                    };
+                                    if d_amt.abs() > 1e-9 {
+                                        let mat = Self::gumball_matrix(
+                                            drag.axis,
+                                            drag.mode,
+                                            drag.origin,
+                                            d_amt,
+                                        );
+                                        self.apply_raw_selected_transform(&mat);
+                                        drag.total_amount += d_amt;
+                                        drag.moved = true;
+                                    }
+                                }
+                                self.gumball_drag = Some(drag);
+                            } else {
+                                if drag.moved && drag.total_amount.abs() > 1e-9 {
+                                    let revert = Self::gumball_matrix(
+                                        drag.axis,
+                                        drag.mode,
+                                        drag.origin,
+                                        -drag.total_amount,
+                                    );
+                                    self.apply_raw_selected_transform(&revert);
+                                    let final_mat = Self::gumball_matrix(
+                                        drag.axis,
+                                        drag.mode,
+                                        drag.origin,
+                                        drag.total_amount,
+                                    );
+                                    let label = match drag.mode {
+                                        GumballMode::Move => "Gumball Move",
+                                        GumballMode::Rotate => "Gumball Rotate",
+                                    };
+                                    self.doc.transform_selected(label, &final_mat);
+                                    self.scene_dirty = true;
+                                }
+                            }
+                        } else {
+                            self.gumball_drag = Some(drag);
+                        }
+                    }
+
+                    if let Some(mut m) = self.marquee.take() {
+                        if m.viewport_idx == idx {
+                            if response.dragged_by(egui::PointerButton::Primary) {
+                                if let Some(pos) = response.interact_pointer_pos() {
+                                    m.current = pos;
+                                }
+                                self.marquee = Some(m);
+                            } else {
+                                let sel_rect = egui::Rect::from_two_pos(m.start, m.current);
+                                if sel_rect.width() > 4.0 || sel_rect.height() > 4.0 {
+                                    let crossing = m.current.x < m.start.x;
+                                    let shift = ui.input(|i| i.modifiers.shift);
+                                    let ctrl = ui.input(|i| i.modifiers.ctrl);
+                                    if !shift && !ctrl {
+                                        self.doc.clear_selection();
+                                    }
+                                    let ids: Vec<_> = self.doc.objects.keys().collect();
+                                    for id in ids {
+                                        let Some(obj) = self.doc.objects.get(id) else {
+                                            continue;
+                                        };
+                                        let Some(layer) = self.doc.layers.get(obj.layer_id) else {
+                                            continue;
+                                        };
+                                        if !layer.visible || layer.locked {
+                                            continue;
+                                        }
+                                        let min = obj.aabb.min;
+                                        let max = obj.aabb.max;
+                                        let corners = [
+                                            DVec3::new(min.x, min.y, min.z),
+                                            DVec3::new(max.x, min.y, min.z),
+                                            DVec3::new(min.x, max.y, min.z),
+                                            DVec3::new(max.x, max.y, min.z),
+                                            DVec3::new(min.x, min.y, max.z),
+                                            DVec3::new(max.x, min.y, max.z),
+                                            DVec3::new(min.x, max.y, max.z),
+                                            DVec3::new(max.x, max.y, max.z),
+                                        ];
+                                        let mut obj_rect = egui::Rect::NOTHING;
+                                        for c in corners {
+                                            if let Some(sp) =
+                                                Self::world_to_screen(c, &vp_cols, rect)
+                                            {
+                                                obj_rect.extend_with(sp);
+                                            }
+                                        }
+                                        if obj_rect.is_positive() {
+                                            let hit = if crossing {
+                                                sel_rect.intersects(obj_rect)
+                                            } else {
+                                                sel_rect.contains_rect(obj_rect)
+                                            };
+                                            if hit {
+                                                self.doc.set_selected(id, !ctrl);
+                                            }
+                                        }
+                                    }
+                                    self.scene_dirty = true;
+                                }
+                            }
+                        } else {
+                            self.marquee = Some(m);
+                        }
                     }
                 }
 
@@ -522,13 +867,31 @@ impl ElephantApp {
                                     self.log(m);
                                 }
                             }
+                        } else if let Some((axis, mode, _, _)) = hit_gumball(pos) {
+                            self.gumball_prompt = Some(GumballNumericPrompt {
+                                axis,
+                                mode,
+                                text: String::new(),
+                                just_opened: true,
+                            });
                         } else {
                             let shift = ui.input(|i| i.modifiers.shift);
-                            if !shift {
+                            let ctrl = ui.input(|i| i.modifiers.ctrl);
+                            if !shift && !ctrl {
                                 self.doc.clear_selection();
                             }
                             if let Some(hit_id) = self.doc.pick_ray(&ray) {
-                                self.doc.set_selected(hit_id, true);
+                                if ctrl {
+                                    let cur = self
+                                        .doc
+                                        .objects
+                                        .get(hit_id)
+                                        .map(|o| o.selected)
+                                        .unwrap_or(false);
+                                    self.doc.set_selected(hit_id, !cur);
+                                } else {
+                                    self.doc.set_selected(hit_id, true);
+                                }
                             }
                             self.scene_dirty = true;
                         }
@@ -544,6 +907,54 @@ impl ElephantApp {
                     },
                 );
                 ui.painter().add(cb);
+
+                // Draw Gumball overlay
+                let painter = ui.painter_at(rect);
+                if !gumball_handles.is_empty() {
+                    let axis_colors = [
+                        egui::Color32::from_rgb(235, 75, 75),
+                        egui::Color32::from_rgb(80, 210, 95),
+                        egui::Color32::from_rgb(75, 145, 245),
+                    ];
+                    for h in &gumball_handles {
+                        let col = axis_colors[h.axis];
+                        painter.line_segment([h.p0, h.tip], egui::Stroke::new(2.2_f32, col));
+                        let dir = (h.tip - h.p0).normalized();
+                        let perp = egui::vec2(-dir.y, dir.x);
+                        let base = h.tip - dir * 10.0;
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![h.tip, base + perp * 4.5, base - perp * 4.5],
+                            col,
+                            egui::Stroke::NONE,
+                        ));
+                        painter.circle_stroke(h.rot_pos, 5.0, egui::Stroke::new(2.0_f32, col));
+                    }
+                    painter.circle_filled(
+                        gumball_handles[0].p0,
+                        3.5,
+                        egui::Color32::from_rgb(235, 235, 240),
+                    );
+                }
+
+                // Draw Marquee selection rectangle
+                if let Some(m) = &self.marquee {
+                    if m.viewport_idx == idx {
+                        let sel_rect = egui::Rect::from_two_pos(m.start, m.current);
+                        let crossing = m.current.x < m.start.x;
+                        let (fill, stroke_col) = if crossing {
+                            (
+                                egui::Color32::from_rgba_unmultiplied(80, 200, 110, 35),
+                                egui::Color32::from_rgb(90, 220, 120),
+                            )
+                        } else {
+                            (
+                                egui::Color32::from_rgba_unmultiplied(70, 145, 240, 35),
+                                egui::Color32::from_rgb(90, 165, 250),
+                            )
+                        };
+                        painter.rect(sel_rect, 0.0, fill, egui::Stroke::new(1.5_f32, stroke_col));
+                    }
+                }
             });
         });
     }
@@ -551,15 +962,25 @@ impl ElephantApp {
 
 impl eframe::App for ElephantApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.session.is_active() {
-            let msg = self.session.cancel();
-            self.log(msg);
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.gumball_prompt.is_some() {
+                self.gumball_prompt = None;
+            } else if self.session.is_active() {
+                let msg = self.session.cancel();
+                self.log(msg);
+            } else {
+                self.doc.clear_selection();
+                self.scene_dirty = true;
+            }
         }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z)) {
             self.execute_command("Undo");
         }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Y)) {
             self.execute_command("Redo");
+        }
+        if !ctx.wants_keyboard_input() && ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::A)) {
+            self.execute_command("SelAll");
         }
         if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
             self.execute_command("Delete");
@@ -689,6 +1110,36 @@ impl eframe::App for ElephantApp {
                         .desired_width(380.0)
                         .hint_text("Command, x,y,z, @dx,dy,dz, or distance"),
                 );
+                if edit.has_focus() && !self.command_history.is_empty() {
+                    if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                        let next = match self.history_cursor {
+                            None => self.command_history.len() - 1,
+                            Some(c) => c.saturating_sub(1),
+                        };
+                        self.history_cursor = Some(next);
+                        self.command_input = self.command_history[next].clone();
+                    } else if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                        if let Some(c) = self.history_cursor {
+                            if c + 1 < self.command_history.len() {
+                                self.history_cursor = Some(c + 1);
+                                self.command_input = self.command_history[c + 1].clone();
+                            } else {
+                                self.history_cursor = None;
+                                self.command_input.clear();
+                            }
+                        }
+                    } else if ui.input(|i| i.key_pressed(egui::Key::Tab)) && !self.session.is_active() {
+                        let typed = self.command_input.trim().to_ascii_lowercase();
+                        if !typed.is_empty() {
+                            if let Some(&cand) = KNOWN_COMMANDS
+                                .iter()
+                                .find(|c| c.to_ascii_lowercase().starts_with(&typed))
+                            {
+                                self.command_input = cand.to_string();
+                            }
+                        }
+                    }
+                }
                 if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     let cmd = std::mem::take(&mut self.command_input);
                     self.execute_command(&cmd);
@@ -829,6 +1280,7 @@ impl eframe::App for ElephantApp {
                     ui.label("CPlane: --");
                 }
                 ui.separator();
+                ui.checkbox(&mut self.gumball_enabled, "Gumball");
                 ui.checkbox(&mut self.snap.grid_snap, "Grid Snap");
                 ui.checkbox(&mut self.snap.ortho, "Ortho");
                 ui.checkbox(&mut self.snap.osnap_enabled, "OSnap");
@@ -836,6 +1288,8 @@ impl eframe::App for ElephantApp {
                     ui.checkbox(&mut self.snap.osnap_end, "End");
                     ui.checkbox(&mut self.snap.osnap_mid, "Mid");
                     ui.checkbox(&mut self.snap.osnap_center, "Cen");
+                    ui.checkbox(&mut self.snap.osnap_quad, "Quad");
+                    ui.checkbox(&mut self.snap.osnap_near, "Near");
                 }
                 ui.separator();
                 let sel_count = self.doc.objects.values().filter(|o| o.selected).count();
@@ -999,5 +1453,62 @@ impl eframe::App for ElephantApp {
                     });
                 }
             });
+
+        if let Some(mut prompt) = self.gumball_prompt.take() {
+            let axis_name = ["X", "Y", "Z"][prompt.axis];
+            let title = match prompt.mode {
+                GumballMode::Move => format!("Gumball Move {axis_name}"),
+                GumballMode::Rotate => format!("Gumball Rotate {axis_name} (deg)"),
+            };
+            let mut keep = true;
+            let mut commit_val: Option<f64> = None;
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let res = ui.add(
+                            egui::TextEdit::singleline(&mut prompt.text)
+                                .desired_width(120.0)
+                                .hint_text("Enter value..."),
+                        );
+                        if prompt.just_opened {
+                            res.request_focus();
+                            prompt.just_opened = false;
+                        }
+                        if (res.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                            || ui.button("Apply").clicked()
+                        {
+                            if let Ok(v) = prompt.text.trim().parse::<f64>() {
+                                commit_val = Some(v);
+                            }
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                });
+            if let Some(v) = commit_val {
+                if let Some(aabb) = self.doc.selection_aabb() {
+                    let origin = aabb.center();
+                    let amount = match prompt.mode {
+                        GumballMode::Move => v,
+                        GumballMode::Rotate => v.to_radians(),
+                    };
+                    let mat = Self::gumball_matrix(prompt.axis, prompt.mode, origin, amount);
+                    let label = match prompt.mode {
+                        GumballMode::Move => "Gumball Move",
+                        GumballMode::Rotate => "Gumball Rotate",
+                    };
+                    let n = self.doc.transform_selected(label, &mat);
+                    self.scene_dirty = true;
+                    self.log(format!("{label} {axis_name} by {v} on {n} object(s)."));
+                }
+            } else if keep {
+                self.gumball_prompt = Some(prompt);
+            }
+        }
     }
 }
