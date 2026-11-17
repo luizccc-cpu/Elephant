@@ -4,6 +4,7 @@ pub mod error;
 pub mod obj;
 pub mod project;
 pub mod stl;
+pub mod threedom;
 
 use std::path::Path;
 
@@ -25,6 +26,10 @@ pub fn import_into_document(path: &Path, doc: &mut Document) -> Result<usize, Io
             let bytes = std::fs::read(path)?;
             let name = path.file_stem().and_then(|s| s.to_str()).map(String::from);
             stl::import_stl_bytes(&bytes, doc, name)
+        }
+        "3dm" => {
+            let bytes = std::fs::read(path)?;
+            threedom::import_3dm_bytes(&bytes, doc)
         }
         other => Err(IoError::UnsupportedExtension(other.to_string())),
     }
@@ -57,6 +62,17 @@ pub fn export_from_document(path: &Path, doc: &Document) -> Result<(), IoError> 
 }
 
 pub fn open_project_file(path: &Path) -> Result<Document, IoError> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "3dm" {
+        let mut doc = Document::new();
+        let bytes = std::fs::read(path)?;
+        threedom::import_3dm_bytes(&bytes, &mut doc)?;
+        return Ok(doc);
+    }
     let text = std::fs::read_to_string(path)?;
     project::load_project_json(&text)
 }

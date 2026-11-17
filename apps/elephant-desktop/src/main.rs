@@ -174,7 +174,7 @@ impl ElephantApp {
 
     fn open_project_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Elephant Project", &["elephant", "json"])
+            .add_filter("CAD Projects (.elephant, .3dm)", &["elephant", "3dm", "json"])
             .pick_file()
         {
             match open_project_file(&path) {
@@ -204,7 +204,7 @@ impl ElephantApp {
 
     fn import_mesh_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("3D Mesh (OBJ, STL)", &["obj", "stl"])
+            .add_filter("3D Files (.3dm, .obj, .stl)", &["3dm", "obj", "stl"])
             .pick_file()
         {
             match import_into_document(&path, &mut self.doc) {
@@ -551,7 +551,7 @@ impl eframe::App for ElephantApp {
                         self.execute_command("New");
                         ui.close_menu();
                     }
-                    if ui.button("Open (.elephant)...").clicked() {
+                    if ui.button("Open (.elephant / .3dm)...").clicked() {
                         self.open_project_dialog();
                         ui.close_menu();
                     }
@@ -560,7 +560,7 @@ impl eframe::App for ElephantApp {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Import (.obj / .stl)...").clicked() {
+                    if ui.button("Import (.3dm / .obj / .stl)...").clicked() {
                         self.import_mesh_dialog();
                         ui.close_menu();
                     }
