@@ -1,8 +1,28 @@
-use cad_geom::{Aabb, Geometry};
+use cad_geom::{Aabb, DVec3, Geometry};
 use serde::{Deserialize, Serialize};
 use slotmap::new_key_type;
 
 use crate::layer::LayerId;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnnotationKind {
+    Dimension,
+    Text,
+    TextDot,
+    Leader,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnnotationItem {
+    pub kind: AnnotationKind,
+    pub layer_id: LayerId,
+    pub color: Option<[u8; 4]>,
+    pub text: String,
+    pub position: DVec3,
+    pub p1: Option<DVec3>,
+    pub p2: Option<DVec3>,
+    pub offset_pt: Option<DVec3>,
+}
 
 new_key_type! {
     pub struct ObjectId;

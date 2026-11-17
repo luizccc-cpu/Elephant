@@ -1,4 +1,4 @@
-use cad_doc::Document;
+use cad_doc::{AnnotationItem, AnnotationKind, Document};
 use cad_geom::{DMat4, DVec3, Geometry, NurbsCurve, Plane, TriangleMesh};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,6 +23,8 @@ pub enum ActiveTool {
     ArrayLinear { count: usize, base: Option<DVec3> },
     ArrayPolar { count: usize },
     Distance { first: Option<DVec3> },
+    Dim { p1: Option<DVec3>, p2: Option<DVec3> },
+    TextDot { label: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,7 +85,8 @@ impl CommandSession {
             ActiveTool::Mirror { start } => *start,
             ActiveTool::ArrayLinear { base, .. } => *base,
             ActiveTool::Distance { first } => *first,
-            ActiveTool::Offset { .. } | ActiveTool::ArrayPolar { .. } | ActiveTool::Idle => None,
+            ActiveTool::Dim { p1, p2 } => p2.or(*p1),
+            ActiveTool::Offset { .. } | ActiveTool::ArrayPolar { .. } | ActiveTool::TextDot { .. } | ActiveTool::Idle => None,
         }
     }
 
@@ -132,6 +135,10 @@ impl CommandSession {
             ActiveTool::ArrayPolar { .. } => "Center of polar array (or enter count)",
             ActiveTool::Distance { first: None } => "First point for distance",
             ActiveTool::Distance { first: Some(_) } => "Second point for distance",
+            ActiveTool::Dim { p1: None, .. } => "First dimension point",
+            ActiveTool::Dim { p2: None, .. } => "Second dimension point",
+            ActiveTool::Dim { .. } => "Dimension line location",
+            ActiveTool::TextDot { .. } => "Location of text dot",
         }
     }
 
@@ -268,6 +275,16 @@ impl CommandSession {
             }
             "distance" | "dist" => {
                 self.tool = ActiveTool::Distance { first: None };
+                Some(self.prompt().to_string())
+            }
+            "dim" | "dimaligned" => {
+                self.tool = ActiveTool::Dim { p1: None, p2: None };
+                Some(self.prompt().to_string())
+            }
+            "textdot" | "dot" => {
+                self.tool = ActiveTool::TextDot {
+                    label: "Note".to_string(),
+                };
                 Some(self.prompt().to_string())
             }
             _ => None,
@@ -712,6 +729,50 @@ impl CommandSession {
                     CommandOutcome::msg(self.prompt())
                 }
             }
+            ActiveTool::Dim { p1, p2 } => {
+                if p1.is_none() {
+                    *p1 = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                } else if p2.is_none() {
+                    *p2 = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                } else {
+                    let a = p1.unwrap();
+                    let b = p2.unwrap();
+                    let dist = a.distance(b);
+                    let dir = (b - a).normalize_or_zero();
+                    let perp = pt - (a + dir * (pt - a).dot(dir));
+                    let mid = (a + b) * 0.5 + perp;
+                    let text = format!("{dist:.2}");
+                    doc.add_annotation(AnnotationItem {
+                        kind: AnnotationKind::Dimension,
+                        layer_id: doc.active_layer,
+                        color: None,
+                        text: text.clone(),
+                        position: mid,
+                        p1: Some(a),
+                        p2: Some(b),
+                        offset_pt: Some(pt),
+                    });
+                    self.tool = ActiveTool::Idle;
+                    CommandOutcome::done(format!("Created Dimension: {text}"))
+                }
+            }
+            ActiveTool::TextDot { label } => {
+                let text = label.clone();
+                doc.add_annotation(AnnotationItem {
+                    kind: AnnotationKind::TextDot,
+                    layer_id: doc.active_layer,
+                    color: None,
+                    text: text.clone(),
+                    position: pt,
+                    p1: None,
+                    p2: None,
+                    offset_pt: None,
+                });
+                self.tool = ActiveTool::Idle;
+                CommandOutcome::done(format!("Created TextDot '{text}'."))
+            }
         }
     }
 
@@ -837,8 +898,21 @@ impl CommandSession {
             ActiveTool::Line { start: Some(s) }
             | ActiveTool::Mirror { start: Some(s) }
             | ActiveTool::Revolve { axis_start: Some(s) }
-            | ActiveTool::Distance { first: Some(s) } => {
+            | ActiveTool::Distance { first: Some(s) }
+            | ActiveTool::Dim { p1: Some(s), p2: None } => {
                 vec![Geometry::Curve(NurbsCurve::line(*s, cur))]
+            }
+            ActiveTool::Dim {
+                p1: Some(a),
+                p2: Some(b),
+            } => {
+                let dir = (*b - *a).normalize_or_zero();
+                let perp = cur - (*a + dir * (cur - *a).dot(dir));
+                vec![
+                    Geometry::Curve(NurbsCurve::line(*a, *a + perp)),
+                    Geometry::Curve(NurbsCurve::line(*b, *b + perp)),
+                    Geometry::Curve(NurbsCurve::line(*a + perp, *b + perp)),
+                ]
             }
             ActiveTool::Polyline { points } if !points.is_empty() => {
                 let mut pts = points.clone();

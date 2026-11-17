@@ -3,7 +3,7 @@ use slotmap::SlotMap;
 
 use crate::history::{UndoAction, UndoHistory, UndoTransaction};
 use crate::layer::{Layer, LayerId};
-use crate::object::{CadObject, ObjectId};
+use crate::object::{AnnotationItem, CadObject, ObjectId};
 use crate::spatial::{SpatialEntry, SpatialIndex};
 
 /// Central Elephant CAD document holding layers, objects, selection, spatial index, and Undo/Redo.
@@ -12,6 +12,7 @@ pub struct Document {
     pub layers: SlotMap<LayerId, Layer>,
     pub active_layer: LayerId,
     pub objects: SlotMap<ObjectId, CadObject>,
+    pub annotations: Vec<AnnotationItem>,
     pub last_created: Vec<ObjectId>,
     next_group_id: u64,
     spatial: SpatialIndex,
@@ -33,6 +34,7 @@ impl Document {
             layers,
             active_layer,
             objects: SlotMap::with_key(),
+            annotations: Vec::new(),
             last_created: Vec::new(),
             next_group_id: 1,
             spatial: SpatialIndex::default(),
@@ -42,6 +44,10 @@ impl Document {
 
     pub fn add_layer(&mut self, name: impl Into<String>, color: [u8; 4]) -> LayerId {
         self.layers.insert(Layer::new(name, color))
+    }
+
+    pub fn add_annotation(&mut self, item: AnnotationItem) {
+        self.annotations.push(item);
     }
 
     pub fn add_object(&mut self, label: impl Into<String>, geometry: Geometry) -> ObjectId {

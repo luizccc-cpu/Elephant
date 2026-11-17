@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use cad_commands::{CommandSession, SnapConfig, SnapKind};
-use cad_doc::{Document, ObjectId};
+use cad_doc::{AnnotationItem, AnnotationKind, Document, ObjectId};
 use cad_geom::{
     BooleanOp, DMat4, DVec3, Geometry, NurbsCurve, NurbsSurface, Plane, TriangleMesh, mesh_boolean,
 };
@@ -101,9 +101,14 @@ const KNOWN_COMMANDS: &[&str] = &[
     "Undo",
     "Redo",
     "ZoomExtents",
+    "Dim",
+    "TextDot",
+    "Text",
     "Wireframe",
     "Shaded",
     "Ghosted",
+    "Technical",
+    "Arctic",
     "New",
     "Help",
 ];
@@ -813,6 +818,41 @@ impl ElephantApp {
                 self.display_mode = DisplayMode::Ghosted;
                 self.log("Display mode: Ghosted.");
             }
+            "technical" => {
+                self.display_mode = DisplayMode::Technical;
+                self.log("Display mode: Technical.");
+            }
+            "arctic" => {
+                self.display_mode = DisplayMode::Arctic;
+                self.log("Display mode: Arctic.");
+            }
+            "text" => {
+                let label = if args.is_empty() {
+                    "Text".to_string()
+                } else {
+                    args.join(" ")
+                };
+                self.doc.add_annotation(AnnotationItem {
+                    kind: AnnotationKind::Text,
+                    layer_id: self.doc.active_layer,
+                    color: None,
+                    text: label.clone(),
+                    position: cplane.origin,
+                    p1: None,
+                    p2: None,
+                    offset_pt: None,
+                });
+                self.log(format!("Created Text '{label}' at CPlane origin."));
+            }
+            "textdot" | "dot" => {
+                let label = if args.is_empty() {
+                    "Note".to_string()
+                } else {
+                    args.join(" ")
+                };
+                self.session.tool = cad_commands::ActiveTool::TextDot { label };
+                self.log(self.session.prompt());
+            }
             "new" => {
                 self.session.cancel();
                 self.doc = Document::new();
@@ -1395,6 +1435,64 @@ impl ElephantApp {
                     }
                 }
 
+                // Draw Annotations (Dimensions, Text, TextDots, Leaders)
+                for ann in &self.doc.annotations {
+                    if let Some(layer) = self.doc.layers.get(ann.layer_id) {
+                        if !layer.visible {
+                            continue;
+                        }
+                    }
+                    if let Some(sp) = Self::world_to_screen(ann.position, &vp_cols, rect) {
+                        match ann.kind {
+                            AnnotationKind::TextDot => {
+                                let galley = painter.layout_no_wrap(
+                                    ann.text.clone(),
+                                    egui::FontId::proportional(11.5),
+                                    egui::Color32::WHITE,
+                                );
+                                let pad = egui::vec2(6.0, 3.0);
+                                let pill = egui::Rect::from_center_size(
+                                    sp,
+                                    galley.size() + pad * 2.0,
+                                );
+                                painter.rect(
+                                    pill,
+                                    5.0,
+                                    egui::Color32::from_rgb(48, 110, 195),
+                                    egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
+                                );
+                                painter.galley(
+                                    pill.min + pad,
+                                    galley,
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                            AnnotationKind::Dimension | AnnotationKind::Text | AnnotationKind::Leader => {
+                                let galley = painter.layout_no_wrap(
+                                    ann.text.clone(),
+                                    egui::FontId::proportional(11.5),
+                                    egui::Color32::from_rgb(235, 240, 248),
+                                );
+                                let pad = egui::vec2(3.0, 1.5);
+                                let bg = egui::Rect::from_center_size(
+                                    sp,
+                                    galley.size() + pad * 2.0,
+                                );
+                                painter.rect_filled(
+                                    bg,
+                                    2.0,
+                                    egui::Color32::from_rgba_unmultiplied(28, 32, 38, 185),
+                                );
+                                painter.galley(
+                                    bg.min + pad,
+                                    galley,
+                                    egui::Color32::from_rgb(235, 240, 248),
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // Draw Marquee selection rectangle
                 if let Some(m) = &self.marquee {
                     if m.viewport_idx == idx {
@@ -1582,6 +1680,14 @@ impl eframe::App for ElephantApp {
                         }
                     }
                 });
+                ui.menu_button("Annotate", |ui| {
+                    for cmd in ["Dim", "TextDot", "Text"] {
+                        if ui.button(cmd).clicked() {
+                            self.execute_command(cmd);
+                            ui.close_menu();
+                        }
+                    }
+                });
                 ui.menu_button("View", |ui| {
                     if ui.button("Wireframe").clicked() {
                         self.display_mode = DisplayMode::Wireframe;
@@ -1595,6 +1701,16 @@ impl eframe::App for ElephantApp {
                     }
                     if ui.button("Ghosted").clicked() {
                         self.display_mode = DisplayMode::Ghosted;
+                        self.scene_dirty = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Technical").clicked() {
+                        self.display_mode = DisplayMode::Technical;
+                        self.scene_dirty = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Arctic").clicked() {
+                        self.display_mode = DisplayMode::Arctic;
                         self.scene_dirty = true;
                         ui.close_menu();
                     }

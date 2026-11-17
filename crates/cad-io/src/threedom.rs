@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
-use cad_doc::{Document, Layer, LayerId};
+use cad_doc::{AnnotationItem, AnnotationKind, Document, Layer, LayerId};
 use cad_geom::{ControlPoint, DVec3, Geometry, NurbsCurve, NurbsSurface, Plane, TriangleMesh};
 use cadmpeg_codec_rhino::RhinoCodec;
 use cadmpeg_ir::codec::{Codec, DecodeOptions};
@@ -9,6 +9,7 @@ use cadmpeg_ir::geometry::nurbs::{NurbsPoleGrid, NurbsPoles3};
 use cadmpeg_ir::geometry::{
     CurveGeometry, SolvedCurveGeometry, SolvedSurfaceGeometry, SurfaceGeometry,
 };
+use cadmpeg_ir::semantic_annotations::SemanticAnnotationKind;
 
 use crate::error::IoError;
 
@@ -337,6 +338,45 @@ pub fn import_3dm_bytes(bytes: &[u8], doc: &mut Document) -> Result<usize, IoErr
                     resolve_color(s.object_id.as_str(), rgb)
                 });
             }
+            added += 1;
+        }
+    }
+
+    // 5. Import semantic annotations (dimensions, text, leaders)
+    for ann in &ir.model.semantic_annotations {
+        let text = ann
+            .text_override
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if !ann.text.is_empty() {
+                    ann.text.join(" ")
+                } else if let Some(v) = ann.value {
+                    format!("{:.2}", v.get())
+                } else {
+                    String::new()
+                }
+            });
+        if text.is_empty() {
+            continue;
+        }
+        if let Some(pos) = ann.position {
+            let p: [f64; 3] = pos.get().into();
+            let kind = match ann.kind {
+                SemanticAnnotationKind::Dimension => AnnotationKind::Dimension,
+                SemanticAnnotationKind::Leader => AnnotationKind::Leader,
+                _ => AnnotationKind::Text,
+            };
+            doc.add_annotation(AnnotationItem {
+                kind,
+                layer_id: default_layer,
+                color: None,
+                text,
+                position: DVec3::from_array(p),
+                p1: None,
+                p2: None,
+                offset_pt: None,
+            });
             added += 1;
         }
     }

@@ -8,4 +8,4 @@ pub mod spatial;
 
 pub use document::Document;
 pub use layer::{Layer, LayerId};
-pub use object::{CadObject, ObjectId};
+pub use object::{AnnotationItem, AnnotationKind, CadObject, ObjectId};

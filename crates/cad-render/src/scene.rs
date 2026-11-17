@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use bytemuck::{Pod, Zeroable};
-use cad_doc::Document;
+use cad_doc::{AnnotationKind, Document};
 use cad_geom::Geometry;
 use cad_math::{DVec3, Plane};
 
@@ -8,6 +10,8 @@ pub enum DisplayMode {
     Wireframe,
     Shaded,
     Ghosted,
+    Technical,
+    Arctic,
 }
 
 impl DisplayMode {
@@ -16,6 +20,8 @@ impl DisplayMode {
             Self::Wireframe => "Wireframe",
             Self::Shaded => "Shaded",
             Self::Ghosted => "Ghosted",
+            Self::Technical => "Technical",
+            Self::Arctic => "Arctic",
         }
     }
 }
@@ -111,6 +117,10 @@ impl RenderScene {
             let alpha = if mode == DisplayMode::Ghosted { 0.45 } else { 1.0 };
             let shaded_color = if obj.selected {
                 [1.0, 0.88, 0.25, alpha]
+            } else if mode == DisplayMode::Technical {
+                [0.86, 0.88, 0.90, 1.0]
+            } else if mode == DisplayMode::Arctic {
+                [0.94, 0.95, 0.97, 1.0]
             } else if is_pure_black {
                 [0.74, 0.77, 0.82, alpha]
             } else {
@@ -153,6 +163,29 @@ impl RenderScene {
                 }
                 Geometry::Mesh(mesh) => {
                     scene.push_mesh(&mesh.positions, &mesh.normals, &mesh.indices, shaded_color, base_color, mode, obj.selected);
+                }
+            }
+        }
+
+        // Render dimension extension lines & dimension lines for annotations
+        for ann in &doc.annotations {
+            if let Some(layer) = doc.layers.get(ann.layer_id) {
+                if !layer.visible {
+                    continue;
+                }
+            }
+            if ann.kind == AnnotationKind::Dimension {
+                if let (Some(p1), Some(p2), Some(off)) = (ann.p1, ann.p2, ann.offset_pt) {
+                    let dir = (p2 - p1).normalize_or_zero();
+                    let perp = off - (p1 + dir * (off - p1).dot(dir));
+                    let d1 = p1 + perp;
+                    let d2 = p2 + perp;
+                    let col = [0.92, 0.94, 0.98, 1.0];
+                    let ext_col = [0.68, 0.72, 0.78, 1.0];
+                    let f = |v: DVec3| [v.x as f32, v.y as f32, v.z as f32];
+                    scene.push_line(f(p1), f(d1), ext_col);
+                    scene.push_line(f(p2), f(d2), ext_col);
+                    scene.push_line(f(d1), f(d2), col);
                 }
             }
         }
@@ -255,6 +288,47 @@ impl RenderScene {
                 self.push_line(fa, fb, edge_color);
                 self.push_line(fb, fc, edge_color);
                 self.push_line(fc, fa, edge_color);
+            }
+        } else if mode == DisplayMode::Shaded || mode == DisplayMode::Technical {
+            let edge_color = if mode == DisplayMode::Technical {
+                [0.10, 0.12, 0.15, 1.0]
+            } else {
+                [0.14, 0.16, 0.20, 1.0]
+            };
+            let quant = |p: [f64; 3]| -> [i64; 3] {
+                [
+                    (p[0] * 1e4).round() as i64,
+                    (p[1] * 1e4).round() as i64,
+                    (p[2] * 1e4).round() as i64,
+                ]
+            };
+            let mut edge_faces: HashMap<([i64; 3], [i64; 3]), (DVec3, DVec3, Vec<DVec3>)> =
+                HashMap::new();
+            for &[a, b, c] in indices {
+                let va = DVec3::from_array(positions[a as usize]);
+                let vb = DVec3::from_array(positions[b as usize]);
+                let vc = DVec3::from_array(positions[c as usize]);
+                let fn_dir = (vb - va).cross(vc - va).normalize_or_zero();
+                if fn_dir.length_squared() < 1e-8 {
+                    continue;
+                }
+                for (u, v) in [(va, vb), (vb, vc), (vc, va)] {
+                    let qu = quant(u.to_array());
+                    let qv = quant(v.to_array());
+                    let key = if qu <= qv { (qu, qv) } else { (qv, qu) };
+                    let entry = edge_faces.entry(key).or_insert_with(|| (u, v, Vec::new()));
+                    entry.2.push(fn_dir);
+                }
+            }
+            for (_, (u, v, ns)) in edge_faces {
+                let is_crease = ns.len() == 1 || ns.windows(2).any(|w| w[0].dot(w[1]) < 0.94);
+                if is_crease {
+                    self.push_line(
+                        [u.x as f32, u.y as f32, u.z as f32],
+                        [v.x as f32, v.y as f32, v.z as f32],
+                        edge_color,
+                    );
+                }
             }
         }
     }
