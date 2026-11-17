@@ -19,6 +19,7 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([800.0, 540.0]),
         renderer: eframe::Renderer::Wgpu,
+        depth_buffer: 32,
         ..Default::default()
     };
 
@@ -27,7 +28,11 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             if let Some(wgpu_state) = &cc.wgpu_render_state {
-                let cad_state = CadWgpuState::new(&wgpu_state.device, wgpu_state.target_format);
+                let cad_state = CadWgpuState::new(
+                    &wgpu_state.device,
+                    wgpu_state.target_format,
+                    Some(eframe::egui_wgpu::wgpu::TextureFormat::Depth32Float),
+                );
                 wgpu_state
                     .renderer
                     .write()
@@ -426,80 +431,43 @@ impl ElephantApp {
             ));
 
         frame.show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let label_res = ui.selectable_label(is_active, title);
-                if label_res.clicked() {
-                    self.active_viewport = idx;
-                }
-                if label_res.double_clicked() {
-                    self.maximized_viewport = if self.maximized_viewport == Some(idx) {
-                        None
-                    } else {
-                        Some(idx)
-                    };
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak(self.display_mode.label());
-                });
-            });
-
-            let avail = ui.available_size().max(egui::vec2(16.0, 16.0));
-            let (rect, response) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
-
-            let aspect = (rect.width() / rect.height().max(1.0)) as f64;
-            let cplane = self.cameras[idx].cplane;
-
-            if response.hovered() {
-                self.active_viewport = idx;
-                let scroll = ui.input(|i| i.smooth_scroll_delta.y as f64);
-                if scroll.abs() > 0.0 {
-                    self.cameras[idx].zoom(scroll);
-                }
-                if let Some(pos) = response.hover_pos() {
-                    let ndc_x = ((pos.x - rect.left()) / rect.width().max(1.0)) * 2.0 - 1.0;
-                    let ndc_y = 1.0 - ((pos.y - rect.top()) / rect.height().max(1.0)) * 2.0;
-                    let ray = self.cameras[idx].screen_to_ray(ndc_x as f64, ndc_y as f64, aspect);
-                    if let Some(raw_pt) = cplane.intersect_ray(&ray) {
-                        let res = self.snap.resolve(
-                            raw_pt,
-                            self.session.base_point(),
-                            &self.doc,
-                            &cplane,
-                        );
-                        self.cursor_world = Some(res.point);
-                        self.last_snap_kind = res.kind;
-                    } else {
-                        self.cursor_world = None;
-                        self.last_snap_kind = None;
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    let label_res = ui.selectable_label(is_active, title);
+                    if label_res.clicked() {
+                        self.active_viewport = idx;
                     }
-                }
-            }
+                    if label_res.double_clicked() {
+                        self.maximized_viewport = if self.maximized_viewport == Some(idx) {
+                            None
+                        } else {
+                            Some(idx)
+                        };
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.weak(self.display_mode.label());
+                    });
+                });
 
-            if response.dragged_by(egui::PointerButton::Secondary) {
-                self.active_viewport = idx;
-                let delta = response.drag_delta();
-                let shift = ui.input(|i| i.modifiers.shift);
-                if self.cameras[idx].is_perspective && !shift {
-                    self.cameras[idx].orbit(delta.x as f64, delta.y as f64);
-                } else {
-                    self.cameras[idx].pan(delta.x as f64, delta.y as f64, rect.height() as f64);
-                }
-            } else if response.clicked_by(egui::PointerButton::Secondary) && self.session.is_active()
-            {
-                let outcome = self.session.finish_or_cancel(&mut self.doc);
-                for m in outcome.messages {
-                    self.log(m);
-                }
-            }
+                let avail = ui.available_size().max(egui::vec2(16.0, 16.0));
+                let (rect, response) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
 
-            if response.clicked_by(egui::PointerButton::Primary) {
-                self.active_viewport = idx;
-                if let Some(pos) = response.interact_pointer_pos() {
-                    let ndc_x = ((pos.x - rect.left()) / rect.width().max(1.0)) * 2.0 - 1.0;
-                    let ndc_y = 1.0 - ((pos.y - rect.top()) / rect.height().max(1.0)) * 2.0;
-                    let ray = self.cameras[idx].screen_to_ray(ndc_x as f64, ndc_y as f64, aspect);
+                let aspect = (rect.width() / rect.height().max(1.0)) as f64;
+                let cplane = self.cameras[idx].cplane;
 
+                if response.hovered() {
+                    self.active_viewport = idx;
                     if self.session.is_active() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                    }
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y as f64);
+                    if scroll.abs() > 0.0 {
+                        self.cameras[idx].zoom(scroll);
+                    }
+                    if let Some(pos) = response.hover_pos() {
+                        let ndc_x = ((pos.x - rect.left()) / rect.width().max(1.0)) * 2.0 - 1.0;
+                        let ndc_y = 1.0 - ((pos.y - rect.top()) / rect.height().max(1.0)) * 2.0;
+                        let ray = self.cameras[idx].screen_to_ray(ndc_x as f64, ndc_y as f64, aspect);
                         if let Some(raw_pt) = cplane.intersect_ray(&ray) {
                             let res = self.snap.resolve(
                                 raw_pt,
@@ -507,33 +475,76 @@ impl ElephantApp {
                                 &self.doc,
                                 &cplane,
                             );
-                            let outcome = self.session.on_point(res.point, &mut self.doc, &cplane);
-                            for m in outcome.messages {
-                                self.log(m);
-                            }
+                            self.cursor_world = Some(res.point);
+                            self.last_snap_kind = res.kind;
+                        } else {
+                            self.cursor_world = None;
+                            self.last_snap_kind = None;
                         }
-                    } else {
-                        let shift = ui.input(|i| i.modifiers.shift);
-                        if !shift {
-                            self.doc.clear_selection();
-                        }
-                        if let Some(hit_id) = self.doc.pick_ray(&ray) {
-                            self.doc.set_selected(hit_id, true);
-                        }
-                        self.scene_dirty = true;
                     }
                 }
-            }
 
-            let cb = eframe::egui_wgpu::Callback::new_paint_callback(
-                rect,
-                ViewportPaintCallback {
-                    kind: self.cameras[idx].kind,
-                    view_proj: self.cameras[idx].view_proj_f32(aspect),
-                    scene: Arc::clone(scene),
-                },
-            );
-            ui.painter().add(cb);
+                if response.dragged_by(egui::PointerButton::Secondary) {
+                    self.active_viewport = idx;
+                    let delta = response.drag_delta();
+                    let shift = ui.input(|i| i.modifiers.shift);
+                    if self.cameras[idx].is_perspective && !shift {
+                        self.cameras[idx].orbit(delta.x as f64, delta.y as f64);
+                    } else {
+                        self.cameras[idx].pan(delta.x as f64, delta.y as f64, rect.height() as f64);
+                    }
+                } else if response.clicked_by(egui::PointerButton::Secondary)
+                    && self.session.is_active()
+                {
+                    let outcome = self.session.finish_or_cancel(&mut self.doc);
+                    for m in outcome.messages {
+                        self.log(m);
+                    }
+                }
+
+                if response.clicked_by(egui::PointerButton::Primary) {
+                    self.active_viewport = idx;
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let ndc_x = ((pos.x - rect.left()) / rect.width().max(1.0)) * 2.0 - 1.0;
+                        let ndc_y = 1.0 - ((pos.y - rect.top()) / rect.height().max(1.0)) * 2.0;
+                        let ray = self.cameras[idx].screen_to_ray(ndc_x as f64, ndc_y as f64, aspect);
+
+                        if self.session.is_active() {
+                            if let Some(raw_pt) = cplane.intersect_ray(&ray) {
+                                let res = self.snap.resolve(
+                                    raw_pt,
+                                    self.session.base_point(),
+                                    &self.doc,
+                                    &cplane,
+                                );
+                                let outcome = self.session.on_point(res.point, &mut self.doc, &cplane);
+                                for m in outcome.messages {
+                                    self.log(m);
+                                }
+                            }
+                        } else {
+                            let shift = ui.input(|i| i.modifiers.shift);
+                            if !shift {
+                                self.doc.clear_selection();
+                            }
+                            if let Some(hit_id) = self.doc.pick_ray(&ray) {
+                                self.doc.set_selected(hit_id, true);
+                            }
+                            self.scene_dirty = true;
+                        }
+                    }
+                }
+
+                let cb = eframe::egui_wgpu::Callback::new_paint_callback(
+                    rect,
+                    ViewportPaintCallback {
+                        kind: self.cameras[idx].kind,
+                        view_proj: self.cameras[idx].view_proj_f32(aspect),
+                        scene: Arc::clone(scene),
+                    },
+                );
+                ui.painter().add(cb);
+            });
         });
     }
 }
@@ -949,20 +960,28 @@ impl eframe::App for ElephantApp {
 
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            ui.allocate_ui(egui::vec2(half_w, half_h), |ui| {
-                                self.draw_viewport(ui, 0, &scene);
-                            });
-                            ui.allocate_ui(egui::vec2(half_w, half_h), |ui| {
-                                self.draw_viewport(ui, 1, &scene);
-                            });
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(half_w, half_h),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| self.draw_viewport(ui, 0, &scene),
+                            );
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(half_w, half_h),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| self.draw_viewport(ui, 1, &scene),
+                            );
                         });
                         ui.horizontal(|ui| {
-                            ui.allocate_ui(egui::vec2(half_w, half_h), |ui| {
-                                self.draw_viewport(ui, 2, &scene);
-                            });
-                            ui.allocate_ui(egui::vec2(half_w, half_h), |ui| {
-                                self.draw_viewport(ui, 3, &scene);
-                            });
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(half_w, half_h),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| self.draw_viewport(ui, 2, &scene),
+                            );
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(half_w, half_h),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| self.draw_viewport(ui, 3, &scene),
+                            );
                         });
                     });
                 }

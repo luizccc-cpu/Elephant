@@ -35,10 +35,22 @@ pub struct CadWgpuState {
 }
 
 impl CadWgpuState {
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        depth_format: Option<wgpu::TextureFormat>,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("elephant_cad_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("cad_shader.wgsl").into()),
+        });
+
+        let depth_stencil = depth_format.map(|format| wgpu::DepthStencilState {
+            format,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -93,7 +105,7 @@ impl CadWgpuState {
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: None,
+            depth_stencil: depth_stencil.clone(),
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,
@@ -129,7 +141,7 @@ impl CadWgpuState {
                 topology: wgpu::PrimitiveTopology::LineList,
                 ..Default::default()
             },
-            depth_stencil: None,
+            depth_stencil,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,
@@ -256,15 +268,6 @@ impl egui_wgpu::CallbackTrait for ViewportPaintCallback {
             return;
         };
 
-        if state.line_vertex_count > 0 {
-            if let Some(vb) = &state.line_vb {
-                render_pass.set_pipeline(&state.line_pipeline);
-                render_pass.set_bind_group(0, &vp.bind_group, &[]);
-                render_pass.set_vertex_buffer(0, vb.slice(..));
-                render_pass.draw(0..state.line_vertex_count, 0..1);
-            }
-        }
-
         if state.mesh_index_count > 0 {
             if let (Some(vb), Some(ib)) = (&state.mesh_vb, &state.mesh_ib) {
                 render_pass.set_pipeline(&state.mesh_pipeline);
@@ -274,5 +277,112 @@ impl egui_wgpu::CallbackTrait for ViewportPaintCallback {
                 render_pass.draw_indexed(0..state.mesh_index_count, 0, 0..1);
             }
         }
+
+        if state.line_vertex_count > 0 {
+            if let Some(vb) = &state.line_vb {
+                render_pass.set_pipeline(&state.line_pipeline);
+                render_pass.set_bind_group(0, &vp.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, vb.slice(..));
+                render_pass.draw(0..state.line_vertex_count, 0..1);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::camera::ViewportCamera;
+    use crate::scene::DisplayMode;
+    use cad_doc::Document;
+    use cad_geom::{DVec3, Geometry, TriangleMesh};
+    use eframe::egui_wgpu::CallbackTrait;
+
+    #[test]
+    fn wgpu_renders_starter_scene_pixels() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .expect("adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+            .expect("device");
+
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let state = CadWgpuState::new(&device, format, None);
+        let mut resources = egui_wgpu::CallbackResources::new();
+        resources.insert(state);
+
+        let mut doc = Document::new();
+        doc.add_object("Box", Geometry::Mesh(TriangleMesh::from_box(DVec3::ZERO, DVec3::splat(3.0))));
+        let cam = ViewportCamera::preset(ViewportKind::Perspective);
+        let scene = Arc::new(RenderScene::build(&doc, DisplayMode::Shaded, &cam.cplane, 1));
+        let cb = ViewportPaintCallback {
+            kind: ViewportKind::Perspective,
+            view_proj: cam.view_proj_f32(1.0),
+            scene,
+        };
+
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen"),
+            size: wgpu::Extent3d { width: 128, height: 128, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [128, 128], pixels_per_point: 1.0 };
+
+        let extra_cmds = cb.prepare(&device, &queue, &sd, &mut encoder, &mut resources);
+        {
+            let rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("test_rp"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            let mut rp = rp.forget_lifetime();
+            let info = egui::PaintCallbackInfo {
+                viewport: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(128.0, 128.0)),
+                clip_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(128.0, 128.0)),
+                pixels_per_point: 1.0,
+                screen_size_px: [128, 128],
+            };
+            cb.paint(info, &mut rp, &resources);
+        }
+
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: (128 * 4 * 128) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            tex.as_image_copy(),
+            wgpu::ImageCopyBuffer {
+                buffer: &buf,
+                layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(128 * 4), rows_per_image: Some(128) },
+            },
+            wgpu::Extent3d { width: 128, height: 128, depth_or_array_layers: 1 },
+        );
+        queue.submit(extra_cmds.into_iter().chain(std::iter::once(encoder.finish())));
+
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let data = slice.get_mapped_range();
+        let non_black = data.chunks_exact(4).filter(|px| px[0] > 0 || px[1] > 0 || px[2] > 0).count();
+        eprintln!("offscreen non_black_pixels={non_black}");
+        assert!(non_black > 50, "expected rendered pixels, got {non_black}");
     }
 }

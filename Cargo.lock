@@ -625,8 +625,10 @@ dependencies = [
  "bytemuck",
  "cad-doc",
  "cad-geom",
+ "cad-io",
  "cad-math",
  "eframe",
+ "pollster 0.3.0",
 ]
 
 [[package]]

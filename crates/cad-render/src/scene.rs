@@ -63,9 +63,17 @@ impl RenderScene {
             1.0
         } else {
             let max_dim = total_aabb.size().max_element().max(1.0);
-            10.0_f64.powf((max_dim / 30.0).log10().floor()).max(1.0)
+            10.0_f64.powf((max_dim / 20.0).log10().floor()).max(1.0)
         };
-        scene.push_cplane_grid(cplane, 20, grid_step);
+        let mut grid_plane = *cplane;
+        if !total_aabb.is_empty() {
+            let c = total_aabb.center();
+            let snap = grid_step * 5.0;
+            let sx = (c.x / snap).round() * snap;
+            let sy = (c.y / snap).round() * snap;
+            grid_plane.origin = DVec3::new(sx, sy, cplane.origin.z);
+        }
+        scene.push_cplane_grid(&grid_plane, 20, grid_step);
 
         for (_, obj) in &doc.objects {
             let Some(layer) = doc.layers.get(obj.layer_id) else {
