@@ -83,21 +83,32 @@ impl RenderScene {
                 continue;
             }
 
-            let base_color = if obj.selected {
-                SELECTION_COLOR
+            let raw_rgb = obj.color.unwrap_or(layer.color);
+            let is_pure_black = raw_rgb[0] == 0 && raw_rgb[1] == 0 && raw_rgb[2] == 0;
+            let layer_rgba = if is_pure_black {
+                [0.84, 0.86, 0.90, 1.0]
             } else {
                 [
-                    layer.color[0] as f32 / 255.0,
-                    layer.color[1] as f32 / 255.0,
-                    layer.color[2] as f32 / 255.0,
+                    raw_rgb[0] as f32 / 255.0,
+                    raw_rgb[1] as f32 / 255.0,
+                    raw_rgb[2] as f32 / 255.0,
                     1.0,
                 ]
             };
 
-            let shaded_color = if obj.selected {
-                [1.0, 0.88, 0.25, if mode == DisplayMode::Ghosted { 0.45 } else { 1.0 }]
+            let base_color = if obj.selected {
+                SELECTION_COLOR
             } else {
-                [0.72, 0.76, 0.82, if mode == DisplayMode::Ghosted { 0.45 } else { 1.0 }]
+                layer_rgba
+            };
+
+            let alpha = if mode == DisplayMode::Ghosted { 0.45 } else { 1.0 };
+            let shaded_color = if obj.selected {
+                [1.0, 0.88, 0.25, alpha]
+            } else if is_pure_black {
+                [0.74, 0.77, 0.82, alpha]
+            } else {
+                [layer_rgba[0], layer_rgba[1], layer_rgba[2], alpha]
             };
 
             match &obj.geometry {

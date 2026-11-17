@@ -12,6 +12,7 @@ new_key_type! {
 pub struct CadObject {
     pub name: Option<String>,
     pub layer_id: LayerId,
+    pub color: Option<[u8; 4]>,
     pub geometry: Geometry,
     pub selected: bool,
     pub aabb: Aabb,
@@ -23,6 +24,7 @@ impl CadObject {
         Self {
             name: None,
             layer_id,
+            color: None,
             geometry,
             selected: false,
             aabb,

@@ -41,7 +41,16 @@ impl Document {
     }
 
     pub fn add_object(&mut self, label: impl Into<String>, geometry: Geometry) -> ObjectId {
-        let obj = CadObject::new(self.active_layer, geometry);
+        self.add_object_on_layer(label, self.active_layer, geometry)
+    }
+
+    pub fn add_object_on_layer(
+        &mut self,
+        label: impl Into<String>,
+        layer_id: LayerId,
+        geometry: Geometry,
+    ) -> ObjectId {
+        let obj = CadObject::new(layer_id, geometry);
         let id = self.objects.insert(obj);
         self.history.push(UndoTransaction {
             label: label.into(),

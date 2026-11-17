@@ -746,6 +746,19 @@ impl eframe::App for ElephantApp {
                     let is_active = self.doc.active_layer == lid;
                     if let Some(layer) = self.doc.layers.get_mut(lid) {
                         ui.horizontal(|ui| {
+                            let (swatch_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(12.0, 12.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(
+                                swatch_rect,
+                                2.0,
+                                egui::Color32::from_rgb(
+                                    layer.color[0],
+                                    layer.color[1],
+                                    layer.color[2],
+                                ),
+                            );
                             if ui.selectable_label(is_active, &layer.name).clicked() {
                                 self.doc.active_layer = lid;
                             }
