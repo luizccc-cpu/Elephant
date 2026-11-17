@@ -8,11 +8,19 @@ new_key_type! {
     pub struct ObjectId;
 }
 
+fn default_visible() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CadObject {
     pub name: Option<String>,
     pub layer_id: LayerId,
     pub color: Option<[u8; 4]>,
+    #[serde(default = "default_visible")]
+    pub visible: bool,
+    #[serde(default)]
+    pub group_id: Option<u64>,
     pub geometry: Geometry,
     pub selected: bool,
     pub aabb: Aabb,
@@ -25,6 +33,8 @@ impl CadObject {
             name: None,
             layer_id,
             color: None,
+            visible: true,
+            group_id: None,
             geometry,
             selected: false,
             aabb,

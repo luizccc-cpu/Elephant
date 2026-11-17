@@ -70,8 +70,19 @@ const KNOWN_COMMANDS: &[&str] = &[
     "Length",
     "Area",
     "Delete",
+    "Hide",
+    "Show",
+    "Isolate",
+    "Group",
+    "Ungroup",
     "SelAll",
     "SelNone",
+    "Invert",
+    "SelLast",
+    "SelCrv",
+    "SelSrf",
+    "SelMesh",
+    "SelPt",
     "Undo",
     "Redo",
     "ZoomExtents",
@@ -123,9 +134,17 @@ struct MarqueeDrag {
     current: egui::Pos2,
 }
 
+#[derive(Debug, Clone)]
+struct NamedView {
+    name: String,
+    cameras: [ViewportCamera; 4],
+}
+
 struct ElephantApp {
     doc: Document,
     cameras: [ViewportCamera; 4],
+    named_views: Vec<NamedView>,
+    new_view_name: String,
     active_viewport: usize,
     maximized_viewport: Option<usize>,
     display_mode: DisplayMode,
@@ -161,6 +180,8 @@ impl ElephantApp {
                 ViewportCamera::preset(ViewportKind::Front),
                 ViewportCamera::preset(ViewportKind::Right),
             ],
+            named_views: Vec::new(),
+            new_view_name: String::new(),
             active_viewport: 1,
             maximized_viewport: None,
             display_mode: DisplayMode::Shaded,
@@ -447,6 +468,50 @@ impl ElephantApp {
             "selnone" => {
                 self.doc.clear_selection();
                 self.log("Selection cleared.");
+            }
+            "invert" => {
+                let n = self.doc.invert_selection();
+                self.log(format!("Inverted selection ({n} selected)."));
+            }
+            "sellast" => {
+                let n = self.doc.select_last();
+                self.log(format!("Selected {n} last created object(s)."));
+            }
+            "selcrv" => {
+                let n = self.doc.select_by_kind(|g| matches!(g, Geometry::Curve(_)));
+                self.log(format!("Selected {n} curve(s)."));
+            }
+            "selsrf" => {
+                let n = self.doc.select_by_kind(|g| matches!(g, Geometry::Surface(_)));
+                self.log(format!("Selected {n} surface(s)."));
+            }
+            "selmesh" => {
+                let n = self.doc.select_by_kind(|g| matches!(g, Geometry::Mesh(_)));
+                self.log(format!("Selected {n} mesh(es)."));
+            }
+            "selpt" => {
+                let n = self.doc.select_by_kind(|g| matches!(g, Geometry::Point(_)));
+                self.log(format!("Selected {n} point(s)."));
+            }
+            "hide" => {
+                let n = self.doc.hide_selected();
+                self.log(format!("Hid {n} object(s)."));
+            }
+            "show" => {
+                let n = self.doc.show_all();
+                self.log(format!("Showed {n} hidden object(s)."));
+            }
+            "isolate" => {
+                let n = self.doc.isolate_selected();
+                self.log(format!("Isolated selection (hid {n} other object(s))."));
+            }
+            "group" => match self.doc.group_selected() {
+                Some((gid, count)) => self.log(format!("Grouped {count} objects (Group #{gid}).")),
+                None => self.log("Select 2 or more objects to group."),
+            },
+            "ungroup" => {
+                let n = self.doc.ungroup_selected();
+                self.log(format!("Ungrouped {n} object(s)."));
             }
             "ellipse" => {
                 let rx = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(4.0);
@@ -1168,6 +1233,24 @@ impl eframe::App for ElephantApp {
                         self.execute_command("Delete");
                         ui.close_menu();
                     }
+                    ui.separator();
+                    for cmd in ["Hide", "Show", "Isolate", "Group", "Ungroup"] {
+                        if ui.button(cmd).clicked() {
+                            self.execute_command(cmd);
+                            ui.close_menu();
+                        }
+                    }
+                    ui.menu_button("Select", |ui| {
+                        for cmd in [
+                            "SelAll", "SelNone", "Invert", "SelLast", "SelCrv", "SelSrf",
+                            "SelMesh", "SelPt",
+                        ] {
+                            if ui.button(cmd).clicked() {
+                                self.execute_command(cmd);
+                                ui.close_menu();
+                            }
+                        }
+                    });
                 });
                 ui.menu_button("Create", |ui| {
                     for cmd in [
@@ -1237,6 +1320,42 @@ impl eframe::App for ElephantApp {
                         self.maximized_viewport = None;
                         ui.close_menu();
                     }
+                    ui.separator();
+                    ui.menu_button("Named Views", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.new_view_name)
+                                    .desired_width(110.0)
+                                    .hint_text("View name..."),
+                            );
+                            if ui.button("Save").clicked() {
+                                let name = if self.new_view_name.trim().is_empty() {
+                                    format!("View {}", self.named_views.len() + 1)
+                                } else {
+                                    std::mem::take(&mut self.new_view_name).trim().to_string()
+                                };
+                                self.named_views.push(NamedView {
+                                    name: name.clone(),
+                                    cameras: self.cameras.clone(),
+                                });
+                                self.log(format!("Saved Named View '{name}'."));
+                            }
+                        });
+                        if !self.named_views.is_empty() {
+                            ui.separator();
+                            let mut restore_idx = None;
+                            for (vi, nv) in self.named_views.iter().enumerate() {
+                                if ui.button(&nv.name).clicked() {
+                                    restore_idx = Some(vi);
+                                }
+                            }
+                            if let Some(vi) = restore_idx {
+                                self.cameras = self.named_views[vi].cameras.clone();
+                                self.log(format!("Restored Named View '{}'.", self.named_views[vi].name));
+                                ui.close_menu();
+                            }
+                        }
+                    });
                 });
                 ui.menu_button("Tools", |ui| {
                     if ui.button("Parametric Graph (Grasshopper-style)").clicked() {
@@ -1354,26 +1473,37 @@ impl eframe::App for ElephantApp {
                 });
 
                 let layer_ids: Vec<_> = self.doc.layers.keys().collect();
-                for lid in layer_ids {
+                let mut select_layer_req = None;
+                let mut move_to_layer_req = None;
+                for lid in &layer_ids {
+                    let lid = *lid;
                     let is_active = self.doc.active_layer == lid;
                     if let Some(layer) = self.doc.layers.get_mut(lid) {
                         ui.horizontal(|ui| {
-                            let (swatch_rect, _) = ui.allocate_exact_size(
-                                egui::vec2(12.0, 12.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().rect_filled(
-                                swatch_rect,
-                                2.0,
-                                egui::Color32::from_rgb(
-                                    layer.color[0],
-                                    layer.color[1],
-                                    layer.color[2],
-                                ),
-                            );
-                            if ui.selectable_label(is_active, &layer.name).clicked() {
+                            if ui
+                                .color_edit_button_srgba_unmultiplied(&mut layer.color)
+                                .changed()
+                            {
+                                self.scene_dirty = true;
+                            }
+                            let lbl = ui.selectable_label(is_active, &layer.name);
+                            if lbl.clicked() {
                                 self.doc.active_layer = lid;
                             }
+                            lbl.context_menu(|ui| {
+                                if ui.button("Set Active").clicked() {
+                                    self.doc.active_layer = lid;
+                                    ui.close_menu();
+                                }
+                                if ui.button("Select Objects on Layer").clicked() {
+                                    select_layer_req = Some(lid);
+                                    ui.close_menu();
+                                }
+                                if ui.button("Move Selected to Layer").clicked() {
+                                    move_to_layer_req = Some(lid);
+                                    ui.close_menu();
+                                }
+                            });
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -1386,38 +1516,166 @@ impl eframe::App for ElephantApp {
                         });
                     }
                 }
+                if let Some(lid) = select_layer_req {
+                    let n = self.doc.select_layer_objects(lid);
+                    self.scene_dirty = true;
+                    self.log(format!("Selected {n} object(s) on layer."));
+                }
+                if let Some(lid) = move_to_layer_req {
+                    let n = self.doc.move_selected_to_layer(lid);
+                    self.scene_dirty = true;
+                    self.log(format!("Moved {n} object(s) to layer."));
+                }
 
                 ui.separator();
                 ui.heading("Properties");
-                let selected: Vec<_> = self
+                let selected_ids: Vec<_> = self
                     .doc
                     .objects
                     .iter()
                     .filter(|(_, o)| o.selected)
-                    .map(|(_, o)| o)
+                    .map(|(id, _)| id)
                     .collect();
-                if selected.is_empty() {
+                let layer_choices: Vec<_> = self
+                    .doc
+                    .layers
+                    .iter()
+                    .map(|(lid, l)| (lid, l.name.clone()))
+                    .collect();
+                let hidden_count = self.doc.objects.values().filter(|o| !o.visible).count();
+
+                if selected_ids.is_empty() {
                     ui.weak("No object selected.");
                     ui.label(format!("Total objects: {}", self.doc.objects.len()));
-                } else if selected.len() == 1 {
-                    let obj = selected[0];
-                    ui.label(format!(
-                        "Name: {}",
-                        obj.name.as_deref().unwrap_or("(unnamed)")
-                    ));
-                    let kind = match &obj.geometry {
-                        Geometry::Point(_) => "Point",
-                        Geometry::Curve(_) => "NURBS Curve",
-                        Geometry::Surface(_) => "NURBS Surface",
-                        Geometry::Mesh(_) => "Mesh",
-                    };
-                    ui.label(format!("Type: {kind}"));
-                    let c = obj.aabb.center();
-                    let s = obj.aabb.size();
-                    ui.label(format!("Center: ({:.2}, {:.2}, {:.2})", c.x, c.y, c.z));
-                    ui.label(format!("Size: ({:.2}, {:.2}, {:.2})", s.x, s.y, s.z));
+                    if hidden_count > 0 {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Hidden: {hidden_count}"));
+                            if ui.small_button("Show All").clicked() {
+                                self.execute_command("Show");
+                            }
+                        });
+                    }
+                } else if selected_ids.len() == 1 {
+                    let oid = selected_ids[0];
+                    if let Some(obj) = self.doc.objects.get_mut(oid) {
+                        let mut name_buf = obj.name.clone().unwrap_or_default();
+                        ui.horizontal(|ui| {
+                            ui.label("Name:");
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut name_buf)
+                                        .desired_width(150.0)
+                                        .hint_text("(unnamed)"),
+                                )
+                                .changed()
+                            {
+                                obj.name = if name_buf.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(name_buf)
+                                };
+                            }
+                        });
+
+                        let cur_layer_name = layer_choices
+                            .iter()
+                            .find(|(lid, _)| *lid == obj.layer_id)
+                            .map(|(_, n)| n.as_str())
+                            .unwrap_or("Unknown");
+                        let mut new_lid = obj.layer_id;
+                        egui::ComboBox::from_label("Layer")
+                            .selected_text(cur_layer_name)
+                            .show_ui(ui, |ui| {
+                                for (lid, lname) in &layer_choices {
+                                    ui.selectable_value(&mut new_lid, *lid, lname);
+                                }
+                            });
+                        if new_lid != obj.layer_id {
+                            obj.layer_id = new_lid;
+                            self.scene_dirty = true;
+                        }
+
+                        let mut is_custom = obj.color.is_some();
+                        ui.horizontal(|ui| {
+                            if ui.checkbox(&mut is_custom, "Custom Color").changed() {
+                                obj.color = if is_custom {
+                                    Some([230, 180, 90, 255])
+                                } else {
+                                    None
+                                };
+                                self.scene_dirty = true;
+                            }
+                            if let Some(col) = &mut obj.color {
+                                if ui.color_edit_button_srgba_unmultiplied(col).changed() {
+                                    self.scene_dirty = true;
+                                }
+                            }
+                        });
+
+                        let kind_detail = match &obj.geometry {
+                            Geometry::Point(_) => "Point".to_string(),
+                            Geometry::Curve(c) => format!(
+                                "NURBS Curve ({}, len={:.3})",
+                                if c.is_closed() { "Closed" } else { "Open" },
+                                c.length_approx(48)
+                            ),
+                            Geometry::Surface(_) => "NURBS Surface".to_string(),
+                            Geometry::Mesh(m) => format!(
+                                "Mesh ({} verts, {} tris)",
+                                m.positions.len(),
+                                m.indices.len() / 3
+                            ),
+                        };
+                        ui.label(format!("Type: {kind_detail}"));
+                        if let Some(gid) = obj.group_id {
+                            ui.label(format!("Group: #{gid}"));
+                        }
+                        let c = obj.aabb.center();
+                        let s = obj.aabb.size();
+                        ui.label(format!("Center: ({:.2}, {:.2}, {:.2})", c.x, c.y, c.z));
+                        ui.label(format!("Size: ({:.2}, {:.2}, {:.2})", s.x, s.y, s.z));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Hide").clicked() {
+                            self.execute_command("Hide");
+                        }
+                        if ui.small_button("Isolate").clicked() {
+                            self.execute_command("Isolate");
+                        }
+                        if ui.small_button("Ungroup").clicked() {
+                            self.execute_command("Ungroup");
+                        }
+                    });
                 } else {
-                    ui.label(format!("{} objects selected", selected.len()));
+                    ui.label(format!("{} objects selected", selected_ids.len()));
+                    let mut target_lid = None;
+                    egui::ComboBox::from_label("Set Layer")
+                        .selected_text("Choose layer...")
+                        .show_ui(ui, |ui| {
+                            for (lid, lname) in &layer_choices {
+                                if ui.selectable_label(false, lname).clicked() {
+                                    target_lid = Some(*lid);
+                                }
+                            }
+                        });
+                    if let Some(lid) = target_lid {
+                        self.doc.move_selected_to_layer(lid);
+                        self.scene_dirty = true;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Group").clicked() {
+                            self.execute_command("Group");
+                        }
+                        if ui.small_button("Ungroup").clicked() {
+                            self.execute_command("Ungroup");
+                        }
+                        if ui.small_button("Hide").clicked() {
+                            self.execute_command("Hide");
+                        }
+                        if ui.small_button("Isolate").clicked() {
+                            self.execute_command("Isolate");
+                        }
+                    });
                 }
             });
 

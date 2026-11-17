@@ -53,6 +53,9 @@ impl RenderScene {
         };
         let mut total_aabb = cad_math::Aabb::EMPTY;
         for (_, obj) in &doc.objects {
+            if !obj.visible {
+                continue;
+            }
             if let Some(layer) = doc.layers.get(obj.layer_id) {
                 if layer.visible {
                     total_aabb = total_aabb.union(&obj.aabb);
@@ -76,6 +79,9 @@ impl RenderScene {
         scene.push_cplane_grid(&grid_plane, 20, grid_step);
 
         for (_, obj) in &doc.objects {
+            if !obj.visible {
+                continue;
+            }
             let Some(layer) = doc.layers.get(obj.layer_id) else {
                 continue;
             };

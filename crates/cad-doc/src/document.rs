@@ -12,6 +12,8 @@ pub struct Document {
     pub layers: SlotMap<LayerId, Layer>,
     pub active_layer: LayerId,
     pub objects: SlotMap<ObjectId, CadObject>,
+    pub last_created: Vec<ObjectId>,
+    next_group_id: u64,
     spatial: SpatialIndex,
     history: UndoHistory,
 }
@@ -31,6 +33,8 @@ impl Document {
             layers,
             active_layer,
             objects: SlotMap::with_key(),
+            last_created: Vec::new(),
+            next_group_id: 1,
             spatial: SpatialIndex::default(),
             history: UndoHistory::default(),
         }
@@ -52,6 +56,7 @@ impl Document {
     ) -> ObjectId {
         let obj = CadObject::new(layer_id, geometry);
         let id = self.objects.insert(obj);
+        self.last_created = vec![id];
         self.history.push(UndoTransaction {
             label: label.into(),
             actions: vec![UndoAction::Added(id)],
@@ -115,7 +120,14 @@ impl Document {
     }
 
     pub fn set_selected(&mut self, id: ObjectId, selected: bool) {
-        if let Some(obj) = self.objects.get_mut(id) {
+        let gid = self.objects.get(id).and_then(|o| o.group_id);
+        if let Some(gid) = gid {
+            for (_, obj) in &mut self.objects {
+                if obj.group_id == Some(gid) && obj.visible {
+                    obj.selected = selected;
+                }
+            }
+        } else if let Some(obj) = self.objects.get_mut(id) {
             obj.selected = selected;
         }
     }
@@ -129,6 +141,9 @@ impl Document {
     pub fn select_all(&mut self) -> usize {
         let mut count = 0;
         for (_, obj) in &mut self.objects {
+            if !obj.visible {
+                continue;
+            }
             let unlocked = self
                 .layers
                 .get(obj.layer_id)
@@ -142,11 +157,153 @@ impl Document {
         count
     }
 
+    pub fn invert_selection(&mut self) -> usize {
+        let mut count = 0;
+        for (_, obj) in &mut self.objects {
+            let selectable = obj.visible
+                && self
+                    .layers
+                    .get(obj.layer_id)
+                    .map(|l| l.visible && !l.locked)
+                    .unwrap_or(true);
+            if selectable {
+                obj.selected = !obj.selected;
+                if obj.selected {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    pub fn select_last(&mut self) -> usize {
+        self.clear_selection();
+        let ids = self.last_created.clone();
+        let mut count = 0;
+        for id in ids {
+            if let Some(obj) = self.objects.get_mut(id) {
+                if obj.visible {
+                    obj.selected = true;
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    pub fn select_by_kind<F>(&mut self, pred: F) -> usize
+    where
+        F: Fn(&Geometry) -> bool,
+    {
+        self.clear_selection();
+        let mut count = 0;
+        for (_, obj) in &mut self.objects {
+            let selectable = obj.visible
+                && self
+                    .layers
+                    .get(obj.layer_id)
+                    .map(|l| l.visible && !l.locked)
+                    .unwrap_or(true);
+            if selectable && pred(&obj.geometry) {
+                obj.selected = true;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub fn select_layer_objects(&mut self, layer_id: LayerId) -> usize {
+        self.clear_selection();
+        let mut count = 0;
+        for (_, obj) in &mut self.objects {
+            if obj.layer_id == layer_id && obj.visible {
+                obj.selected = true;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub fn move_selected_to_layer(&mut self, layer_id: LayerId) -> usize {
+        let mut count = 0;
+        for (_, obj) in &mut self.objects {
+            if obj.selected {
+                obj.layer_id = layer_id;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub fn hide_selected(&mut self) -> usize {
+        let mut count = 0;
+        for (_, obj) in &mut self.objects {
+            if obj.selected {
+                obj.visible = false;
+                obj.selected = false;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub fn show_all(&mut self) -> usize {
+        let mut count = 0;
+        for (_, obj) in &mut self.objects {
+            if !obj.visible {
+                obj.visible = true;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub fn isolate_selected(&mut self) -> usize {
+        let any_sel = self.objects.values().any(|o| o.selected);
+        if !any_sel {
+            return 0;
+        }
+        let mut hidden = 0;
+        for (_, obj) in &mut self.objects {
+            if !obj.selected && obj.visible {
+                obj.visible = false;
+                hidden += 1;
+            }
+        }
+        hidden
+    }
+
+    pub fn group_selected(&mut self) -> Option<(u64, usize)> {
+        let count = self.objects.values().filter(|o| o.selected).count();
+        if count < 2 {
+            return None;
+        }
+        let gid = self.next_group_id;
+        self.next_group_id += 1;
+        for (_, obj) in &mut self.objects {
+            if obj.selected {
+                obj.group_id = Some(gid);
+            }
+        }
+        Some((gid, count))
+    }
+
+    pub fn ungroup_selected(&mut self) -> usize {
+        let mut count = 0;
+        for (_, obj) in &mut self.objects {
+            if obj.selected && obj.group_id.is_some() {
+                obj.group_id = None;
+                count += 1;
+            }
+        }
+        count
+    }
+
     pub fn selection_aabb(&self) -> Option<Aabb> {
         let mut out = Aabb::EMPTY;
         let mut any = false;
         for (_, obj) in &self.objects {
-            if obj.selected {
+            if obj.selected && obj.visible {
                 out = out.union(&obj.aabb);
                 any = true;
             }
@@ -164,6 +321,9 @@ impl Document {
             let Some(obj) = self.objects.get(id) else {
                 continue;
             };
+            if !obj.visible {
+                continue;
+            }
             let Some(layer) = self.layers.get(obj.layer_id) else {
                 continue;
             };
