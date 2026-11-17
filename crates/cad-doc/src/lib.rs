@@ -1,3 +1,11 @@
-//! Document model, generational object store, layers, selection, and Undo/Redo for Elephant.
+//! Document model, generational object store, layers, spatial index, and Undo/Redo for Elephant.
 
-pub use cad_geom::{Aabb, DVec3, Plane};
+pub mod document;
+pub mod history;
+pub mod layer;
+pub mod object;
+pub mod spatial;
+
+pub use document::Document;
+pub use layer::{Layer, LayerId};
+pub use object::{CadObject, ObjectId};
