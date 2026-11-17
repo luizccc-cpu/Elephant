@@ -1,0 +1,13 @@
+[package]
+name = "elephant-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cad-math = { path = "../../crates/cad-math" }
+cad-geom = { path = "../../crates/cad-geom" }
+cad-doc = { path = "../../crates/cad-doc" }
+cad-io = { path = "../../crates/cad-io" }
+cad-commands = { path = "../../crates/cad-commands" }
+cad-render = { path = "../../crates/cad-render" }
