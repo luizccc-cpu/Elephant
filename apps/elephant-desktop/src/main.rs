@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use cad_commands::{CommandSession, SnapConfig, SnapKind};
 use cad_doc::Document;
 use cad_geom::{DMat4, DVec3, Geometry, NurbsCurve, NurbsSurface, Plane, TriangleMesh};
 use cad_render::{
@@ -35,12 +36,15 @@ fn main() -> eframe::Result<()> {
 }
 
 const KNOWN_COMMANDS: &[&str] = &[
+    "Line",
+    "Polyline",
+    "Circle",
     "Box",
     "Sphere",
-    "Circle",
-    "Line",
     "Extrude",
     "Move",
+    "Copy",
+    "Rotate",
     "Scale",
     "Delete",
     "Undo",
@@ -59,10 +63,13 @@ struct ElephantApp {
     active_viewport: usize,
     maximized_viewport: Option<usize>,
     display_mode: DisplayMode,
+    session: CommandSession,
+    snap: SnapConfig,
     command_input: String,
     command_log: Vec<String>,
     new_layer_name: String,
     cursor_world: Option<DVec3>,
+    last_snap_kind: Option<SnapKind>,
 }
 
 impl ElephantApp {
@@ -78,6 +85,8 @@ impl ElephantApp {
             active_viewport: 1,
             maximized_viewport: None,
             display_mode: DisplayMode::Shaded,
+            session: CommandSession::default(),
+            snap: SnapConfig::default(),
             command_input: String::new(),
             command_log: vec![
                 "Elephant CAD initialized (local clean-room engine). Type 'Help' for commands."
@@ -85,6 +94,7 @@ impl ElephantApp {
             ],
             new_layer_name: String::new(),
             cursor_world: None,
+            last_snap_kind: None,
         };
         app.populate_starter_scene();
         app
@@ -147,6 +157,20 @@ impl ElephantApp {
 
     fn execute_command(&mut self, raw: &str) {
         let trimmed = raw.trim();
+        let cplane = self.cameras[self.active_viewport].cplane;
+
+        if self.session.is_active() {
+            if !trimmed.is_empty() {
+                self.log(format!("> {trimmed}"));
+            }
+            if let Some(outcome) = self.session.on_text_input(trimmed, &mut self.doc, &cplane) {
+                for m in outcome.messages {
+                    self.log(m);
+                }
+                return;
+            }
+        }
+
         if trimmed.is_empty() {
             return;
         }
@@ -154,6 +178,13 @@ impl ElephantApp {
         let mut parts = trimmed.split_whitespace();
         let cmd = parts.next().unwrap_or("").to_ascii_lowercase();
         let args: Vec<&str> = parts.collect();
+
+        if args.is_empty() {
+            if let Some(prompt) = self.session.start_tool(&cmd, &self.doc) {
+                self.log(prompt);
+                return;
+            }
+        }
 
         match cmd.as_str() {
             "box" => {
@@ -269,11 +300,12 @@ impl ElephantApp {
                 self.log("Display mode: Ghosted.");
             }
             "new" => {
+                self.session.cancel();
                 self.doc = Document::new();
                 self.log("Created new empty document.");
             }
             "help" => {
-                self.log("Commands: Box [s], Sphere [r], Circle [r], Line [len], Extrude [h], Move dx dy dz, Scale s, Delete, Undo, Redo, ZoomExtents (ZE), Wireframe, Shaded, Ghosted, New");
+                self.log("Interactive: Line, Polyline, Circle, Box, Move, Copy, Rotate, Scale | Quick: Sphere [r], Extrude [h], Delete, Undo, Redo, ZoomExtents (ZE), Wireframe, Shaded, Ghosted, New");
             }
             _ => {
                 self.log(format!("Unknown command '{cmd}'. Type 'Help' for available commands."));
@@ -318,6 +350,7 @@ impl ElephantApp {
             let (rect, response) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
 
             let aspect = (rect.width() / rect.height().max(1.0)) as f64;
+            let cplane = self.cameras[idx].cplane;
 
             if response.hovered() {
                 self.active_viewport = idx;
@@ -329,7 +362,19 @@ impl ElephantApp {
                     let ndc_x = ((pos.x - rect.left()) / rect.width().max(1.0)) * 2.0 - 1.0;
                     let ndc_y = 1.0 - ((pos.y - rect.top()) / rect.height().max(1.0)) * 2.0;
                     let ray = self.cameras[idx].screen_to_ray(ndc_x as f64, ndc_y as f64, aspect);
-                    self.cursor_world = self.cameras[idx].cplane.intersect_ray(&ray);
+                    if let Some(raw_pt) = cplane.intersect_ray(&ray) {
+                        let res = self.snap.resolve(
+                            raw_pt,
+                            self.session.base_point(),
+                            &self.doc,
+                            &cplane,
+                        );
+                        self.cursor_world = Some(res.point);
+                        self.last_snap_kind = res.kind;
+                    } else {
+                        self.cursor_world = None;
+                        self.last_snap_kind = None;
+                    }
                 }
             }
 
@@ -342,6 +387,12 @@ impl ElephantApp {
                 } else {
                     self.cameras[idx].pan(delta.x as f64, delta.y as f64, rect.height() as f64);
                 }
+            } else if response.clicked_by(egui::PointerButton::Secondary) && self.session.is_active()
+            {
+                let outcome = self.session.finish_or_cancel(&mut self.doc);
+                for m in outcome.messages {
+                    self.log(m);
+                }
             }
 
             if response.clicked_by(egui::PointerButton::Primary) {
@@ -350,12 +401,28 @@ impl ElephantApp {
                     let ndc_x = ((pos.x - rect.left()) / rect.width().max(1.0)) * 2.0 - 1.0;
                     let ndc_y = 1.0 - ((pos.y - rect.top()) / rect.height().max(1.0)) * 2.0;
                     let ray = self.cameras[idx].screen_to_ray(ndc_x as f64, ndc_y as f64, aspect);
-                    let shift = ui.input(|i| i.modifiers.shift);
-                    if !shift {
-                        self.doc.clear_selection();
-                    }
-                    if let Some(hit_id) = self.doc.pick_ray(&ray) {
-                        self.doc.set_selected(hit_id, true);
+
+                    if self.session.is_active() {
+                        if let Some(raw_pt) = cplane.intersect_ray(&ray) {
+                            let res = self.snap.resolve(
+                                raw_pt,
+                                self.session.base_point(),
+                                &self.doc,
+                                &cplane,
+                            );
+                            let outcome = self.session.on_point(res.point, &mut self.doc, &cplane);
+                            for m in outcome.messages {
+                                self.log(m);
+                            }
+                        }
+                    } else {
+                        let shift = ui.input(|i| i.modifiers.shift);
+                        if !shift {
+                            self.doc.clear_selection();
+                        }
+                        if let Some(hit_id) = self.doc.pick_ray(&ray) {
+                            self.doc.set_selected(hit_id, true);
+                        }
                     }
                 }
             }
@@ -375,7 +442,10 @@ impl ElephantApp {
 
 impl eframe::App for ElephantApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Keyboard shortcuts
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && self.session.is_active() {
+            let msg = self.session.cancel();
+            self.log(msg);
+        }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z)) {
             self.execute_command("Undo");
         }
@@ -386,7 +456,6 @@ impl eframe::App for ElephantApp {
             self.execute_command("Delete");
         }
 
-        // Top Menu + Toolbar + Command Prompt
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -399,11 +468,17 @@ impl eframe::App for ElephantApp {
                     }
                 });
                 ui.menu_button("Edit", |ui| {
-                    if ui.add_enabled(self.doc.can_undo(), egui::Button::new("Undo (Ctrl+Z)")).clicked() {
+                    if ui
+                        .add_enabled(self.doc.can_undo(), egui::Button::new("Undo (Ctrl+Z)"))
+                        .clicked()
+                    {
                         self.execute_command("Undo");
                         ui.close_menu();
                     }
-                    if ui.add_enabled(self.doc.can_redo(), egui::Button::new("Redo (Ctrl+Y)")).clicked() {
+                    if ui
+                        .add_enabled(self.doc.can_redo(), egui::Button::new("Redo (Ctrl+Y)"))
+                        .clicked()
+                    {
                         self.execute_command("Redo");
                         ui.close_menu();
                     }
@@ -413,7 +488,15 @@ impl eframe::App for ElephantApp {
                     }
                 });
                 ui.menu_button("Create", |ui| {
-                    for cmd in ["Box", "Sphere", "Circle", "Line", "Extrude"] {
+                    for cmd in ["Line", "Polyline", "Circle", "Box", "Sphere", "Extrude"] {
+                        if ui.button(cmd).clicked() {
+                            self.execute_command(cmd);
+                            ui.close_menu();
+                        }
+                    }
+                });
+                ui.menu_button("Transform", |ui| {
+                    for cmd in ["Move", "Copy", "Rotate", "Scale"] {
                         if ui.button(cmd).clicked() {
                             self.execute_command(cmd);
                             ui.close_menu();
@@ -447,17 +530,16 @@ impl eframe::App for ElephantApp {
 
             ui.separator();
 
-            // Command log preview (last 2 lines) + Command prompt
             let start = self.command_log.len().saturating_sub(2);
             for line in &self.command_log[start..] {
                 ui.small(line);
             }
             ui.horizontal(|ui| {
-                ui.strong("Command:");
+                ui.strong(format!("{}:", self.session.prompt()));
                 let edit = ui.add(
                     egui::TextEdit::singleline(&mut self.command_input)
-                        .desired_width(420.0)
-                        .hint_text("Type a command (Box, Sphere, Circle, Move 1 0 0, Undo...)"),
+                        .desired_width(380.0)
+                        .hint_text("Command, x,y,z, @dx,dy,dz, or distance"),
                 );
                 if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     let cmd = std::mem::take(&mut self.command_input);
@@ -468,8 +550,12 @@ impl eframe::App for ElephantApp {
                     let cmd = std::mem::take(&mut self.command_input);
                     self.execute_command(&cmd);
                 }
+                if self.session.is_active() && ui.small_button("Cancel (Esc)").clicked() {
+                    let msg = self.session.cancel();
+                    self.log(msg);
+                }
                 ui.separator();
-                for quick in ["Box", "Sphere", "Circle", "ZoomExtents"] {
+                for quick in ["Line", "Circle", "Box", "Move", "ZoomExtents"] {
                     if ui.small_button(quick).clicked() {
                         self.execute_command(quick);
                     }
@@ -477,7 +563,7 @@ impl eframe::App for ElephantApp {
             });
 
             let typed = self.command_input.trim().to_ascii_lowercase();
-            if !typed.is_empty() {
+            if !typed.is_empty() && !self.session.is_active() {
                 ui.horizontal(|ui| {
                     ui.weak("Suggestions:");
                     for &cand in KNOWN_COMMANDS {
@@ -491,7 +577,6 @@ impl eframe::App for ElephantApp {
             }
         });
 
-        // Right Inspector Panel: Layers + Properties
         egui::SidePanel::right("inspector")
             .default_width(250.0)
             .show(ctx, |ui| {
@@ -561,7 +646,6 @@ impl eframe::App for ElephantApp {
                 }
             });
 
-        // Bottom Status Bar
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!(
@@ -570,27 +654,48 @@ impl eframe::App for ElephantApp {
                 ));
                 ui.separator();
                 if let Some(p) = self.cursor_world {
-                    ui.label(format!("CPlane: {:.2}, {:.2}, {:.2}", p.x, p.y, p.z));
+                    let snap_tag = self
+                        .last_snap_kind
+                        .map(|k| format!(" [{}]", k.label()))
+                        .unwrap_or_default();
+                    ui.label(format!(
+                        "CPlane: {:.2}, {:.2}, {:.2}{}",
+                        p.x, p.y, p.z, snap_tag
+                    ));
                 } else {
                     ui.label("CPlane: --");
                 }
                 ui.separator();
+                ui.checkbox(&mut self.snap.grid_snap, "Grid Snap");
+                ui.checkbox(&mut self.snap.ortho, "Ortho");
+                ui.checkbox(&mut self.snap.osnap_enabled, "OSnap");
+                if self.snap.osnap_enabled {
+                    ui.checkbox(&mut self.snap.osnap_end, "End");
+                    ui.checkbox(&mut self.snap.osnap_mid, "Mid");
+                    ui.checkbox(&mut self.snap.osnap_center, "Cen");
+                }
+                ui.separator();
                 let sel_count = self.doc.objects.values().filter(|o| o.selected).count();
                 ui.label(format!(
-                    "Objects: {} | Selected: {} | Mode: {}",
+                    "Obj: {} | Sel: {}",
                     self.doc.objects.len(),
-                    sel_count,
-                    self.display_mode.label()
+                    sel_count
                 ));
             });
         });
 
-        // Central 4-Viewport Grid (or Maximized Single Viewport)
-        let scene = Arc::new(RenderScene::build(
-            &self.doc,
-            self.display_mode,
-            &self.cameras[self.active_viewport].cplane,
-        ));
+        let cplane = self.cameras[self.active_viewport].cplane;
+        let mut scene = RenderScene::build(&self.doc, self.display_mode, &cplane);
+        if self.session.is_active() {
+            let previews = self.session.preview_geometry(self.cursor_world, &cplane);
+            let snap_marker = if self.last_snap_kind.is_some() {
+                self.cursor_world
+            } else {
+                None
+            };
+            scene.push_preview(&previews, snap_marker);
+        }
+        let scene = Arc::new(scene);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::from_rgb(28, 30, 34)))

@@ -1,7 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use cad_doc::Document;
 use cad_geom::Geometry;
-use cad_math::Plane;
+use cad_math::{DVec3, Plane};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayMode {
@@ -103,6 +103,31 @@ impl RenderScene {
         }
 
         scene
+    }
+
+    /// Append live rubber-band preview geometry and optional OSnap crosshair marker.
+    pub fn push_preview(&mut self, previews: &[Geometry], snap_point: Option<DVec3>) {
+        let preview_color = [0.25, 0.85, 1.0, 1.0];
+        for geom in previews {
+            if let Geometry::Curve(curve) = geom {
+                let pts = curve.sample_polyline(48);
+                for pair in pts.windows(2) {
+                    self.push_line(
+                        [pair[0].x as f32, pair[0].y as f32, pair[0].z as f32],
+                        [pair[1].x as f32, pair[1].y as f32, pair[1].z as f32],
+                        preview_color,
+                    );
+                }
+            }
+        }
+        if let Some(p) = snap_point {
+            let snap_color = [1.0, 0.35, 0.95, 1.0];
+            let pf = [p.x as f32, p.y as f32, p.z as f32];
+            let d = 0.25_f32;
+            self.push_line([pf[0] - d, pf[1], pf[2]], [pf[0] + d, pf[1], pf[2]], snap_color);
+            self.push_line([pf[0], pf[1] - d, pf[2]], [pf[0], pf[1] + d, pf[2]], snap_color);
+            self.push_line([pf[0], pf[1], pf[2] - d], [pf[0], pf[1], pf[2] + d], snap_color);
+        }
     }
 
     fn push_mesh(
