@@ -2,10 +2,11 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 use cad_doc::{AnnotationKind, Document};
-use cad_geom::Geometry;
+use cad_geom::{Aabb, Geometry};
 use cad_math::{DVec3, Plane};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DisplayMode {
     Wireframe,
     Shaded,
@@ -15,6 +16,14 @@ pub enum DisplayMode {
 }
 
 impl DisplayMode {
+    pub const ALL: [Self; 5] = [
+        Self::Wireframe,
+        Self::Shaded,
+        Self::Ghosted,
+        Self::Technical,
+        Self::Arctic,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Wireframe => "Wireframe",
@@ -52,37 +61,21 @@ pub struct RenderScene {
 const SELECTION_COLOR: [f32; 4] = [1.0, 0.85, 0.12, 1.0];
 
 impl RenderScene {
+    /// Combined document + CPlane grid scene (useful for single-viewport rendering and tests).
     pub fn build(doc: &Document, mode: DisplayMode, cplane: &Plane, version: u64) -> Self {
+        let doc_aabb = doc.visible_bounding_box();
+        let mut scene = Self::build_grid(cplane, &doc_aabb, version);
+        let doc_scene = Self::build_document(doc, mode, version);
+        scene.append(&doc_scene);
+        scene
+    }
+
+    /// Build only visible document geometry and annotations (without CPlane grid or transient previews).
+    pub fn build_document(doc: &Document, mode: DisplayMode, version: u64) -> Self {
         let mut scene = Self {
             version,
             ..Default::default()
         };
-        let mut total_aabb = cad_math::Aabb::EMPTY;
-        for (_, obj) in &doc.objects {
-            if !obj.visible {
-                continue;
-            }
-            if let Some(layer) = doc.layers.get(obj.layer_id) {
-                if layer.visible {
-                    total_aabb = total_aabb.union(&obj.aabb);
-                }
-            }
-        }
-        let grid_step = if total_aabb.is_empty() {
-            1.0
-        } else {
-            let max_dim = total_aabb.size().max_element().max(1.0);
-            10.0_f64.powf((max_dim / 20.0).log10().floor()).max(1.0)
-        };
-        let mut grid_plane = *cplane;
-        if !total_aabb.is_empty() {
-            let c = total_aabb.center();
-            let snap = grid_step * 5.0;
-            let sx = (c.x / snap).round() * snap;
-            let sy = (c.y / snap).round() * snap;
-            grid_plane.origin = DVec3::new(sx, sy, cplane.origin.z);
-        }
-        scene.push_cplane_grid(&grid_plane, 20, grid_step);
 
         for (_, obj) in &doc.objects {
             if !obj.visible {
@@ -158,11 +151,49 @@ impl RenderScene {
                     }
                 }
                 Geometry::Surface(surf) => {
-                    let mesh = surf.tessellate(24, 8);
-                    scene.push_mesh(&mesh.positions, &mesh.normals, &mesh.indices, shaded_color, base_color, mode, obj.selected);
+                    if mode != DisplayMode::Wireframe {
+                        let su = (surf.count_u.max(4) * 4).clamp(16, 48);
+                        let sv = (surf.count_v.max(4) * 4).clamp(16, 48);
+                        let mesh = surf.tessellate(su, sv);
+                        scene.push_mesh_triangles(
+                            &mesh.positions,
+                            &mesh.normals,
+                            &mesh.indices,
+                            shaded_color,
+                        );
+                    }
+                    if mode != DisplayMode::Arctic || obj.selected {
+                        let iso_color = if obj.selected {
+                            SELECTION_COLOR
+                        } else if mode == DisplayMode::Wireframe {
+                            base_color
+                        } else if mode == DisplayMode::Technical {
+                            [0.10, 0.12, 0.15, 1.0]
+                        } else {
+                            [0.16, 0.18, 0.22, 0.85]
+                        };
+                        let inner = if mode == DisplayMode::Wireframe { 3 } else { 2 };
+                        for poly in surf.isocurve_polylines(inner, inner, 24) {
+                            for pair in poly.windows(2) {
+                                scene.push_line(
+                                    [pair[0].x as f32, pair[0].y as f32, pair[0].z as f32],
+                                    [pair[1].x as f32, pair[1].y as f32, pair[1].z as f32],
+                                    iso_color,
+                                );
+                            }
+                        }
+                    }
                 }
                 Geometry::Mesh(mesh) => {
-                    scene.push_mesh(&mesh.positions, &mesh.normals, &mesh.indices, shaded_color, base_color, mode, obj.selected);
+                    scene.push_mesh(
+                        &mesh.positions,
+                        &mesh.normals,
+                        &mesh.indices,
+                        shaded_color,
+                        base_color,
+                        mode,
+                        obj.selected,
+                    );
                 }
             }
         }
@@ -191,6 +222,49 @@ impl RenderScene {
         }
 
         scene
+    }
+
+    /// Build a viewport-specific construction plane (CPlane) grid centered near `doc_aabb`.
+    pub fn build_grid(cplane: &Plane, doc_aabb: &Aabb, version: u64) -> Self {
+        let mut scene = Self {
+            version,
+            ..Default::default()
+        };
+        let grid_step = if doc_aabb.is_empty() {
+            1.0
+        } else {
+            let max_dim = doc_aabb.size().max_element().max(1.0);
+            10.0_f64.powf((max_dim / 20.0).log10().floor()).max(1.0)
+        };
+        let (center_u_steps, center_v_steps) = if doc_aabb.is_empty() {
+            (0_i32, 0_i32)
+        } else {
+            let rel = doc_aabb.center() - cplane.origin;
+            let snap = grid_step * 5.0;
+            let cu = (rel.dot(cplane.x_axis) / snap).round() as i32 * 5;
+            let cv = (rel.dot(cplane.y_axis) / snap).round() as i32 * 5;
+            (cu, cv)
+        };
+        scene.push_cplane_grid(cplane, center_u_steps, center_v_steps, 20, grid_step);
+        scene
+    }
+
+    /// Build a dynamic overlay scene containing active tool previews and snap crosshair markers.
+    pub fn build_overlay(previews: &[Geometry], snap_point: Option<DVec3>, version: u64) -> Self {
+        let mut scene = Self {
+            version,
+            ..Default::default()
+        };
+        scene.push_preview(previews, snap_point);
+        scene
+    }
+
+    fn append(&mut self, other: &Self) {
+        let base = self.mesh_vertices.len() as u32;
+        self.mesh_vertices.extend_from_slice(&other.mesh_vertices);
+        self.mesh_indices
+            .extend(other.mesh_indices.iter().map(|&idx| base + idx));
+        self.line_vertices.extend_from_slice(&other.line_vertices);
     }
 
     /// Append live rubber-band / parametric preview geometry and optional OSnap crosshair marker.
@@ -250,6 +324,28 @@ impl RenderScene {
         }
     }
 
+    fn push_mesh_triangles(
+        &mut self,
+        positions: &[[f64; 3]],
+        normals: &[[f64; 3]],
+        indices: &[[u32; 3]],
+        shaded_color: [f32; 4],
+    ) {
+        let base = self.mesh_vertices.len() as u32;
+        for (p, n) in positions.iter().zip(normals.iter()) {
+            self.mesh_vertices.push(MeshVertex {
+                position: [p[0] as f32, p[1] as f32, p[2] as f32],
+                normal: [n[0] as f32, n[1] as f32, n[2] as f32],
+                color: shaded_color,
+            });
+        }
+        for &[a, b, c] in indices {
+            self.mesh_indices.push(base + a);
+            self.mesh_indices.push(base + b);
+            self.mesh_indices.push(base + c);
+        }
+    }
+
     fn push_mesh(
         &mut self,
         positions: &[[f64; 3]],
@@ -261,19 +357,7 @@ impl RenderScene {
         selected: bool,
     ) {
         if mode != DisplayMode::Wireframe {
-            let base = self.mesh_vertices.len() as u32;
-            for (p, n) in positions.iter().zip(normals.iter()) {
-                self.mesh_vertices.push(MeshVertex {
-                    position: [p[0] as f32, p[1] as f32, p[2] as f32],
-                    normal: [n[0] as f32, n[1] as f32, n[2] as f32],
-                    color: shaded_color,
-                });
-            }
-            for &[a, b, c] in indices {
-                self.mesh_indices.push(base + a);
-                self.mesh_indices.push(base + b);
-                self.mesh_indices.push(base + c);
-            }
+            self.push_mesh_triangles(positions, normals, indices, shaded_color);
         }
 
         if mode == DisplayMode::Wireframe || mode == DisplayMode::Ghosted || selected {
@@ -333,33 +417,72 @@ impl RenderScene {
         }
     }
 
-    fn push_cplane_grid(&mut self, plane: &Plane, half_count: i32, step: f64) {
-        let extent = half_count as f64 * step;
+    fn axis_color(axis: DVec3) -> [f32; 4] {
+        let ax = axis.x.abs();
+        let ay = axis.y.abs();
+        let az = axis.z.abs();
+        if ax >= ay && ax >= az {
+            [0.85, 0.22, 0.22, 1.0]
+        } else if ay >= az {
+            [0.22, 0.78, 0.30, 1.0]
+        } else {
+            [0.28, 0.54, 0.92, 1.0]
+        }
+    }
+
+    fn push_cplane_grid(
+        &mut self,
+        plane: &Plane,
+        center_u_steps: i32,
+        center_v_steps: i32,
+        half_count: i32,
+        step: f64,
+    ) {
         let minor = [0.32, 0.34, 0.38, 1.0];
         let major = [0.22, 0.24, 0.28, 1.0];
-        let x_axis_color = [0.85, 0.22, 0.22, 1.0];
-        let y_axis_color = [0.22, 0.78, 0.30, 1.0];
+        let u_axis_color = Self::axis_color(plane.x_axis);
+        let v_axis_color = Self::axis_color(plane.y_axis);
 
-        for i in -half_count..=half_count {
-            let d = i as f64 * step;
-            let is_major = i % 5 == 0;
-            let c_x = if i == 0 { x_axis_color } else if is_major { major } else { minor };
-            let c_y = if i == 0 { y_axis_color } else if is_major { major } else { minor };
+        let u_min = (center_u_steps - half_count) as f64 * step;
+        let u_max = (center_u_steps + half_count) as f64 * step;
+        let v_min = (center_v_steps - half_count) as f64 * step;
+        let v_max = (center_v_steps + half_count) as f64 * step;
 
-            let p0 = plane.origin + plane.y_axis * d - plane.x_axis * extent;
-            let p1 = plane.origin + plane.y_axis * d + plane.x_axis * extent;
+        for iv in (center_v_steps - half_count)..=(center_v_steps + half_count) {
+            let d = iv as f64 * step;
+            let is_major = iv.rem_euclid(5) == 0;
+            let col = if iv == 0 {
+                u_axis_color
+            } else if is_major {
+                major
+            } else {
+                minor
+            };
+            let p0 = plane.origin + plane.y_axis * d + plane.x_axis * u_min;
+            let p1 = plane.origin + plane.y_axis * d + plane.x_axis * u_max;
             self.push_line(
                 [p0.x as f32, p0.y as f32, p0.z as f32],
                 [p1.x as f32, p1.y as f32, p1.z as f32],
-                c_x,
+                col,
             );
+        }
 
-            let q0 = plane.origin + plane.x_axis * d - plane.y_axis * extent;
-            let q1 = plane.origin + plane.x_axis * d + plane.y_axis * extent;
+        for iu in (center_u_steps - half_count)..=(center_u_steps + half_count) {
+            let d = iu as f64 * step;
+            let is_major = iu.rem_euclid(5) == 0;
+            let col = if iu == 0 {
+                v_axis_color
+            } else if is_major {
+                major
+            } else {
+                minor
+            };
+            let q0 = plane.origin + plane.x_axis * d + plane.y_axis * v_min;
+            let q1 = plane.origin + plane.x_axis * d + plane.y_axis * v_max;
             self.push_line(
                 [q0.x as f32, q0.y as f32, q0.z as f32],
                 [q1.x as f32, q1.y as f32, q1.z as f32],
-                c_y,
+                col,
             );
         }
     }

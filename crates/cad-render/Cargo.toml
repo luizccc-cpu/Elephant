@@ -10,6 +10,7 @@ cad-geom = { path = "../cad-geom" }
 cad-doc = { path = "../cad-doc" }
 bytemuck.workspace = true
 eframe.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 cad-io = { path = "../cad-io" }

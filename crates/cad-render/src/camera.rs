@@ -1,6 +1,9 @@
 use cad_math::{Aabb, DMat4, DVec3, DVec4, Mat4, Plane, Ray};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use crate::scene::DisplayMode;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ViewportKind {
     Perspective,
     Top,
@@ -20,7 +23,7 @@ impl ViewportKind {
 }
 
 /// Z-up CAD viewport camera supporting Perspective and Orthographic projections.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViewportCamera {
     pub kind: ViewportKind,
     pub target: DVec3,
@@ -31,6 +34,7 @@ pub struct ViewportCamera {
     pub is_perspective: bool,
     pub fov_y_rad: f64,
     pub cplane: Plane,
+    pub display_mode: DisplayMode,
 }
 
 impl ViewportCamera {
@@ -46,6 +50,7 @@ impl ViewportCamera {
                 is_perspective: true,
                 fov_y_rad: 45.0_f64.to_radians(),
                 cplane: Plane::world_xy(),
+                display_mode: DisplayMode::Shaded,
             },
             ViewportKind::Top => Self {
                 kind,
@@ -57,6 +62,7 @@ impl ViewportCamera {
                 is_perspective: false,
                 fov_y_rad: 45.0_f64.to_radians(),
                 cplane: Plane::world_xy(),
+                display_mode: DisplayMode::Wireframe,
             },
             ViewportKind::Front => Self {
                 kind,
@@ -68,6 +74,7 @@ impl ViewportCamera {
                 is_perspective: false,
                 fov_y_rad: 45.0_f64.to_radians(),
                 cplane: Plane::world_zx(),
+                display_mode: DisplayMode::Wireframe,
             },
             ViewportKind::Right => Self {
                 kind,
@@ -79,6 +86,7 @@ impl ViewportCamera {
                 is_perspective: false,
                 fov_y_rad: 45.0_f64.to_radians(),
                 cplane: Plane::world_yz(),
+                display_mode: DisplayMode::Wireframe,
             },
         }
     }
@@ -137,13 +145,17 @@ impl ViewportCamera {
         self.pitch = (self.pitch + delta_y * 0.008).clamp(-1.54, 1.54);
     }
 
-    pub fn pan(&mut self, delta_x: f64, delta_y: f64, viewport_height_px: f64) {
+    pub fn world_units_per_pixel(&self, viewport_height_px: f64) -> f64 {
         let h = viewport_height_px.max(1.0);
-        let world_per_px = if self.is_perspective {
+        if self.is_perspective {
             2.0 * self.distance * (self.fov_y_rad * 0.5).tan() / h
         } else {
             2.0 * self.ortho_half_height / h
-        };
+        }
+    }
+
+    pub fn pan(&mut self, delta_x: f64, delta_y: f64, viewport_height_px: f64) {
+        let world_per_px = self.world_units_per_pixel(viewport_height_px);
         let (eye, up) = self.eye_and_up();
         let forward = (self.target - eye).normalize_or_zero();
         let right = forward.cross(up).normalize_or_zero();

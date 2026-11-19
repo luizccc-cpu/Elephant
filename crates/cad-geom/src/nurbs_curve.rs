@@ -1,4 +1,4 @@
-use cad_math::{Aabb, DMat4, DVec3, DVec4, PARAM_EPSILON, Plane};
+use cad_math::{Aabb, DMat4, DVec3, DVec4, PARAM_EPSILON, Plane, Ray};
 use serde::{Deserialize, Serialize};
 
 use crate::error::GeomError;
@@ -203,6 +203,26 @@ impl NurbsCurve {
 
     pub fn bounding_box(&self) -> Aabb {
         Aabb::from_points(self.control_points.iter().map(|cp| cp.position))
+    }
+
+    /// Closest `(t, distance)` from `ray` (`t >= 0`) to a polyline approximation of this curve.
+    pub fn ray_distance(&self, ray: &Ray, samples: usize) -> Option<(f64, f64)> {
+        let pts: Vec<DVec3> = if self.degree == 1 {
+            self.control_points.iter().map(|c| c.position).collect()
+        } else {
+            self.sample_polyline(samples.max(32))
+        };
+        if pts.len() < 2 {
+            return pts.first().map(|&p| ray.distance_to_point(p));
+        }
+        let mut best: Option<(f64, f64)> = None;
+        for w in pts.windows(2) {
+            let (t, d) = ray.distance_to_segment(w[0], w[1]);
+            if best.is_none_or(|b| d < b.1 || ((d - b.1).abs() < 1e-12 && t < b.0)) {
+                best = Some((t, d));
+            }
+        }
+        best
     }
 
     pub fn transform(&mut self, mat: &DMat4) {
@@ -823,5 +843,18 @@ mod tests {
         assert!((la.length_approx(4) - 8.0).abs() < 1e-6);
         assert!((lb.length_approx(4) - 8.0).abs() < 1e-6);
         assert!((fillet.length_approx(32) - std::f64::consts::PI).abs() < 1e-3);
+    }
+
+    #[test]
+    fn curve_ray_distance_hits_perimeter_and_misses_center() {
+        let circle = NurbsCurve::circle(&Plane::world_xy(), 5.0).unwrap();
+        let center_ray = Ray::new(DVec3::new(0.0, 0.0, 10.0), DVec3::new(0.0, 0.0, -1.0));
+        let (_, dist_center) = circle.ray_distance(&center_ray, 48).unwrap();
+        assert!((dist_center - 5.0).abs() < 0.05);
+
+        let edge_ray = Ray::new(DVec3::new(5.05, 0.0, 10.0), DVec3::new(0.0, 0.0, -1.0));
+        let (t_edge, dist_edge) = circle.ray_distance(&edge_ray, 48).unwrap();
+        assert!((t_edge - 10.0).abs() < 1e-6);
+        assert!(dist_edge < 0.08);
     }
 }

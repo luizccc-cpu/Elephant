@@ -1,4 +1,4 @@
-use cad_math::{Aabb, DMat4, DVec3, DVec4, PARAM_EPSILON, Plane};
+use cad_math::{Aabb, DMat4, DVec3, DVec4, PARAM_EPSILON, Plane, Ray};
 use serde::{Deserialize, Serialize};
 
 use crate::error::GeomError;
@@ -256,6 +256,72 @@ impl NurbsSurface {
             cp.position = mat.transform_point3(cp.position);
         }
     }
+
+    /// Ray intersection against a display tessellation of the surface, returning hit distance `t >= 0`.
+    pub fn ray_intersect(&self, ray: &Ray) -> Option<f64> {
+        let su = (self.count_u.max(4) * 4).clamp(16, 48);
+        let sv = (self.count_v.max(4) * 4).clamp(16, 48);
+        self.tessellate(su, sv).ray_intersect(ray)
+    }
+
+    /// Control-polygon grid edges across `u` and `v` directions.
+    pub fn control_net_segments(&self) -> Vec<(DVec3, DVec3)> {
+        let mut segs = Vec::with_capacity(
+            self.count_u * self.count_v.saturating_sub(1)
+                + self.count_u.saturating_sub(1) * self.count_v,
+        );
+        for u in 0..self.count_u {
+            for v in 0..self.count_v {
+                let p = self.control_points[u * self.count_v + v].position;
+                if v + 1 < self.count_v {
+                    let pv = self.control_points[u * self.count_v + (v + 1)].position;
+                    segs.push((p, pv));
+                }
+                if u + 1 < self.count_u {
+                    let pu = self.control_points[(u + 1) * self.count_v + v].position;
+                    segs.push((p, pu));
+                }
+            }
+        }
+        segs
+    }
+
+    /// Sample boundary and interior U/V isocurve polylines for viewport wireframe rendering.
+    pub fn isocurve_polylines(
+        &self,
+        inner_u: usize,
+        inner_v: usize,
+        samples: usize,
+    ) -> Vec<Vec<DVec3>> {
+        let (u0, u1) = self.domain_u();
+        let (v0, v1) = self.domain_v();
+        let steps = samples.max(2);
+        let u_curves = inner_u + 1;
+        let v_curves = inner_v + 1;
+        let mut out = Vec::with_capacity(u_curves + 1 + v_curves + 1);
+
+        for iu in 0..=u_curves {
+            let u = u0 + (u1 - u0) * (iu as f64 / u_curves as f64);
+            let mut pts = Vec::with_capacity(steps + 1);
+            for s in 0..=steps {
+                let v = v0 + (v1 - v0) * (s as f64 / steps as f64);
+                pts.push(self.evaluate(u, v));
+            }
+            out.push(pts);
+        }
+
+        for iv in 0..=v_curves {
+            let v = v0 + (v1 - v0) * (iv as f64 / v_curves as f64);
+            let mut pts = Vec::with_capacity(steps + 1);
+            for s in 0..=steps {
+                let u = u0 + (u1 - u0) * (s as f64 / steps as f64);
+                pts.push(self.evaluate(u, v));
+            }
+            out.push(pts);
+        }
+
+        out
+    }
 }
 
 #[cfg(test)]
@@ -270,5 +336,23 @@ mod tests {
         assert!((p - DVec3::new(0.0, 2.0, 2.5)).length() < 1e-9);
         let mesh = cyl.tessellate(16, 4);
         assert_eq!(mesh.indices.len(), 16 * 4 * 2);
+    }
+
+    #[test]
+    fn surface_ray_intersect_control_net_and_isocurves() {
+        let surf = NurbsSurface::plane_rect(&Plane::world_xy(), 4.0, 2.0);
+        let hit_ray = Ray::new(DVec3::new(0.5, 0.25, 5.0), DVec3::new(0.0, 0.0, -1.0));
+        let t = surf.ray_intersect(&hit_ray).expect("ray should hit plane rect");
+        assert!((t - 5.0).abs() < 1e-6);
+
+        let miss_ray = Ray::new(DVec3::new(3.5, 0.0, 5.0), DVec3::new(0.0, 0.0, -1.0));
+        assert!(surf.ray_intersect(&miss_ray).is_none());
+
+        let segs = surf.control_net_segments();
+        assert_eq!(segs.len(), 4);
+
+        let isos = surf.isocurve_polylines(2, 2, 8);
+        assert_eq!(isos.len(), 8);
+        assert!(isos.iter().all(|poly| poly.len() == 9));
     }
 }

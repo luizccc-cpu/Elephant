@@ -12,6 +12,9 @@ pub fn export_obj_string(doc: &Document) -> String {
     let mut vn_offset: u32 = 1;
 
     for (idx, (_, obj)) in doc.objects.iter().enumerate() {
+        if !obj.visible {
+            continue;
+        }
         if let Some(layer) = doc.layers.get(obj.layer_id) {
             if !layer.visible {
                 continue;

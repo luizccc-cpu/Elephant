@@ -39,6 +39,7 @@ pub struct SnapConfig {
     pub osnap_quad: bool,
     pub osnap_near: bool,
     pub snap_radius: f64,
+    pub snap_radius_px: f64,
 }
 
 impl Default for SnapConfig {
@@ -54,6 +55,7 @@ impl Default for SnapConfig {
             osnap_quad: true,
             osnap_near: false,
             snap_radius: 0.6,
+            snap_radius_px: 14.0,
         }
     }
 }
@@ -72,8 +74,19 @@ impl SnapConfig {
         doc: &Document,
         cplane: &Plane,
     ) -> SnapResult {
+        self.resolve_with_radius(raw_point, base_point, doc, cplane, self.snap_radius)
+    }
+
+    pub fn resolve_with_radius(
+        &self,
+        raw_point: DVec3,
+        base_point: Option<DVec3>,
+        doc: &Document,
+        cplane: &Plane,
+        world_snap_radius: f64,
+    ) -> SnapResult {
         if self.osnap_enabled {
-            if let Some((pt, kind)) = self.find_osnap(raw_point, doc) {
+            if let Some((pt, kind)) = self.find_osnap(raw_point, doc, world_snap_radius) {
                 return SnapResult {
                     point: pt,
                     kind: Some(kind),
@@ -109,11 +122,19 @@ impl SnapConfig {
         SnapResult { point: p, kind }
     }
 
-    fn find_osnap(&self, raw_point: DVec3, doc: &Document) -> Option<(DVec3, SnapKind)> {
-        let mut best_dist = self.snap_radius;
+    fn find_osnap(
+        &self,
+        raw_point: DVec3,
+        doc: &Document,
+        snap_radius: f64,
+    ) -> Option<(DVec3, SnapKind)> {
+        let mut best_dist = snap_radius.max(1e-6);
         let mut best: Option<(DVec3, SnapKind)> = None;
 
         for (_, obj) in &doc.objects {
+            if !obj.visible {
+                continue;
+            }
             if let Some(layer) = doc.layers.get(obj.layer_id) {
                 if !layer.visible {
                     continue;
@@ -132,12 +153,22 @@ impl SnapConfig {
                 Geometry::Curve(curve) => {
                     let (u0, u1) = curve.domain();
                     if self.osnap_end {
-                        for u in [u0, u1] {
-                            let pt = curve.evaluate(u);
-                            let d = pt.distance(raw_point);
-                            if d < best_dist {
-                                best_dist = d;
-                                best = Some((pt, SnapKind::End));
+                        if curve.degree == 1 {
+                            for cp in &curve.control_points {
+                                let d = cp.position.distance(raw_point);
+                                if d < best_dist {
+                                    best_dist = d;
+                                    best = Some((cp.position, SnapKind::End));
+                                }
+                            }
+                        } else {
+                            for u in [u0, u1] {
+                                let pt = curve.evaluate(u);
+                                let d = pt.distance(raw_point);
+                                if d < best_dist {
+                                    best_dist = d;
+                                    best = Some((pt, SnapKind::End));
+                                }
                             }
                         }
                     }
@@ -172,7 +203,29 @@ impl SnapConfig {
                         }
                     }
                 }
-                Geometry::Mesh(_) | Geometry::Surface(_) => {
+                Geometry::Surface(surf) => {
+                    if self.osnap_end {
+                        let (u0, u1) = surf.domain_u();
+                        let (v0, v1) = surf.domain_v();
+                        for (u, v) in [(u0, v0), (u1, v0), (u0, v1), (u1, v1)] {
+                            let pt = surf.evaluate(u, v);
+                            let d = pt.distance(raw_point);
+                            if d < best_dist {
+                                best_dist = d;
+                                best = Some((pt, SnapKind::End));
+                            }
+                        }
+                    }
+                    if self.osnap_center {
+                        let pt = obj.aabb.center();
+                        let d = pt.distance(raw_point);
+                        if d < best_dist {
+                            best_dist = d;
+                            best = Some((pt, SnapKind::Center));
+                        }
+                    }
+                }
+                Geometry::Mesh(_) => {
                     if self.osnap_center {
                         let pt = obj.aabb.center();
                         let d = pt.distance(raw_point);
@@ -186,8 +239,11 @@ impl SnapConfig {
         }
 
         if best.is_none() && self.osnap_near {
-            let mut near_best = self.snap_radius;
+            let mut near_best = snap_radius.max(1e-6);
             for (_, obj) in &doc.objects {
+                if !obj.visible {
+                    continue;
+                }
                 if let Some(layer) = doc.layers.get(obj.layer_id) {
                     if !layer.visible {
                         continue;
@@ -281,5 +337,37 @@ mod tests {
         let res_near = cfg_near.resolve(DVec3::new(2.5, 0.2, 0.0), None, &doc2, &Plane::world_xy());
         assert_eq!(res_near.kind, Some(SnapKind::Near));
         assert!((res_near.point - DVec3::new(2.5, 0.0, 0.0)).length() < 1e-9);
+    }
+
+    #[test]
+    fn osnap_skips_hidden_objects_and_supports_zoom_radius_and_corners() {
+        use cad_geom::NurbsSurface;
+
+        let mut doc = Document::new();
+        let rect = NurbsCurve::rectangle(&Plane::world_xy(), DVec3::ZERO, DVec3::new(4.0, 4.0, 0.0)).unwrap();
+        let rect_id = doc.add_object("Rect", Geometry::Curve(rect));
+        let cfg = SnapConfig::default();
+
+        // Corner of polyline (4,0,0) is an interior vertex of closed polyline
+        let res_corner = cfg.resolve_with_radius(DVec3::new(3.9, 0.1, 0.0), None, &doc, &Plane::world_xy(), 0.3);
+        assert_eq!(res_corner.kind, Some(SnapKind::End));
+        assert!((res_corner.point - DVec3::new(4.0, 0.0, 0.0)).length() < 1e-9);
+
+        // Smaller zoom radius rejects 0.14 distance while larger radius accepts
+        let res_tight = cfg.resolve_with_radius(DVec3::new(3.9, 0.1, 0.0), None, &doc, &Plane::world_xy(), 0.05);
+        assert_eq!(res_tight.kind, None);
+
+        // Hidden object must be skipped
+        doc.objects[rect_id].visible = false;
+        let res_hidden = cfg.resolve_with_radius(DVec3::new(4.0, 0.0, 0.0), None, &doc, &Plane::world_xy(), 0.5);
+        assert_eq!(res_hidden.kind, None);
+
+        // Surface corner snap
+        let mut doc_srf = Document::new();
+        let srf = NurbsSurface::plane_rect(&Plane::world_xy(), 6.0, 4.0);
+        doc_srf.add_object("Plane", Geometry::Surface(srf));
+        let res_srf = cfg.resolve_with_radius(DVec3::new(2.9, 1.9, 0.0), None, &doc_srf, &Plane::world_xy(), 0.5);
+        assert_eq!(res_srf.kind, Some(SnapKind::End));
+        assert!((res_srf.point - DVec3::new(3.0, 2.0, 0.0)).length() < 1e-9);
     }
 }

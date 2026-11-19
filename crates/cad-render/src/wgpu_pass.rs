@@ -7,7 +7,7 @@ use eframe::egui_wgpu::{self, wgpu};
 use wgpu::util::DeviceExt;
 
 use crate::camera::ViewportKind;
-use crate::scene::{LineVertex, MeshVertex, RenderScene};
+use crate::scene::{DisplayMode, LineVertex, MeshVertex, RenderScene};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -20,18 +20,92 @@ struct ViewportUniform {
     bind_group: wgpu::BindGroup,
 }
 
-/// Shared `wgpu` pipelines, shared scene GPU buffers, and per-viewport uniforms.
-pub struct CadWgpuState {
-    mesh_pipeline: wgpu::RenderPipeline,
-    line_pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-    viewports: HashMap<u8, ViewportUniform>,
-    uploaded_version: u64,
+#[derive(Default)]
+struct GpuBatch {
+    initialized: bool,
+    version: u64,
     mesh_vb: Option<wgpu::Buffer>,
     mesh_ib: Option<wgpu::Buffer>,
     mesh_index_count: u32,
     line_vb: Option<wgpu::Buffer>,
     line_vertex_count: u32,
+}
+
+impl GpuBatch {
+    fn upload_if_needed(&mut self, device: &wgpu::Device, scene: &RenderScene) {
+        if self.initialized && self.version == scene.version {
+            return;
+        }
+        self.initialized = true;
+        self.version = scene.version;
+
+        if !scene.mesh_vertices.is_empty() && !scene.mesh_indices.is_empty() {
+            self.mesh_vb = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("cad_mesh_vb"),
+                contents: bytemuck::cast_slice(&scene.mesh_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            }));
+            self.mesh_ib = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("cad_mesh_ib"),
+                contents: bytemuck::cast_slice(&scene.mesh_indices),
+                usage: wgpu::BufferUsages::INDEX,
+            }));
+            self.mesh_index_count = scene.mesh_indices.len() as u32;
+        } else {
+            self.mesh_vb = None;
+            self.mesh_ib = None;
+            self.mesh_index_count = 0;
+        }
+
+        if !scene.line_vertices.is_empty() {
+            self.line_vb = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("cad_line_vb"),
+                contents: bytemuck::cast_slice(&scene.line_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            }));
+            self.line_vertex_count = scene.line_vertices.len() as u32;
+        } else {
+            self.line_vb = None;
+            self.line_vertex_count = 0;
+        }
+    }
+
+    fn paint(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        mesh_pipeline: &wgpu::RenderPipeline,
+        line_pipeline: &wgpu::RenderPipeline,
+        vp_bind_group: &wgpu::BindGroup,
+    ) {
+        if self.mesh_index_count > 0 {
+            if let (Some(vb), Some(ib)) = (&self.mesh_vb, &self.mesh_ib) {
+                render_pass.set_pipeline(mesh_pipeline);
+                render_pass.set_bind_group(0, vp_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, vb.slice(..));
+                render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..self.mesh_index_count, 0, 0..1);
+            }
+        }
+        if self.line_vertex_count > 0 {
+            if let Some(vb) = &self.line_vb {
+                render_pass.set_pipeline(line_pipeline);
+                render_pass.set_bind_group(0, vp_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, vb.slice(..));
+                render_pass.draw(0..self.line_vertex_count, 0..1);
+            }
+        }
+    }
+}
+
+/// Shared `wgpu` pipelines, per-mode document GPU buffers, per-viewport grids, and dynamic overlays.
+pub struct CadWgpuState {
+    mesh_pipeline: wgpu::RenderPipeline,
+    line_pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    viewports: HashMap<u8, ViewportUniform>,
+    mode_buffers: HashMap<DisplayMode, GpuBatch>,
+    grid_buffers: HashMap<u8, GpuBatch>,
+    overlay_buffers: GpuBatch,
 }
 
 impl CadWgpuState {
@@ -152,12 +226,9 @@ impl CadWgpuState {
             line_pipeline,
             bind_group_layout,
             viewports: HashMap::new(),
-            uploaded_version: 0,
-            mesh_vb: None,
-            mesh_ib: None,
-            mesh_index_count: 0,
-            line_vb: None,
-            line_vertex_count: 0,
+            mode_buffers: HashMap::new(),
+            grid_buffers: HashMap::new(),
+            overlay_buffers: GpuBatch::default(),
         }
     }
 }
@@ -175,8 +246,11 @@ fn viewport_key(kind: ViewportKind) -> u8 {
 /// Per-viewport `egui_wgpu` paint callback.
 pub struct ViewportPaintCallback {
     pub kind: ViewportKind,
+    pub display_mode: DisplayMode,
     pub view_proj: Mat4,
-    pub scene: Arc<RenderScene>,
+    pub doc_scene: Arc<RenderScene>,
+    pub grid_scene: Arc<RenderScene>,
+    pub overlay_scene: Option<Arc<RenderScene>>,
 }
 
 impl egui_wgpu::CallbackTrait for ViewportPaintCallback {
@@ -222,34 +296,18 @@ impl egui_wgpu::CallbackTrait for ViewportPaintCallback {
             }),
         );
 
-        if state.uploaded_version != self.scene.version {
-            state.uploaded_version = self.scene.version;
-            if !self.scene.mesh_vertices.is_empty() && !self.scene.mesh_indices.is_empty() {
-                state.mesh_vb = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("cad_mesh_vb"),
-                    contents: bytemuck::cast_slice(&self.scene.mesh_vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }));
-                state.mesh_ib = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("cad_mesh_ib"),
-                    contents: bytemuck::cast_slice(&self.scene.mesh_indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                }));
-                state.mesh_index_count = self.scene.mesh_indices.len() as u32;
-            } else {
-                state.mesh_index_count = 0;
-            }
-
-            if !self.scene.line_vertices.is_empty() {
-                state.line_vb = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("cad_line_vb"),
-                    contents: bytemuck::cast_slice(&self.scene.line_vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }));
-                state.line_vertex_count = self.scene.line_vertices.len() as u32;
-            } else {
-                state.line_vertex_count = 0;
-            }
+        state
+            .grid_buffers
+            .entry(key)
+            .or_default()
+            .upload_if_needed(device, &self.grid_scene);
+        state
+            .mode_buffers
+            .entry(self.display_mode)
+            .or_default()
+            .upload_if_needed(device, &self.doc_scene);
+        if let Some(overlay) = &self.overlay_scene {
+            state.overlay_buffers.upload_if_needed(device, overlay);
         }
 
         Vec::new()
@@ -264,27 +322,34 @@ impl egui_wgpu::CallbackTrait for ViewportPaintCallback {
         let Some(state) = resources.get::<CadWgpuState>() else {
             return;
         };
-        let Some(vp) = state.viewports.get(&viewport_key(self.kind)) else {
+        let key = viewport_key(self.kind);
+        let Some(vp) = state.viewports.get(&key) else {
             return;
         };
 
-        if state.mesh_index_count > 0 {
-            if let (Some(vb), Some(ib)) = (&state.mesh_vb, &state.mesh_ib) {
-                render_pass.set_pipeline(&state.mesh_pipeline);
-                render_pass.set_bind_group(0, &vp.bind_group, &[]);
-                render_pass.set_vertex_buffer(0, vb.slice(..));
-                render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..state.mesh_index_count, 0, 0..1);
-            }
+        if let Some(grid) = state.grid_buffers.get(&key) {
+            grid.paint(
+                render_pass,
+                &state.mesh_pipeline,
+                &state.line_pipeline,
+                &vp.bind_group,
+            );
         }
-
-        if state.line_vertex_count > 0 {
-            if let Some(vb) = &state.line_vb {
-                render_pass.set_pipeline(&state.line_pipeline);
-                render_pass.set_bind_group(0, &vp.bind_group, &[]);
-                render_pass.set_vertex_buffer(0, vb.slice(..));
-                render_pass.draw(0..state.line_vertex_count, 0..1);
-            }
+        if let Some(doc_batch) = state.mode_buffers.get(&self.display_mode) {
+            doc_batch.paint(
+                render_pass,
+                &state.mesh_pipeline,
+                &state.line_pipeline,
+                &vp.bind_group,
+            );
+        }
+        if self.overlay_scene.is_some() {
+            state.overlay_buffers.paint(
+                render_pass,
+                &state.mesh_pipeline,
+                &state.line_pipeline,
+                &vp.bind_group,
+            );
         }
     }
 }
@@ -314,11 +379,19 @@ mod tests {
         let mut doc = Document::new();
         doc.add_object("Box", Geometry::Mesh(TriangleMesh::from_box(DVec3::ZERO, DVec3::splat(3.0))));
         let cam = ViewportCamera::preset(ViewportKind::Perspective);
-        let scene = Arc::new(RenderScene::build(&doc, DisplayMode::Shaded, &cam.cplane, 1));
+        let doc_scene = Arc::new(RenderScene::build_document(&doc, DisplayMode::Shaded, 1));
+        let grid_scene = Arc::new(RenderScene::build_grid(
+            &cam.cplane,
+            &doc.visible_bounding_box(),
+            1,
+        ));
         let cb = ViewportPaintCallback {
             kind: ViewportKind::Perspective,
+            display_mode: DisplayMode::Shaded,
             view_proj: cam.view_proj_f32(1.0),
-            scene,
+            doc_scene,
+            grid_scene,
+            overlay_scene: None,
         };
 
         let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -384,5 +457,58 @@ mod tests {
         let non_black = data.chunks_exact(4).filter(|px| px[0] > 0 || px[1] > 0 || px[2] > 0).count();
         eprintln!("offscreen non_black_pixels={non_black}");
         assert!(non_black > 50, "expected rendered pixels, got {non_black}");
+    }
+
+    #[test]
+    fn wgpu_caches_separate_shaded_and_wireframe_mode_batches() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .expect("adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+            .expect("device");
+
+        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        let state = CadWgpuState::new(&device, format, None);
+        let mut resources = egui_wgpu::CallbackResources::new();
+        resources.insert(state);
+
+        let mut doc = Document::new();
+        doc.add_object("Box", Geometry::Mesh(TriangleMesh::from_box(DVec3::ZERO, DVec3::splat(2.0))));
+        let cam_persp = ViewportCamera::preset(ViewportKind::Perspective);
+        let cam_top = ViewportCamera::preset(ViewportKind::Top);
+
+        let doc_shaded = Arc::new(RenderScene::build_document(&doc, DisplayMode::Shaded, 1));
+        let doc_wire = Arc::new(RenderScene::build_document(&doc, DisplayMode::Wireframe, 1));
+        let grid_persp = Arc::new(RenderScene::build_grid(&cam_persp.cplane, &doc.visible_bounding_box(), 1));
+        let grid_top = Arc::new(RenderScene::build_grid(&cam_top.cplane, &doc.visible_bounding_box(), 1));
+
+        let cb1 = ViewportPaintCallback {
+            kind: ViewportKind::Perspective,
+            display_mode: DisplayMode::Shaded,
+            view_proj: cam_persp.view_proj_f32(1.0),
+            doc_scene: doc_shaded,
+            grid_scene: grid_persp,
+            overlay_scene: None,
+        };
+        let cb2 = ViewportPaintCallback {
+            kind: ViewportKind::Top,
+            display_mode: DisplayMode::Wireframe,
+            view_proj: cam_top.view_proj_f32(1.0),
+            doc_scene: doc_wire,
+            grid_scene: grid_top,
+            overlay_scene: None,
+        };
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let sd = egui_wgpu::ScreenDescriptor { size_in_pixels: [64, 64], pixels_per_point: 1.0 };
+        cb1.prepare(&device, &queue, &sd, &mut encoder, &mut resources);
+        cb2.prepare(&device, &queue, &sd, &mut encoder, &mut resources);
+
+        let st = resources.get::<CadWgpuState>().unwrap();
+        assert!(st.mode_buffers.contains_key(&DisplayMode::Shaded));
+        assert!(st.mode_buffers.contains_key(&DisplayMode::Wireframe));
+        assert!(st.mode_buffers[&DisplayMode::Shaded].mesh_index_count > 0);
+        assert_eq!(st.mode_buffers[&DisplayMode::Wireframe].mesh_index_count, 0);
+        assert!(st.mode_buffers[&DisplayMode::Wireframe].line_vertex_count > 0);
     }
 }

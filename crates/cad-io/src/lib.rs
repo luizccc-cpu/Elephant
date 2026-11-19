@@ -13,6 +13,7 @@ use std::path::Path;
 
 use cad_doc::Document;
 pub use error::IoError;
+pub use project::ProjectMetadata;
 
 pub fn import_into_document(path: &Path, doc: &mut Document) -> Result<usize, IoError> {
     let ext = path
@@ -84,6 +85,10 @@ pub fn export_from_document(path: &Path, doc: &Document) -> Result<(), IoError> 
 }
 
 pub fn open_project_file(path: &Path) -> Result<Document, IoError> {
+    open_project_with_meta(path).map(|(doc, _)| doc)
+}
+
+pub fn open_project_with_meta(path: &Path) -> Result<(Document, ProjectMetadata), IoError> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -93,8 +98,19 @@ pub fn open_project_file(path: &Path) -> Result<Document, IoError> {
         let mut doc = Document::new();
         let bytes = std::fs::read(path)?;
         threedom::import_3dm_bytes(&bytes, &mut doc)?;
-        return Ok(doc);
+        doc.clear_history();
+        return Ok((doc, ProjectMetadata::default()));
     }
     let text = std::fs::read_to_string(path)?;
-    project::load_project_json(&text)
+    project::load_project_with_meta(&text)
+}
+
+pub fn save_project_file_with_meta(
+    path: &Path,
+    doc: &Document,
+    meta: &ProjectMetadata,
+) -> Result<(), IoError> {
+    let text = project::save_project_with_meta(doc, meta)?;
+    std::fs::write(path, text)?;
+    Ok(())
 }

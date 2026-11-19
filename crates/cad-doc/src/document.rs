@@ -1,17 +1,18 @@
-use cad_geom::{Aabb, DMat4, Geometry, Ray, Tolerances};
+use cad_geom::{Aabb, DMat4, DVec3, Geometry, Ray, Tolerances, UnitSystem};
 use slotmap::SlotMap;
 
 use crate::history::{UndoAction, UndoHistory, UndoTransaction};
 use crate::layer::{Layer, LayerId};
-use crate::object::{AnnotationItem, CadObject, ObjectId};
+use crate::object::{AnnotationItem, CadObject, ObjectId, ObjectStore};
 use crate::spatial::{SpatialEntry, SpatialIndex};
 
 /// Central Elephant CAD document holding layers, objects, selection, spatial index, and Undo/Redo.
 pub struct Document {
+    pub units: UnitSystem,
     pub tolerances: Tolerances,
     pub layers: SlotMap<LayerId, Layer>,
     pub active_layer: LayerId,
-    pub objects: SlotMap<ObjectId, CadObject>,
+    pub objects: ObjectStore,
     pub annotations: Vec<AnnotationItem>,
     pub last_created: Vec<ObjectId>,
     next_group_id: u64,
@@ -29,17 +30,69 @@ impl Document {
     pub fn new() -> Self {
         let mut layers = SlotMap::with_key();
         let active_layer = layers.insert(Layer::new("Default", [215, 220, 228, 255]));
+        let units = UnitSystem::default();
         Self {
-            tolerances: Tolerances::default(),
+            units,
+            tolerances: units.default_tolerances(),
             layers,
             active_layer,
-            objects: SlotMap::with_key(),
+            objects: ObjectStore::new(),
             annotations: Vec::new(),
             last_created: Vec::new(),
             next_group_id: 1,
             spatial: SpatialIndex::default(),
             history: UndoHistory::default(),
         }
+    }
+
+    pub fn set_units(&mut self, target: UnitSystem, rescale_geometry: bool) {
+        let old = self.units;
+        self.units = target;
+        self.tolerances = target.default_tolerances();
+        if rescale_geometry && old != target {
+            let s = old.scale_to(target);
+            let mat = DMat4::from_scale(DVec3::splat(s));
+            for (_, obj) in &mut self.objects {
+                obj.geometry.transform(&mat);
+                obj.refresh_aabb();
+            }
+            for ann in &mut self.annotations {
+                ann.position *= s;
+                if let Some(p1) = &mut ann.p1 {
+                    *p1 *= s;
+                }
+                if let Some(p2) = &mut ann.p2 {
+                    *p2 *= s;
+                }
+                if let Some(off) = &mut ann.offset_pt {
+                    *off *= s;
+                }
+            }
+            self.rebuild_spatial_index();
+        }
+    }
+
+    pub fn ensure_next_group_id_above(&mut self, max_gid: u64) {
+        self.next_group_id = self.next_group_id.max(max_gid.saturating_add(1));
+    }
+
+    pub fn clear_history(&mut self) {
+        self.history.clear();
+    }
+
+    pub fn visible_bounding_box(&self) -> Aabb {
+        let mut total = Aabb::EMPTY;
+        for (_, obj) in &self.objects {
+            if !obj.visible {
+                continue;
+            }
+            if let Some(layer) = self.layers.get(obj.layer_id) {
+                if layer.visible {
+                    total = total.union(&obj.aabb);
+                }
+            }
+        }
+        total
     }
 
     pub fn add_layer(&mut self, name: impl Into<String>, color: [u8; 4]) -> LayerId {
@@ -61,7 +114,7 @@ impl Document {
         geometry: Geometry,
     ) -> ObjectId {
         let obj = CadObject::new(layer_id, geometry);
-        let id = self.objects.insert(obj);
+        let id = self.objects.insert_new(obj);
         self.last_created = vec![id];
         self.history.push(UndoTransaction {
             label: label.into(),
@@ -123,6 +176,22 @@ impl Document {
         });
         self.rebuild_spatial_index();
         count
+    }
+
+    /// Record an Undo transaction for an already-applied modification on a single object.
+    pub fn record_object_modified(
+        &mut self,
+        label: impl Into<String>,
+        id: ObjectId,
+        before: CadObject,
+    ) {
+        if let Some(after) = self.objects.get(id).cloned() {
+            self.history.push(UndoTransaction {
+                label: label.into(),
+                actions: vec![UndoAction::Modified { id, before, after }],
+            });
+            self.rebuild_spatial_index();
+        }
     }
 
     pub fn set_selected(&mut self, id: ObjectId, selected: bool) {
@@ -323,7 +392,16 @@ impl Document {
 
     /// Pick the closest visible, unlocked object intersected by `ray`.
     pub fn pick_ray(&self, ray: &Ray) -> Option<ObjectId> {
-        for (id, _) in self.spatial.query_ray_candidates(ray) {
+        self.pick_ray_with_tolerance(ray, 0.25)
+    }
+
+    /// Pick the closest visible, unlocked object intersected by `ray` within `pick_tolerance` for curves/points.
+    pub fn pick_ray_with_tolerance(&self, ray: &Ray, pick_tolerance: f64) -> Option<ObjectId> {
+        let tol = pick_tolerance.max(1e-6);
+        let mut best_curve: Option<(f64, f64, ObjectId)> = None;
+        let mut best_surf: Option<(f64, ObjectId)> = None;
+
+        for (id, _) in self.spatial.query_ray_candidates_expanded(ray, tol) {
             let Some(obj) = self.objects.get(id) else {
                 continue;
             };
@@ -337,15 +415,53 @@ impl Document {
                 continue;
             }
             match &obj.geometry {
-                Geometry::Mesh(m) => {
-                    if m.ray_intersect(ray).is_some() {
-                        return Some(id);
+                Geometry::Point(p) => {
+                    let (t, d) = ray.distance_to_point(*p);
+                    if d <= tol
+                        && best_curve.is_none_or(|b| d < b.0 || ((d - b.0).abs() < 1e-9 && t < b.1))
+                    {
+                        best_curve = Some((d, t, id));
                     }
                 }
-                _ => return Some(id),
+                Geometry::Curve(c) => {
+                    if let Some((t, d)) = c.ray_distance(ray, 48) {
+                        if d <= tol
+                            && best_curve
+                                .is_none_or(|b| d < b.0 || ((d - b.0).abs() < 1e-9 && t < b.1))
+                        {
+                            best_curve = Some((d, t, id));
+                        }
+                    }
+                }
+                Geometry::Surface(s) => {
+                    if let Some(t) = s.ray_intersect(ray) {
+                        if best_surf.is_none_or(|b| t < b.0) {
+                            best_surf = Some((t, id));
+                        }
+                    }
+                }
+                Geometry::Mesh(m) => {
+                    if let Some(t) = m.ray_intersect(ray) {
+                        if best_surf.is_none_or(|b| t < b.0) {
+                            best_surf = Some((t, id));
+                        }
+                    }
+                }
             }
         }
-        None
+
+        match (best_curve, best_surf) {
+            (Some((_, ct, cid)), Some((st, sid))) => {
+                if ct <= st + tol * 2.0 {
+                    Some(cid)
+                } else {
+                    Some(sid)
+                }
+            }
+            (Some((_, _, cid)), None) => Some(cid),
+            (None, Some((_, sid))) => Some(sid),
+            (None, None) => None,
+        }
     }
 
     pub fn query_aabb(&self, aabb: &Aabb) -> Vec<ObjectId> {
@@ -365,9 +481,8 @@ impl Document {
                     }
                 }
                 UndoAction::Removed(id, obj) => {
-                    let new_id = self.objects.insert(obj);
-                    redo_actions.push(UndoAction::Added(new_id));
-                    let _ = id;
+                    self.objects.insert_with_id(id, obj);
+                    redo_actions.push(UndoAction::Added(id));
                 }
                 UndoAction::Modified { id, before, after } => {
                     if let Some(obj) = self.objects.get_mut(id) {
@@ -399,9 +514,8 @@ impl Document {
                     }
                 }
                 UndoAction::Removed(id, obj) => {
-                    let new_id = self.objects.insert(obj);
-                    undo_actions.push(UndoAction::Added(new_id));
-                    let _ = id;
+                    self.objects.insert_with_id(id, obj);
+                    undo_actions.push(UndoAction::Added(id));
                 }
                 UndoAction::Modified { id, before, after } => {
                     if let Some(obj) = self.objects.get_mut(id) {
@@ -473,5 +587,102 @@ mod tests {
         let id = doc.add_object("Box", Geometry::Mesh(mesh));
         let ray = Ray::new(DVec3::new(0.0, 0.0, 10.0), DVec3::new(0.0, 0.0, -1.0));
         assert_eq!(doc.pick_ray(&ray), Some(id));
+    }
+
+    #[test]
+    fn undo_delete_then_undo_modify_preserves_object_id() {
+        let mut doc = Document::new();
+        let mesh = TriangleMesh::from_box(DVec3::ZERO, DVec3::splat(2.0));
+        let id = doc.add_object("Box", Geometry::Mesh(mesh));
+        doc.set_selected(id, true);
+        doc.transform_selected("Move", &DMat4::from_translation(DVec3::new(6.0, 0.0, 0.0)));
+        assert_eq!(doc.remove_selected(), 1);
+        assert!(doc.objects.is_empty());
+
+        assert_eq!(doc.undo().as_deref(), Some("Delete"));
+        assert!(doc.objects.get(id).is_some());
+        assert!((doc.objects[id].aabb.center().x - 6.0).abs() < 1e-9);
+
+        assert_eq!(doc.undo().as_deref(), Some("Move"));
+        assert!((doc.objects[id].aabb.center().x - 0.0).abs() < 1e-9);
+
+        assert_eq!(doc.redo().as_deref(), Some("Move"));
+        assert!((doc.objects[id].aabb.center().x - 6.0).abs() < 1e-9);
+
+        assert_eq!(doc.redo().as_deref(), Some("Delete"));
+        assert!(doc.objects.is_empty());
+    }
+
+    #[test]
+    fn pick_ray_hits_circle_edge_and_misses_hole() {
+        use cad_geom::{NurbsCurve, Plane};
+        let mut doc = Document::new();
+        let circle = NurbsCurve::circle(&Plane::world_xy(), 5.0).unwrap();
+        let id = doc.add_object("Circle", Geometry::Curve(circle));
+
+        let center_ray = Ray::new(DVec3::new(0.0, 0.0, 10.0), DVec3::new(0.0, 0.0, -1.0));
+        assert_eq!(doc.pick_ray_with_tolerance(&center_ray, 0.25), None);
+
+        let edge_ray = Ray::new(DVec3::new(5.05, 0.0, 10.0), DVec3::new(0.0, 0.0, -1.0));
+        assert_eq!(doc.pick_ray_with_tolerance(&edge_ray, 0.25), Some(id));
+    }
+
+    #[test]
+    fn pick_ray_hits_nurbs_surface() {
+        use cad_geom::{NurbsSurface, Plane};
+        let mut doc = Document::new();
+        let surf = NurbsSurface::plane_rect(&Plane::world_xy(), 4.0, 4.0);
+        let id = doc.add_object("Plane", Geometry::Surface(surf));
+
+        let hit_ray = Ray::new(DVec3::new(1.0, -1.0, 10.0), DVec3::new(0.0, 0.0, -1.0));
+        assert_eq!(doc.pick_ray(&hit_ray), Some(id));
+
+        let miss_ray = Ray::new(DVec3::new(3.5, 0.0, 10.0), DVec3::new(0.0, 0.0, -1.0));
+        assert_eq!(doc.pick_ray(&miss_ray), None);
+    }
+
+    #[test]
+    fn record_object_modified_undo_redo() {
+        use cad_geom::NurbsCurve;
+        let mut doc = Document::new();
+        let id = doc.add_object(
+            "Line",
+            Geometry::Curve(NurbsCurve::line(DVec3::ZERO, DVec3::new(4.0, 0.0, 0.0))),
+        );
+        let before = doc.objects[id].clone();
+        if let Geometry::Curve(c) = &mut doc.objects[id].geometry {
+            c.control_points[1].position = DVec3::new(4.0, 5.0, 0.0);
+        }
+        doc.objects[id].refresh_aabb();
+        doc.record_object_modified("Move Control Point", id, before);
+
+        assert_eq!(doc.undo().as_deref(), Some("Move Control Point"));
+        let Geometry::Curve(c_after_undo) = &doc.objects[id].geometry else {
+            panic!("expected curve");
+        };
+        assert!((c_after_undo.control_points[1].position - DVec3::new(4.0, 0.0, 0.0)).length() < 1e-9);
+
+        assert_eq!(doc.redo().as_deref(), Some("Move Control Point"));
+        let Geometry::Curve(c_after_redo) = &doc.objects[id].geometry else {
+            panic!("expected curve");
+        };
+        assert!((c_after_redo.control_points[1].position - DVec3::new(4.0, 5.0, 0.0)).length() < 1e-9);
+    }
+
+    #[test]
+    fn set_units_rescales_geometry_and_tolerances() {
+        use cad_geom::NurbsCurve;
+        let mut doc = Document::new();
+        let id = doc.add_object(
+            "Line",
+            Geometry::Curve(NurbsCurve::line(DVec3::ZERO, DVec3::new(100.0, 0.0, 0.0))),
+        );
+        doc.set_units(UnitSystem::Centimeters, true);
+        assert_eq!(doc.units, UnitSystem::Centimeters);
+        assert!((doc.tolerances.absolute - 1e-4).abs() < 1e-12);
+        let Geometry::Curve(c) = &doc.objects[id].geometry else {
+            panic!("expected curve");
+        };
+        assert!((c.control_points[1].position.x - 10.0).abs() < 1e-9);
     }
 }

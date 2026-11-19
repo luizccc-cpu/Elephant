@@ -8,6 +8,9 @@ pub fn export_stl_bytes(doc: &Document) -> Vec<u8> {
     let mut tris: Vec<([f32; 3], [[f32; 3]; 3])> = Vec::new();
 
     for (_, obj) in &doc.objects {
+        if !obj.visible {
+            continue;
+        }
         if let Some(layer) = doc.layers.get(obj.layer_id) {
             if !layer.visible {
                 continue;

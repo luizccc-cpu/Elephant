@@ -6,7 +6,7 @@ pub mod mesh;
 pub mod nurbs_curve;
 pub mod nurbs_surface;
 
-pub use cad_math::{Aabb, DMat4, DVec3, Plane, Ray, Tolerances};
+pub use cad_math::{Aabb, DMat4, DVec3, Plane, Ray, Tolerances, UnitSystem};
 pub use csg::{BooleanOp, mesh_boolean};
 pub use error::GeomError;
 pub use mesh::TriangleMesh;

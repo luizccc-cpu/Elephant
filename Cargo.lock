@@ -629,6 +629,7 @@ dependencies = [
  "cad-math",
  "eframe",
  "pollster 0.3.0",
+ "serde",
 ]
 
 [[package]]
@@ -1190,6 +1191,8 @@ dependencies = [
  "cad-script",
  "eframe",
  "rfd",
+ "serde",
+ "serde_json",
  "winresource",
 ]
 

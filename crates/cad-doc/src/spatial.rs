@@ -59,11 +59,16 @@ impl SpatialIndex {
 
     /// Return candidate `ObjectId`s whose AABB is intersected by `ray`, sorted by entry distance.
     pub fn query_ray_candidates(&self, ray: &Ray) -> Vec<(ObjectId, f64)> {
+        self.query_ray_candidates_expanded(ray, 0.0)
+    }
+
+    /// Return candidate `ObjectId`s whose expanded AABB is intersected by `ray`, sorted by entry distance.
+    pub fn query_ray_candidates_expanded(&self, ray: &Ray, margin: f64) -> Vec<(ObjectId, f64)> {
         let mut hits: Vec<(ObjectId, f64)> = self
             .tree
             .iter()
             .filter_map(|entry| {
-                ray.intersect_aabb(&entry.to_aabb())
+                ray.intersect_aabb(&entry.to_aabb().expanded(margin))
                     .map(|(t_near, _)| (entry.id, t_near))
             })
             .collect();
