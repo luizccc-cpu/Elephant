@@ -1,14 +1,21 @@
 pub mod gumball;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use cad_doc::{AnnotationKind, ObjectId};
-use cad_geom::{DVec3, Geometry};
+use cad_geom::{BoundaryLock, DVec3, Geometry};
 use cad_render::{DisplayMode, ViewportPaintCallback};
 use eframe::egui;
 
-use crate::state::{ElephantApp, GripDrag, GumballDrag, GumballMode, GumballNumericPrompt, MarqueeDrag};
-use gumball::{compute_gumball_handles, draw_gumball_overlay, gumball_matrix, hit_gumball};
+use crate::state::{
+    ElephantApp, GripDrag, GumballDrag, GumballMode, GumballNumericPrompt, MarqueeDrag,
+    UvnGumballDrag, UvnNumericPrompt,
+};
+use gumball::{
+    compute_gumball_handles, compute_uvn_gumball_handles, draw_gumball_overlay,
+    draw_uvn_gumball_overlay, gumball_matrix, hit_gumball, hit_uvn_gumball,
+};
 
 pub fn world_to_screen(pt: DVec3, m: &[f32; 16], rect: egui::Rect) -> Option<egui::Pos2> {
     let (x, y, z) = (pt.x as f32, pt.y as f32, pt.z as f32);
@@ -100,6 +107,7 @@ impl ElephantApp {
 
                 let (gumball_origin, gumball_handles) =
                     compute_gumball_handles(self, &vp_cols, rect);
+                let uvn_bundle = compute_uvn_gumball_handles(self, &vp_cols, rect);
 
                 if response.hovered() {
                     self.active_viewport = idx;
@@ -201,49 +209,121 @@ impl ElephantApp {
                     }
                 }
 
-                // Primary drag: Control Points, Gumball, or Marquee selection (when session is idle)
+                // Primary drag: UVN Gumball, Control Points, XYZ Gumball, or Marquee selection (when session is idle)
                 if !self.session.is_active() {
                     if response.drag_started_by(egui::PointerButton::Primary) {
                         self.active_viewport = idx;
                         if let Some(pos) = response.interact_pointer_pos() {
-                            if let Some(g) = cp_grips.iter().find(|g| pos.distance(g.screen) <= 9.0)
-                            {
-                                if let Some(before_snapshot) =
-                                    self.doc.objects.get(g.object_id).cloned()
+                            if let Some((uvn_oid, _, uvn_handles)) = &uvn_bundle {
+                                if let Some(h) = hit_uvn_gumball(uvn_handles, pos) {
+                                    if let Some(before_snapshot) =
+                                        self.doc.objects.get(*uvn_oid).cloned()
+                                    {
+                                        let cp_weights =
+                                            self.compute_cp_weights_for_object(*uvn_oid, None);
+                                        let axis_screen_dir = (h.tip - h.p0).normalized();
+                                        self.uvn_drag = Some(UvnGumballDrag {
+                                            viewport_idx: idx,
+                                            object_id: *uvn_oid,
+                                            axis: h.axis,
+                                            axis_dir: h.world_dir,
+                                            axis_screen_dir,
+                                            px_per_world: h.px_per_world,
+                                            last_pos: pos,
+                                            total_amount: 0.0,
+                                            moved: false,
+                                            cp_weights,
+                                            before_snapshot,
+                                        });
+                                    }
+                                }
+                            }
+                            if self.uvn_drag.is_none() {
+                                if let Some(g) =
+                                    cp_grips.iter().find(|g| pos.distance(g.screen) <= 9.0)
                                 {
-                                    self.grip_drag = Some(GripDrag {
+                                    if !self.selected_cps.contains(&(g.object_id, g.cp_index)) {
+                                        self.selected_cps = vec![(g.object_id, g.cp_index)];
+                                    }
+                                    if let Some(before_snapshot) =
+                                        self.doc.objects.get(g.object_id).cloned()
+                                    {
+                                        let cp_weights = self.compute_cp_weights_for_object(
+                                            g.object_id,
+                                            Some(g.cp_index),
+                                        );
+                                        self.grip_drag = Some(GripDrag {
+                                            viewport_idx: idx,
+                                            object_id: g.object_id,
+                                            start_world: g.world,
+                                            cp_weights,
+                                            before_snapshot,
+                                        });
+                                    }
+                                } else if let Some((axis, mode, axis_screen_dir, px_per_world)) =
+                                    hit_gumball(&gumball_handles, pos)
+                                {
+                                    self.gumball_drag = Some(GumballDrag {
                                         viewport_idx: idx,
-                                        object_id: g.object_id,
-                                        cp_index: g.cp_index,
-                                        last_world: g.world,
-                                        before_snapshot,
+                                        axis,
+                                        mode,
+                                        origin: gumball_origin,
+                                        last_pos: pos,
+                                        axis_screen_dir,
+                                        px_per_world,
+                                        total_amount: 0.0,
+                                        moved: false,
+                                    });
+                                } else {
+                                    self.marquee = Some(MarqueeDrag {
+                                        viewport_idx: idx,
+                                        start: pos,
+                                        current: pos,
                                     });
                                 }
-                            } else if let Some((axis, mode, axis_screen_dir, px_per_world)) =
-                                hit_gumball(&gumball_handles, pos)
-                            {
-                                self.gumball_drag = Some(GumballDrag {
-                                    viewport_idx: idx,
-                                    axis,
-                                    mode,
-                                    origin: gumball_origin,
-                                    last_pos: pos,
-                                    axis_screen_dir,
-                                    px_per_world,
-                                    total_amount: 0.0,
-                                    moved: false,
-                                });
-                            } else {
-                                self.marquee = Some(MarqueeDrag {
-                                    viewport_idx: idx,
-                                    start: pos,
-                                    current: pos,
-                                });
                             }
                         }
                     }
 
-                    if let Some(mut gd) = self.grip_drag.take() {
+                    if let Some(mut udrag) = self.uvn_drag.take() {
+                        if udrag.viewport_idx == idx {
+                            if response.dragged_by(egui::PointerButton::Primary) {
+                                if let Some(pos) = response.interact_pointer_pos() {
+                                    let d_px =
+                                        (pos - udrag.last_pos).dot(udrag.axis_screen_dir) as f64;
+                                    udrag.last_pos = pos;
+                                    let scale = if udrag.axis == 2 {
+                                        self.uvn_normal_drag_strength
+                                    } else {
+                                        1.0
+                                    };
+                                    let d_world = (d_px / udrag.px_per_world.max(1e-4)) * scale;
+                                    if d_world.abs() > 1e-9 {
+                                        udrag.total_amount += d_world;
+                                        udrag.moved = true;
+                                        self.apply_cp_delta_from_base(
+                                            udrag.object_id,
+                                            &udrag.before_snapshot,
+                                            &udrag.cp_weights,
+                                            udrag.axis_dir * udrag.total_amount,
+                                        );
+                                    }
+                                }
+                                self.uvn_drag = Some(udrag);
+                            } else if udrag.moved && udrag.total_amount.abs() > 1e-9 {
+                                self.doc.record_object_modified(
+                                    "UVN Move Control Point",
+                                    udrag.object_id,
+                                    udrag.before_snapshot,
+                                );
+                                self.mark_scene_dirty();
+                            }
+                        } else {
+                            self.uvn_drag = Some(udrag);
+                        }
+                    }
+
+                    if let Some(gd) = self.grip_drag.take() {
                         if gd.viewport_idx == idx {
                             if response.dragged_by(egui::PointerButton::Primary) {
                                 if let Some(pos) = response.interact_pointer_pos() {
@@ -257,31 +337,15 @@ impl ElephantApp {
                                         aspect,
                                     );
                                     let mut drag_plane = cplane;
-                                    drag_plane.origin = gd.last_world;
+                                    drag_plane.origin = gd.start_world;
                                     if let Some(new_pt) = drag_plane.intersect_ray(&ray) {
-                                        if let Some(obj) = self.doc.objects.get_mut(gd.object_id) {
-                                            match &mut obj.geometry {
-                                                Geometry::Curve(c) => {
-                                                    if let Some(cp) =
-                                                        c.control_points.get_mut(gd.cp_index)
-                                                    {
-                                                        cp.position = new_pt;
-                                                    }
-                                                }
-                                                Geometry::Surface(s) => {
-                                                    if let Some(cp) =
-                                                        s.control_points.get_mut(gd.cp_index)
-                                                    {
-                                                        cp.position = new_pt;
-                                                    }
-                                                }
-                                                _ => {}
-                                            }
-                                            obj.refresh_aabb();
-                                            gd.last_world = new_pt;
-                                            self.doc.rebuild_spatial_index();
-                                            self.mark_scene_dirty();
-                                        }
+                                        let total_delta = new_pt - gd.start_world;
+                                        self.apply_cp_delta_from_base(
+                                            gd.object_id,
+                                            &gd.before_snapshot,
+                                            &gd.cp_weights,
+                                            total_delta,
+                                        );
                                     }
                                 }
                                 self.grip_drag = Some(gd);
@@ -360,53 +424,72 @@ impl ElephantApp {
                             } else {
                                 let sel_rect = egui::Rect::from_two_pos(m.start, m.current);
                                 if sel_rect.width() > 4.0 || sel_rect.height() > 4.0 {
-                                    let crossing = m.current.x < m.start.x;
                                     let shift = ui.input(|i| i.modifiers.shift);
                                     let ctrl = ui.input(|i| i.modifiers.ctrl);
-                                    if !shift && !ctrl {
-                                        self.doc.clear_selection();
-                                    }
-                                    let ids: Vec<_> = self.doc.objects.keys().collect();
-                                    for id in ids {
-                                        let Some(obj) = self.doc.objects.get(id) else {
-                                            continue;
-                                        };
-                                        let Some(layer) = self.doc.layers.get(obj.layer_id) else {
-                                            continue;
-                                        };
-                                        if !layer.visible || layer.locked {
-                                            continue;
+                                    let hit_cps: Vec<(ObjectId, usize)> = cp_grips
+                                        .iter()
+                                        .filter(|g| sel_rect.contains(g.screen))
+                                        .map(|g| (g.object_id, g.cp_index))
+                                        .collect();
+                                    if !cp_grips.is_empty() && !hit_cps.is_empty() {
+                                        if !shift && !ctrl {
+                                            self.selected_cps.clear();
                                         }
-                                        let min = obj.aabb.min;
-                                        let max = obj.aabb.max;
-                                        let corners = [
-                                            DVec3::new(min.x, min.y, min.z),
-                                            DVec3::new(max.x, min.y, min.z),
-                                            DVec3::new(min.x, max.y, min.z),
-                                            DVec3::new(max.x, max.y, min.z),
-                                            DVec3::new(min.x, min.y, max.z),
-                                            DVec3::new(max.x, min.y, max.z),
-                                            DVec3::new(min.x, max.y, max.z),
-                                            DVec3::new(max.x, max.y, max.z),
-                                        ];
-                                        let mut obj_rect = egui::Rect::NOTHING;
-                                        for c in corners {
-                                            if let Some(sp) = world_to_screen(c, &vp_cols, rect) {
-                                                obj_rect.extend_with(sp);
+                                        for pair in hit_cps {
+                                            if ctrl {
+                                                self.selected_cps.retain(|&p| p != pair);
+                                            } else if !self.selected_cps.contains(&pair) {
+                                                self.selected_cps.push(pair);
                                             }
                                         }
-                                        if obj_rect.is_positive() {
-                                            let hit = if crossing {
-                                                sel_rect.intersects(obj_rect)
-                                            } else {
-                                                sel_rect.contains_rect(obj_rect)
+                                    } else {
+                                        let crossing = m.current.x < m.start.x;
+                                        if !shift && !ctrl {
+                                            self.doc.clear_selection();
+                                            self.selected_cps.clear();
+                                        }
+                                        let ids: Vec<_> = self.doc.objects.keys().collect();
+                                        for id in ids {
+                                            let Some(obj) = self.doc.objects.get(id) else {
+                                                continue;
                                             };
-                                            if hit {
-                                                self.doc.set_selected(id, !ctrl);
+                                            let Some(layer) = self.doc.layers.get(obj.layer_id) else {
+                                                continue;
+                                            };
+                                            if !layer.visible || layer.locked {
+                                                continue;
+                                            }
+                                            let min = obj.aabb.min;
+                                            let max = obj.aabb.max;
+                                            let corners = [
+                                                DVec3::new(min.x, min.y, min.z),
+                                                DVec3::new(max.x, min.y, min.z),
+                                                DVec3::new(min.x, max.y, min.z),
+                                                DVec3::new(max.x, max.y, min.z),
+                                                DVec3::new(min.x, min.y, max.z),
+                                                DVec3::new(max.x, min.y, max.z),
+                                                DVec3::new(min.x, max.y, max.z),
+                                                DVec3::new(max.x, max.y, max.z),
+                                            ];
+                                            let mut obj_rect = egui::Rect::NOTHING;
+                                            for c in corners {
+                                                if let Some(sp) = world_to_screen(c, &vp_cols, rect) {
+                                                    obj_rect.extend_with(sp);
+                                                }
+                                            }
+                                            if obj_rect.is_positive() {
+                                                let hit = if crossing {
+                                                    sel_rect.intersects(obj_rect)
+                                                } else {
+                                                    sel_rect.contains_rect(obj_rect)
+                                                };
+                                                if hit {
+                                                    self.doc.set_selected(id, !ctrl);
+                                                }
                                             }
                                         }
+                                        self.mark_doc_dirty();
                                     }
-                                    self.mark_doc_dirty();
                                 }
                             }
                         } else {
@@ -440,6 +523,72 @@ impl ElephantApp {
                                 }
                                 self.mark_scene_dirty();
                             }
+                        } else if let Some((uvn_oid, _, uvn_handles)) = &uvn_bundle {
+                            if let Some(h) = hit_uvn_gumball(uvn_handles, pos) {
+                                self.uvn_prompt = Some(UvnNumericPrompt {
+                                    object_id: *uvn_oid,
+                                    axis: h.axis,
+                                    axis_dir: h.world_dir,
+                                    text: String::new(),
+                                    just_opened: true,
+                                });
+                            } else if let Some(g) =
+                                cp_grips.iter().find(|g| pos.distance(g.screen) <= 9.0)
+                            {
+                                let shift = ui.input(|i| i.modifiers.shift);
+                                let pair = (g.object_id, g.cp_index);
+                                if shift {
+                                    if let Some(pos_idx) =
+                                        self.selected_cps.iter().position(|&p| p == pair)
+                                    {
+                                        self.selected_cps.remove(pos_idx);
+                                    } else {
+                                        self.selected_cps.push(pair);
+                                    }
+                                } else {
+                                    self.selected_cps = vec![pair];
+                                }
+                            } else {
+                                let shift = ui.input(|i| i.modifiers.shift);
+                                let ctrl = ui.input(|i| i.modifiers.ctrl);
+                                if !shift && !ctrl {
+                                    self.doc.clear_selection();
+                                    self.selected_cps.clear();
+                                }
+                                let pick_tol = (world_per_px * 10.0).max(1e-4);
+                                if let Some(hit_id) =
+                                    self.doc.pick_ray_with_tolerance(&ray, pick_tol)
+                                {
+                                    if ctrl {
+                                        let cur = self
+                                            .doc
+                                            .objects
+                                            .get(hit_id)
+                                            .map(|o| o.selected)
+                                            .unwrap_or(false);
+                                        self.doc.set_selected(hit_id, !cur);
+                                    } else {
+                                        self.doc.set_selected(hit_id, true);
+                                    }
+                                }
+                                self.mark_doc_dirty();
+                            }
+                        } else if let Some(g) =
+                            cp_grips.iter().find(|g| pos.distance(g.screen) <= 9.0)
+                        {
+                            let shift = ui.input(|i| i.modifiers.shift);
+                            let pair = (g.object_id, g.cp_index);
+                            if shift {
+                                if let Some(pos_idx) =
+                                    self.selected_cps.iter().position(|&p| p == pair)
+                                {
+                                    self.selected_cps.remove(pos_idx);
+                                } else {
+                                    self.selected_cps.push(pair);
+                                }
+                            } else {
+                                self.selected_cps = vec![pair];
+                            }
                         } else if let Some((axis, mode, _, _)) = hit_gumball(&gumball_handles, pos) {
                             self.gumball_prompt = Some(GumballNumericPrompt {
                                 axis,
@@ -452,6 +601,7 @@ impl ElephantApp {
                             let ctrl = ui.input(|i| i.modifiers.ctrl);
                             if !shift && !ctrl {
                                 self.doc.clear_selection();
+                                self.selected_cps.clear();
                             }
                             let pick_tol = (world_per_px * 10.0).max(1e-4);
                             if let Some(hit_id) = self.doc.pick_ray_with_tolerance(&ray, pick_tol) {
@@ -492,7 +642,6 @@ impl ElephantApp {
                 }
 
                 let painter = ui.painter_at(rect);
-                draw_gumball_overlay(&painter, &gumball_handles);
 
                 // Draw NURBS control points and control nets (PointsOn)
                 if !cp_grips.is_empty() {
@@ -508,15 +657,81 @@ impl ElephantApp {
                             egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(135, 142, 155)),
                         );
                     }
-                    for g in &cp_grips {
-                        let r = egui::Rect::from_center_size(g.screen, egui::vec2(6.0, 6.0));
-                        painter.rect(
-                            r,
-                            0.0,
-                            egui::Color32::from_rgb(245, 90, 210),
-                            egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
-                        );
+                    let mut weight_cache: HashMap<ObjectId, Vec<f64>> = HashMap::new();
+                    if self.soft_transform_enabled && !self.selected_cps.is_empty() {
+                        for &oid in &self.points_on_objects {
+                            weight_cache
+                                .insert(oid, self.compute_cp_weights_for_object(oid, None));
+                        }
                     }
+                    let lock_rings = match self.soft_transform_lock {
+                        BoundaryLock::Free => 0,
+                        BoundaryLock::FixG0 => 1,
+                        BoundaryLock::FixG1 => 2,
+                        BoundaryLock::FixG2 => 3,
+                    };
+                    for g in &cp_grips {
+                        let is_selected = self.selected_cps.contains(&(g.object_id, g.cp_index));
+                        let soft_w = weight_cache
+                            .get(&g.object_id)
+                            .and_then(|ws| ws.get(g.cp_index).copied())
+                            .unwrap_or(0.0);
+                        let is_locked = self.soft_transform_enabled
+                            && lock_rings > 0
+                            && self.doc.objects.get(g.object_id).is_some_and(|o| match &o.geometry {
+                                Geometry::Surface(s) => {
+                                    let ui_cp = g.cp_index / s.count_v.max(1);
+                                    let vj_cp = g.cp_index % s.count_v.max(1);
+                                    ui_cp < lock_rings
+                                        || ui_cp + lock_rings >= s.count_u
+                                        || vj_cp < lock_rings
+                                        || vj_cp + lock_rings >= s.count_v
+                                }
+                                Geometry::Curve(c) => {
+                                    g.cp_index < lock_rings
+                                        || g.cp_index + lock_rings >= c.control_points.len()
+                                }
+                                _ => false,
+                            });
+
+                        let (size, fill, stroke) = if is_selected {
+                            (
+                                8.0_f32,
+                                egui::Color32::from_rgb(255, 220, 50),
+                                egui::Stroke::new(1.4_f32, egui::Color32::from_rgb(30, 30, 35)),
+                            )
+                        } else if self.soft_transform_enabled && is_locked {
+                            (
+                                5.5_f32,
+                                egui::Color32::from_rgb(65, 85, 110),
+                                egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(125, 165, 215)),
+                            )
+                        } else if self.soft_transform_enabled && soft_w > 1e-3 {
+                            let t = soft_w.clamp(0.0, 1.0) as f32;
+                            let r_c = (75.0 + 180.0 * t) as u8;
+                            let g_c = (215.0 - 70.0 * t) as u8;
+                            let b_c = (245.0 - 190.0 * t) as u8;
+                            (
+                                6.5_f32,
+                                egui::Color32::from_rgb(r_c, g_c, b_c),
+                                egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
+                            )
+                        } else {
+                            (
+                                6.0_f32,
+                                egui::Color32::from_rgb(245, 90, 210),
+                                egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
+                            )
+                        };
+                        let r = egui::Rect::from_center_size(g.screen, egui::vec2(size, size));
+                        painter.rect(r, 0.0, fill, stroke);
+                    }
+                }
+
+                if let Some((_, _, uvn_handles)) = &uvn_bundle {
+                    draw_uvn_gumball_overlay(&painter, uvn_handles);
+                } else {
+                    draw_gumball_overlay(&painter, &gumball_handles);
                 }
 
                 // Draw CurvatureGraph combs for tracked curves

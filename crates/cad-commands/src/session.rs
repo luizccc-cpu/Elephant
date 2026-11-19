@@ -1,7 +1,7 @@
 use cad_doc::{AnnotationItem, AnnotationKind, Document, ObjectId};
 use cad_geom::{
-    DMat4, DVec3, Geometry, NurbsCurve, OffsetCornerStyle, Plane, TriangleMesh,
-    trim_curve_with_cutters,
+    DMat4, DVec3, Geometry, NurbsCurve, NurbsSurface, OffsetCornerStyle, Plane, TriangleMesh,
+    rail_revolve_nurbs, revolve_nurbs, trim_curve_with_cutters,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,7 +21,10 @@ pub enum ActiveTool {
     Box { base: Option<DVec3>, corner: Option<DVec3> },
     Cylinder { center: Option<DVec3>, radius: Option<f64> },
     Cone { center: Option<DVec3>, radius: Option<f64> },
-    Revolve { axis_start: Option<DVec3> },
+    Revolve { axis_start: Option<DVec3>, angle_deg: f64 },
+    RailRevolve { axis_start: Option<DVec3> },
+    ExtractIsocurve { dir_v: bool },
+    SplitSrf { dir_v: bool },
     Move { base: Option<DVec3> },
     Copy { base: Option<DVec3> },
     Rotate { center: Option<DVec3>, ref_vec: Option<DVec3> },
@@ -30,7 +33,7 @@ pub enum ActiveTool {
     Offset { distance: f64 },
     SplitCurve,
     Trim { cutter_ids: Vec<ObjectId> },
-    InsertKnot,
+    InsertKnot { dir_v: bool },
     ArrayLinear { count: usize, base: Option<DVec3> },
     ArrayPolar { count: usize },
     Distance { first: Option<DVec3> },
@@ -101,7 +104,9 @@ impl CommandSession {
             ActiveTool::Polygon { center, .. } => *center,
             ActiveTool::Box { base, .. } => *base,
             ActiveTool::Cylinder { center, .. } | ActiveTool::Cone { center, .. } => *center,
-            ActiveTool::Revolve { axis_start } => *axis_start,
+            ActiveTool::Revolve { axis_start, .. } | ActiveTool::RailRevolve { axis_start } => {
+                *axis_start
+            }
             ActiveTool::Move { base } | ActiveTool::Copy { base } => *base,
             ActiveTool::Rotate { center, .. } => *center,
             ActiveTool::Scale { origin, .. } => *origin,
@@ -111,8 +116,10 @@ impl CommandSession {
             ActiveTool::Dim { p1, p2 } => p2.or(*p1),
             ActiveTool::Offset { .. }
             | ActiveTool::SplitCurve
+            | ActiveTool::ExtractIsocurve { .. }
+            | ActiveTool::SplitSrf { .. }
             | ActiveTool::Trim { .. }
-            | ActiveTool::InsertKnot
+            | ActiveTool::InsertKnot { .. }
             | ActiveTool::ArrayPolar { .. }
             | ActiveTool::TextDot { .. }
             | ActiveTool::Idle => None,
@@ -175,8 +182,26 @@ impl CommandSession {
             ActiveTool::Cone { center: None, .. } => "Base center of cone",
             ActiveTool::Cone { radius: None, .. } => "Radius of cone (click or enter number)",
             ActiveTool::Cone { .. } => "Height of cone (click or enter number)",
-            ActiveTool::Revolve { axis_start: None } => "Start of revolve axis",
-            ActiveTool::Revolve { axis_start: Some(_) } => "End of revolve axis",
+            ActiveTool::Revolve { axis_start: None, .. } => {
+                "Start of revolve axis (or enter angle in deg)"
+            }
+            ActiveTool::Revolve { axis_start: Some(_), .. } => {
+                "End of revolve axis (or enter angle in deg)"
+            }
+            ActiveTool::RailRevolve { axis_start: None } => "Start of rail revolve axis",
+            ActiveTool::RailRevolve { axis_start: Some(_) } => "End of rail revolve axis",
+            ActiveTool::ExtractIsocurve { dir_v: false } => {
+                "Click surface to extract U-isocurve (type 'v' or 't' to toggle direction)"
+            }
+            ActiveTool::ExtractIsocurve { dir_v: true } => {
+                "Click surface to extract V-isocurve (type 'u' or 't' to toggle direction)"
+            }
+            ActiveTool::SplitSrf { dir_v: false } => {
+                "Click surface to split along U-isocurve (type 'v' or 't' to toggle direction)"
+            }
+            ActiveTool::SplitSrf { dir_v: true } => {
+                "Click surface to split along V-isocurve (type 'u' or 't' to toggle direction)"
+            }
             ActiveTool::Move { base: None } => "Point to move from",
             ActiveTool::Move { base: Some(_) } => "Point to move to",
             ActiveTool::Copy { base: None } => "Point to copy from",
@@ -192,7 +217,9 @@ impl CommandSession {
             ActiveTool::Offset { .. } => "Side to offset (click side, or enter distance)",
             ActiveTool::SplitCurve => "Click point on selected curve to split",
             ActiveTool::Trim { .. } => "Click curve segment to trim away (Enter/Esc to finish)",
-            ActiveTool::InsertKnot => "Click point on selected curve to insert knot",
+            ActiveTool::InsertKnot { .. } => {
+                "Click point on selected curve or surface to insert knot ('u'/'v' toggles on surface)"
+            }
             ActiveTool::ArrayLinear { base: None, .. } => "Base point for linear array (or enter count)",
             ActiveTool::ArrayLinear { base: Some(_), .. } => "Second reference point (step spacing)",
             ActiveTool::ArrayPolar { .. } => "Center of polar array (or enter count)",
@@ -303,7 +330,51 @@ impl CommandSession {
                 if !has_curve {
                     return Some("Select a profile curve to revolve first.".to_string());
                 }
-                self.tool = ActiveTool::Revolve { axis_start: None };
+                self.tool = ActiveTool::Revolve {
+                    axis_start: None,
+                    angle_deg: 360.0,
+                };
+                Some(self.prompt().to_string())
+            }
+            "railrevolve" => {
+                let curve_count = doc
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter(|&id| {
+                        doc.objects
+                            .get(id)
+                            .is_some_and(|o| matches!(o.geometry, Geometry::Curve(_)))
+                    })
+                    .count();
+                if curve_count < 2 {
+                    return Some(
+                        "Select 2 curves (1st profile, 2nd rail) first, then run RailRevolve."
+                            .to_string(),
+                    );
+                }
+                self.tool = ActiveTool::RailRevolve { axis_start: None };
+                Some(self.prompt().to_string())
+            }
+            "extractisocurve" => {
+                let has_surf = doc
+                    .objects
+                    .values()
+                    .any(|o| o.selected && matches!(o.geometry, Geometry::Surface(_)));
+                if !has_surf {
+                    return Some("Select a NURBS surface first to extract an isocurve.".to_string());
+                }
+                self.tool = ActiveTool::ExtractIsocurve { dir_v: false };
+                Some(self.prompt().to_string())
+            }
+            "splitsrf" => {
+                let has_surf = doc
+                    .objects
+                    .values()
+                    .any(|o| o.selected && matches!(o.geometry, Geometry::Surface(_)));
+                if !has_surf {
+                    return Some("Select a NURBS surface first to split.".to_string());
+                }
+                self.tool = ActiveTool::SplitSrf { dir_v: false };
                 Some(self.prompt().to_string())
             }
             "move" => {
@@ -383,14 +454,15 @@ impl CommandSession {
                 Some(self.prompt().to_string())
             }
             "insertknot" => {
-                let has_curve = doc
-                    .objects
-                    .values()
-                    .any(|o| o.selected && matches!(o.geometry, Geometry::Curve(_)));
-                if !has_curve {
-                    return Some("Select a curve to insert a knot into first.".to_string());
+                let has_nurbs = doc.objects.values().any(|o| {
+                    o.selected && matches!(o.geometry, Geometry::Curve(_) | Geometry::Surface(_))
+                });
+                if !has_nurbs {
+                    return Some(
+                        "Select a curve or NURBS surface to insert a knot into first.".to_string(),
+                    );
                 }
-                self.tool = ActiveTool::InsertKnot;
+                self.tool = ActiveTool::InsertKnot { dir_v: false };
                 Some(self.prompt().to_string())
             }
             "arraylinear" | "array" => {
@@ -666,12 +738,14 @@ impl CommandSession {
                     let r = radius.unwrap();
                     let h = (pt - c).dot(cplane.z_axis);
                     let h = if h.abs() < 1e-3 { 3.0 } else { h };
-                    doc.add_object(
-                        "Cylinder",
-                        Geometry::Mesh(TriangleMesh::from_cylinder(c, r, h, 32)),
-                    );
                     self.tool = ActiveTool::Idle;
-                    CommandOutcome::done(format!("Created Cylinder (r={r:.2}, h={h:.2})."))
+                    match NurbsSurface::cylinder(c, r, h) {
+                        Ok(srf) => {
+                            doc.add_object("Cylinder", Geometry::Surface(srf));
+                            CommandOutcome::done(format!("Created NURBS Cylinder (r={r:.2}, h={h:.2})."))
+                        }
+                        Err(e) => CommandOutcome::done(format!("Cylinder error: {e}")),
+                    }
                 }
             }
             ActiveTool::Cone { center, radius } => {
@@ -687,16 +761,22 @@ impl CommandSession {
                     let r = radius.unwrap();
                     let h = (pt - c).dot(cplane.z_axis);
                     let h = if h.abs() < 1e-3 { 3.0 } else { h };
-                    doc.add_object(
-                        "Cone",
-                        Geometry::Mesh(TriangleMesh::from_cone(c, r, h, 32)),
-                    );
                     self.tool = ActiveTool::Idle;
-                    CommandOutcome::done(format!("Created Cone (r={r:.2}, h={h:.2})."))
+                    match NurbsSurface::cone(c, r, h) {
+                        Ok(srf) => {
+                            doc.add_object("Cone", Geometry::Surface(srf));
+                            CommandOutcome::done(format!("Created NURBS Cone (r={r:.2}, h={h:.2})."))
+                        }
+                        Err(e) => CommandOutcome::done(format!("Cone error: {e}")),
+                    }
                 }
             }
-            ActiveTool::Revolve { axis_start } => {
+            ActiveTool::Revolve {
+                axis_start,
+                angle_deg,
+            } => {
                 if let Some(a) = *axis_start {
+                    let deg = *angle_deg;
                     let dir = (pt - a).normalize_or_zero();
                     if dir.length_squared() < 1e-6 {
                         self.tool = ActiveTool::Idle;
@@ -711,23 +791,132 @@ impl CommandSession {
                             _ => None,
                         })
                         .collect();
-                    let count = curves.len();
+                    let mut created = 0;
                     for (lid, c) in curves {
-                        let mesh = TriangleMesh::revolve_curve(
-                            &c,
-                            a,
-                            dir,
-                            std::f64::consts::TAU,
-                            24,
-                            32,
-                        );
-                        doc.add_object_on_layer("Revolve", lid, Geometry::Mesh(mesh));
+                        if let Ok(srf) = revolve_nurbs(&c, a, dir, deg.to_radians()) {
+                            doc.add_object_on_layer("Revolve", lid, Geometry::Surface(srf));
+                            created += 1;
+                        }
                     }
                     self.tool = ActiveTool::Idle;
-                    CommandOutcome::done(format!("Revolved {count} curve(s) 360 deg."))
+                    CommandOutcome::done(format!(
+                        "Revolved {created} curve(s) by {deg:.1} deg (NURBS surface)."
+                    ))
                 } else {
                     *axis_start = Some(pt);
                     CommandOutcome::msg(self.prompt())
+                }
+            }
+            ActiveTool::RailRevolve { axis_start } => {
+                if let Some(a) = *axis_start {
+                    let dir = (pt - a).normalize_or_zero();
+                    if dir.length_squared() < 1e-6 {
+                        self.tool = ActiveTool::Idle;
+                        return CommandOutcome::done("RailRevolve axis is degenerate.");
+                    }
+                    let curves: Vec<_> = doc
+                        .selected_ids_ordered()
+                        .into_iter()
+                        .filter_map(|id| {
+                            doc.objects.get(id).and_then(|o| match &o.geometry {
+                                Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                                _ => None,
+                            })
+                        })
+                        .collect();
+                    self.tool = ActiveTool::Idle;
+                    if curves.len() < 2 {
+                        return CommandOutcome::done(
+                            "Select 2 curves (1st profile, 2nd rail) for RailRevolve.",
+                        );
+                    }
+                    match rail_revolve_nurbs(&curves[0].1, &curves[1].1, a, dir) {
+                        Ok(srf) => {
+                            doc.add_object_on_layer(
+                                "RailRevolve",
+                                curves[0].0,
+                                Geometry::Surface(srf),
+                            );
+                            CommandOutcome::done("Created NURBS RailRevolve surface.")
+                        }
+                        Err(e) => CommandOutcome::done(format!("RailRevolve error: {e}")),
+                    }
+                } else {
+                    *axis_start = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                }
+            }
+            ActiveTool::ExtractIsocurve { dir_v } => {
+                let fixed_is_u = !*dir_v;
+                let mut best: Option<(cad_doc::LayerId, NurbsSurface, f64, f64, f64)> = None;
+                for obj in doc.objects.values() {
+                    if obj.selected {
+                        if let Geometry::Surface(s) = &obj.geometry {
+                            let (u, v, _, d) = s.closest_point(pt);
+                            if best.as_ref().is_none_or(|b| d < b.4) {
+                                best = Some((obj.layer_id, s.clone(), u, v, d));
+                            }
+                        }
+                    }
+                }
+                self.tool = ActiveTool::Idle;
+                if let Some((lid, surf, u, v, _)) = best {
+                    let param = if fixed_is_u { u } else { v };
+                    match surf.extract_isocurve(fixed_is_u, param) {
+                        Ok(iso) => {
+                            doc.add_object_on_layer("ExtractIsocurve", lid, Geometry::Curve(iso));
+                            let axis_lbl = if fixed_is_u { "U" } else { "V" };
+                            CommandOutcome::done(format!(
+                                "Extracted {axis_lbl}-isocurve at {param:.4}."
+                            ))
+                        }
+                        Err(e) => CommandOutcome::done(format!("ExtractIsocurve error: {e}")),
+                    }
+                } else {
+                    CommandOutcome::done("No selected NURBS surface.")
+                }
+            }
+            ActiveTool::SplitSrf { dir_v } => {
+                let split_along_u = !*dir_v;
+                let mut best: Option<(ObjectId, cad_doc::LayerId, NurbsSurface, f64, f64, f64)> =
+                    None;
+                for (id, obj) in &doc.objects {
+                    if obj.selected {
+                        if let Geometry::Surface(s) = &obj.geometry {
+                            let (u, v, _, d) = s.closest_point(pt);
+                            if best.as_ref().is_none_or(|b| d < b.5) {
+                                best = Some((id, obj.layer_id, s.clone(), u, v, d));
+                            }
+                        }
+                    }
+                }
+                self.tool = ActiveTool::Idle;
+                if let Some((id, lid, surf, u, v, _)) = best {
+                    let split = if split_along_u {
+                        surf.split_u(u)
+                    } else {
+                        surf.split_v(v)
+                    };
+                    if let Some((left, right)) = split {
+                        doc.replace_object_with_many(
+                            "SplitSrf",
+                            id,
+                            vec![
+                                (lid, Geometry::Surface(left)),
+                                (lid, Geometry::Surface(right)),
+                            ],
+                        );
+                        let axis_lbl = if split_along_u { "U" } else { "V" };
+                        CommandOutcome::done(format!(
+                            "Split surface into 2 along {axis_lbl}-isocurve."
+                        ))
+                    } else {
+                        CommandOutcome::done(
+                            "Click strictly inside the surface domain to SplitSrf.",
+                        )
+                    }
+                } else {
+                    CommandOutcome::done("No selected NURBS surface to split.")
                 }
             }
             ActiveTool::Move { base } => {
@@ -1023,20 +1212,57 @@ impl CommandSession {
                     CommandOutcome::msg("No intersection with cutting curves on that curve.")
                 }
             }
-            ActiveTool::InsertKnot => {
-                let mut best: Option<(ObjectId, f64, f64)> = None;
+            ActiveTool::InsertKnot { dir_v } => {
+                let is_v = *dir_v;
+                let mut best_curve: Option<(ObjectId, f64, f64)> = None;
+                let mut best_srf: Option<(ObjectId, f64, f64, f64)> = None;
                 for (id, obj) in &doc.objects {
                     if obj.selected {
-                        if let Geometry::Curve(c) = &obj.geometry {
-                            let (u, _, d) = c.closest_point(pt);
-                            if best.as_ref().is_none_or(|b| d < b.2) {
-                                best = Some((id, u, d));
+                        match &obj.geometry {
+                            Geometry::Curve(c) => {
+                                let (u, _, d) = c.closest_point(pt);
+                                if best_curve.as_ref().is_none_or(|b| d < b.2) {
+                                    best_curve = Some((id, u, d));
+                                }
                             }
+                            Geometry::Surface(s) => {
+                                let (u, v, _, d) = s.closest_point(pt);
+                                if best_srf.as_ref().is_none_or(|b| d < b.3) {
+                                    best_srf = Some((id, u, v, d));
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
                 self.tool = ActiveTool::Idle;
-                if let Some((id, u, _)) = best {
+                let prefer_srf = match (&best_curve, &best_srf) {
+                    (Some(c), Some(s)) => s.3 < c.2,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                if prefer_srf {
+                    if let Some((id, u, v, _)) = best_srf {
+                        let before = doc.objects[id].clone();
+                        if let Geometry::Surface(s) = &before.geometry {
+                            let res = if is_v {
+                                s.insert_knot_v(v, 1)
+                            } else {
+                                s.insert_knot_u(u, 1)
+                            };
+                            if let Ok(updated) = res {
+                                let (cu, cv) = (updated.count_u, updated.count_v);
+                                doc.objects[id].geometry = Geometry::Surface(updated);
+                                doc.objects[id].refresh_aabb();
+                                doc.record_object_modified("InsertKnot", id, before);
+                                let axis_lbl = if is_v { "V" } else { "U" };
+                                return CommandOutcome::done(format!(
+                                    "Inserted {axis_lbl} knot on surface ({cu}x{cv} CPs)."
+                                ));
+                            }
+                        }
+                    }
+                } else if let Some((id, u, _)) = best_curve {
                     let before = doc.objects[id].clone();
                     if let Geometry::Curve(c) = &before.geometry {
                         if let Ok(updated) = c.insert_knot(u, 1) {
@@ -1050,7 +1276,7 @@ impl CommandSession {
                         }
                     }
                 }
-                CommandOutcome::done("No selected curve for knot insertion.")
+                CommandOutcome::done("No selected curve or surface for knot insertion.")
             }
             ActiveTool::ArrayLinear { count, base } => {
                 if let Some(b) = *base {
@@ -1222,11 +1448,37 @@ impl CommandSession {
                     }
                 }
             }
+            ActiveTool::ExtractIsocurve { dir_v }
+            | ActiveTool::SplitSrf { dir_v }
+            | ActiveTool::InsertKnot { dir_v } => {
+                let toggled = match lower.as_str() {
+                    "u" => Some(false),
+                    "v" => Some(true),
+                    "t" | "toggle" => Some(!*dir_v),
+                    _ => None,
+                };
+                if let Some(nv) = toggled {
+                    *dir_v = nv;
+                    return Some(CommandOutcome::msg(self.prompt()));
+                }
+            }
             _ => {}
         }
 
         if let Ok(val) = trimmed.parse::<f64>() {
             match &self.tool {
+                ActiveTool::Revolve { axis_start, .. } if val.abs() > 1e-3 => {
+                    let deg = val.clamp(-360.0, 360.0);
+                    let start = *axis_start;
+                    self.tool = ActiveTool::Revolve {
+                        axis_start: start,
+                        angle_deg: deg,
+                    };
+                    return Some(CommandOutcome::msg(format!(
+                        "Revolve angle = {deg:.1} deg. {}",
+                        self.prompt()
+                    )));
+                }
                 ActiveTool::Conic {
                     p0: Some(a),
                     p2: Some(b),
@@ -1369,6 +1621,44 @@ impl CommandSession {
         None
     }
 
+    /// Interactive tool previews with document context (includes surface hover isocurves).
+    pub fn preview_geometry_with_doc(
+        &self,
+        cursor: Option<DVec3>,
+        cplane: &Plane,
+        doc: &Document,
+    ) -> Vec<Geometry> {
+        let Some(cur) = cursor else {
+            return Vec::new();
+        };
+        match &self.tool {
+            ActiveTool::ExtractIsocurve { dir_v }
+            | ActiveTool::SplitSrf { dir_v }
+            | ActiveTool::InsertKnot { dir_v } => {
+                let mut best: Option<(NurbsSurface, f64, f64, f64)> = None;
+                for obj in doc.objects.values() {
+                    if obj.selected {
+                        if let Geometry::Surface(s) = &obj.geometry {
+                            let (u, v, _, d) = s.closest_point(cur);
+                            if best.as_ref().is_none_or(|b| d < b.3) {
+                                best = Some((s.clone(), u, v, d));
+                            }
+                        }
+                    }
+                }
+                if let Some((surf, u, v, _)) = best {
+                    let fixed_is_u = !*dir_v;
+                    let param = if fixed_is_u { u } else { v };
+                    if let Ok(iso) = surf.extract_isocurve(fixed_is_u, param) {
+                        return vec![Geometry::Curve(iso)];
+                    }
+                }
+                Vec::new()
+            }
+            _ => self.preview_geometry(cursor, cplane),
+        }
+    }
+
     pub fn preview_geometry(&self, cursor: Option<DVec3>, cplane: &Plane) -> Vec<Geometry> {
         let Some(cur) = cursor else {
             return Vec::new();
@@ -1376,7 +1666,8 @@ impl CommandSession {
         match &self.tool {
             ActiveTool::Line { start: Some(s) }
             | ActiveTool::Mirror { start: Some(s) }
-            | ActiveTool::Revolve { axis_start: Some(s) }
+            | ActiveTool::Revolve { axis_start: Some(s), .. }
+            | ActiveTool::RailRevolve { axis_start: Some(s) }
             | ActiveTool::Distance { first: Some(s) }
             | ActiveTool::Dim { p1: Some(s), p2: None } => {
                 vec![Geometry::Curve(NurbsCurve::line(*s, cur))]
@@ -1675,5 +1966,58 @@ mod tests {
         let split_out = session.on_point(DVec3::new(-2.5, 0.0, 0.0), &mut doc2, &plane);
         assert!(split_out.finished);
         assert_eq!(doc2.objects.len(), 3);
+    }
+
+    #[test]
+    fn interactive_revolve_extract_isocurve_and_splitsrf_create_nurbs_surfaces() {
+        let mut doc = Document::new();
+        let mut session = CommandSession::default();
+        let plane = Plane::world_xy();
+
+        // Revolve a vertical profile around Z -> creates NurbsSurface
+        let prof = doc.add_object(
+            "Profile",
+            Geometry::Curve(NurbsCurve::line(
+                DVec3::new(3.0, 0.0, 0.0),
+                DVec3::new(3.0, 0.0, 4.0),
+            )),
+        );
+        doc.set_selected(prof, true);
+        session.start_tool("revolve", &doc);
+        session.on_point(DVec3::ZERO, &mut doc, &plane);
+        let rev_out = session.on_point(DVec3::Z, &mut doc, &plane);
+        assert!(rev_out.finished);
+        assert_eq!(doc.objects.len(), 2);
+        let rev_id = doc.last_created[0];
+        assert!(matches!(doc.objects[rev_id].geometry, Geometry::Surface(_)));
+
+        // Select surface, extract V-isocurve -> creates NurbsCurve
+        doc.clear_selection();
+        doc.set_selected(rev_id, true);
+        session.start_tool("extractisocurve", &doc);
+        session.on_text_input("v", &mut doc, &plane);
+        let preview = session.preview_geometry_with_doc(Some(DVec3::new(3.0, 0.0, 2.0)), &plane, &doc);
+        assert_eq!(preview.len(), 1);
+        let iso_out = session.on_point(DVec3::new(3.0, 0.0, 2.0), &mut doc, &plane);
+        assert!(iso_out.finished);
+        let iso_id = doc.last_created[0];
+        assert!(matches!(doc.objects[iso_id].geometry, Geometry::Curve(_)));
+
+        // SplitSrf splits surface into 2 surfaces with single-step Undo
+        doc.clear_selection();
+        doc.set_selected(rev_id, true);
+        session.start_tool("splitsrf", &doc);
+        session.on_text_input("u", &mut doc, &plane);
+        let split_out = session.on_point(DVec3::new(3.0, 0.0, 2.0), &mut doc, &plane);
+        assert!(split_out.finished);
+        assert!(doc.objects.get(rev_id).is_none());
+        let srf_count = doc
+            .objects
+            .values()
+            .filter(|o| matches!(o.geometry, Geometry::Surface(_)))
+            .count();
+        assert_eq!(srf_count, 2);
+        assert_eq!(doc.undo().as_deref(), Some("SplitSrf"));
+        assert!(doc.objects.get(rev_id).is_some());
     }
 }

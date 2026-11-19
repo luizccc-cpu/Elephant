@@ -31,7 +31,7 @@ pub fn export_obj_string(doc: &Document) -> String {
                 write_obj_mesh(&mut out, mesh, &mut v_offset, &mut vn_offset);
             }
             Geometry::Surface(surf) => {
-                let mesh = surf.tessellate(24, 8);
+                let mesh = surf.tessellate_display();
                 write_obj_mesh(&mut out, &mesh, &mut v_offset, &mut vn_offset);
             }
             Geometry::Curve(curve) => {

@@ -1,4 +1,4 @@
-use cad_geom::{Geometry, UnitSystem};
+use cad_geom::{BoundaryLock, Geometry, SoftTransformFalloff, UnitSystem};
 use eframe::egui;
 
 use crate::state::ElephantApp;
@@ -8,6 +8,7 @@ impl ElephantApp {
         egui::SidePanel::right("inspector")
             .default_width(250.0)
             .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Layers");
                 ui.horizontal(|ui| {
                     ui.add(
@@ -111,6 +112,7 @@ impl ElephantApp {
                 } else if selected_ids.len() == 1 {
                     let oid = selected_ids[0];
                     let mut prop_changed = false;
+                    let mut queued_cmd: Option<&'static str> = None;
                     if let Some(obj) = self.doc.objects.get_mut(oid) {
                         let mut name_buf = obj.name.clone().unwrap_or_default();
                         ui.horizontal(|ui| {
@@ -186,7 +188,26 @@ impl ElephantApp {
                             ),
                         };
                         ui.label(format!("Type: {kind_detail}"));
-                        if let Geometry::Curve(c) = &obj.geometry {
+                        if let Geometry::Surface(s) = &obj.geometry {
+                            ui.small(format!(
+                                "Rational: {} | Closed U/V: {}/{}",
+                                if s.is_rational() { "Yes" } else { "No" },
+                                if s.is_closed_u() { "Yes" } else { "No" },
+                                if s.is_closed_v() { "Yes" } else { "No" }
+                            ));
+                            ui.small(format!("Area: {:.3}", s.area_approx()));
+                            ui.horizontal(|ui| {
+                                if ui.small_button("PointsOn").clicked() {
+                                    queued_cmd = Some("PointsOn");
+                                }
+                                if ui.small_button("Flip").clicked() {
+                                    queued_cmd = Some("Flip");
+                                }
+                                if ui.small_button("DupBorder").clicked() {
+                                    queued_cmd = Some("DupBorder");
+                                }
+                            });
+                        } else if let Geometry::Curve(c) = &obj.geometry {
                             ui.small(format!(
                                 "Rational: {}",
                                 if c.is_rational() { "Yes" } else { "No" }
@@ -216,6 +237,9 @@ impl ElephantApp {
                         let s = obj.aabb.size();
                         ui.label(format!("Center: ({:.2}, {:.2}, {:.2})", c.x, c.y, c.z));
                         ui.label(format!("Size: ({:.2}, {:.2}, {:.2})", s.x, s.y, s.z));
+                    }
+                    if let Some(cmd) = queued_cmd {
+                        self.execute_command(cmd);
                     }
                     if prop_changed {
                         self.mark_scene_dirty();
@@ -263,6 +287,76 @@ impl ElephantApp {
                     });
                 }
 
+                if !self.points_on_objects.is_empty() {
+                    ui.separator();
+                    ui.heading("NURBS Control Points");
+                    ui.checkbox(&mut self.uvn_gumball_enabled, "UVN Gumball");
+                    if self.uvn_gumball_enabled {
+                        ui.add(
+                            egui::Slider::new(&mut self.uvn_normal_drag_strength, 0.05..=2.0)
+                                .text("N Drag Strength"),
+                        );
+                    }
+                    ui.checkbox(&mut self.soft_transform_enabled, "NURBS Soft Transform");
+                    if self.soft_transform_enabled {
+                        ui.add(
+                            egui::Slider::new(&mut self.soft_transform_radius, 0.25..=25.0)
+                                .text("Soft Radius"),
+                        );
+                        egui::ComboBox::from_label("Falloff")
+                            .selected_text(format!("{:?}", self.soft_transform_falloff))
+                            .show_ui(ui, |ui| {
+                                for f in [
+                                    SoftTransformFalloff::Smooth,
+                                    SoftTransformFalloff::Linear,
+                                    SoftTransformFalloff::Sharp,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.soft_transform_falloff,
+                                        f,
+                                        format!("{f:?}"),
+                                    );
+                                }
+                            });
+                        egui::ComboBox::from_label("Boundary Lock")
+                            .selected_text(match self.soft_transform_lock {
+                                BoundaryLock::Free => "Free",
+                                BoundaryLock::FixG0 => "Fix G0",
+                                BoundaryLock::FixG1 => "Fix G1",
+                                BoundaryLock::FixG2 => "Fix G2",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.soft_transform_lock,
+                                    BoundaryLock::Free,
+                                    "Free",
+                                );
+                                ui.selectable_value(
+                                    &mut self.soft_transform_lock,
+                                    BoundaryLock::FixG0,
+                                    "Fix G0 (1 edge row)",
+                                );
+                                ui.selectable_value(
+                                    &mut self.soft_transform_lock,
+                                    BoundaryLock::FixG1,
+                                    "Fix G1 (2 edge rows)",
+                                );
+                                ui.selectable_value(
+                                    &mut self.soft_transform_lock,
+                                    BoundaryLock::FixG2,
+                                    "Fix G2 (3 edge rows)",
+                                );
+                            });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.small(format!("Selected CPs: {}", self.selected_cps.len()));
+                        if !self.selected_cps.is_empty() && ui.small_button("Clear CPs").clicked()
+                        {
+                            self.selected_cps.clear();
+                        }
+                    });
+                }
+
                 ui.separator();
                 ui.heading("Document Settings");
                 let mut selected_unit = self.doc.units;
@@ -294,6 +388,7 @@ impl ElephantApp {
                     self.doc.tolerances.absolute,
                     self.doc.units.label()
                 ));
+                });
             });
     }
 }

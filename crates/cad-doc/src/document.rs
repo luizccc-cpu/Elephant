@@ -15,6 +15,7 @@ pub struct Document {
     pub objects: ObjectStore,
     pub annotations: Vec<AnnotationItem>,
     pub last_created: Vec<ObjectId>,
+    selection_order: Vec<ObjectId>,
     next_group_id: u64,
     spatial: SpatialIndex,
     history: UndoHistory,
@@ -39,6 +40,7 @@ impl Document {
             objects: ObjectStore::new(),
             annotations: Vec::new(),
             last_created: Vec::new(),
+            selection_order: Vec::new(),
             next_group_id: 1,
             spatial: SpatialIndex::default(),
             history: UndoHistory::default(),
@@ -145,6 +147,7 @@ impl Document {
             label: "Delete".to_string(),
             actions,
         });
+        self.sync_selection_order();
         self.rebuild_spatial_index();
         count
     }
@@ -218,26 +221,66 @@ impl Document {
             label: label.into(),
             actions,
         });
+        self.sync_selection_order();
         self.rebuild_spatial_index();
         created_ids
     }
 
     pub fn set_selected(&mut self, id: ObjectId, selected: bool) {
         let gid = self.objects.get(id).and_then(|o| o.group_id);
+        let mut touched = Vec::new();
         if let Some(gid) = gid {
-            for (_, obj) in &mut self.objects {
+            for (oid, obj) in &mut self.objects {
                 if obj.group_id == Some(gid) && obj.visible {
                     obj.selected = selected;
+                    touched.push(oid);
                 }
             }
         } else if let Some(obj) = self.objects.get_mut(id) {
             obj.selected = selected;
+            touched.push(id);
+        }
+        if selected {
+            for oid in touched {
+                if !self.selection_order.contains(&oid) {
+                    self.selection_order.push(oid);
+                }
+            }
+        } else {
+            self.selection_order.retain(|oid| !touched.contains(oid));
         }
     }
 
     pub fn clear_selection(&mut self) {
         for (_, obj) in &mut self.objects {
             obj.selected = false;
+        }
+        self.selection_order.clear();
+    }
+
+    /// Selected visible object IDs in chronological selection order.
+    pub fn selected_ids_ordered(&self) -> Vec<ObjectId> {
+        let mut out: Vec<ObjectId> = self
+            .selection_order
+            .iter()
+            .copied()
+            .filter(|id| self.objects.get(*id).is_some_and(|o| o.visible && o.selected))
+            .collect();
+        for (id, obj) in &self.objects {
+            if obj.visible && obj.selected && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    fn sync_selection_order(&mut self) {
+        self.selection_order
+            .retain(|id| self.objects.get(*id).is_some_and(|o| o.visible && o.selected));
+        for (id, obj) in &self.objects {
+            if obj.visible && obj.selected && !self.selection_order.contains(&id) {
+                self.selection_order.push(id);
+            }
         }
     }
 
@@ -257,6 +300,7 @@ impl Document {
                 count += 1;
             }
         }
+        self.sync_selection_order();
         count
     }
 
@@ -276,6 +320,7 @@ impl Document {
                 }
             }
         }
+        self.sync_selection_order();
         count
     }
 
@@ -291,6 +336,7 @@ impl Document {
                 }
             }
         }
+        self.sync_selection_order();
         count
     }
 
@@ -312,6 +358,7 @@ impl Document {
                 count += 1;
             }
         }
+        self.sync_selection_order();
         count
     }
 
@@ -324,6 +371,7 @@ impl Document {
                 count += 1;
             }
         }
+        self.sync_selection_order();
         count
     }
 
@@ -347,6 +395,7 @@ impl Document {
                 count += 1;
             }
         }
+        self.sync_selection_order();
         count
     }
 
@@ -525,6 +574,7 @@ impl Document {
             label: label.clone(),
             actions: redo_actions,
         });
+        self.sync_selection_order();
         self.rebuild_spatial_index();
         Some(label)
     }
@@ -558,6 +608,7 @@ impl Document {
             label: label.clone(),
             actions: undo_actions,
         });
+        self.sync_selection_order();
         self.rebuild_spatial_index();
         Some(label)
     }
@@ -712,5 +763,22 @@ mod tests {
             panic!("expected curve");
         };
         assert!((c.control_points[1].position.x - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn selected_ids_ordered_preserves_click_sequence() {
+        let mut doc = Document::new();
+        let a = doc.add_object("A", Geometry::Point(DVec3::X));
+        let b = doc.add_object("B", Geometry::Point(DVec3::Y));
+        let c = doc.add_object("C", Geometry::Point(DVec3::Z));
+        doc.set_selected(c, true);
+        doc.set_selected(a, true);
+        doc.set_selected(b, true);
+        assert_eq!(doc.selected_ids_ordered(), vec![c, a, b]);
+        doc.set_selected(a, false);
+        assert_eq!(doc.selected_ids_ordered(), vec![c, b]);
+        doc.undo();
+        assert!(doc.objects.get(c).is_none());
+        assert_eq!(doc.selected_ids_ordered(), vec![b]);
     }
 }

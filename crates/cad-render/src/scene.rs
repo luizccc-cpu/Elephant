@@ -152,9 +152,7 @@ impl RenderScene {
                 }
                 Geometry::Surface(surf) => {
                     if mode != DisplayMode::Wireframe {
-                        let su = (surf.count_u.max(4) * 4).clamp(16, 48);
-                        let sv = (surf.count_v.max(4) * 4).clamp(16, 48);
-                        let mesh = surf.tessellate(su, sv);
+                        let mesh = surf.tessellate_display();
                         scene.push_mesh_triangles(
                             &mesh.positions,
                             &mesh.normals,
@@ -173,7 +171,7 @@ impl RenderScene {
                             [0.16, 0.18, 0.22, 0.85]
                         };
                         let inner = if mode == DisplayMode::Wireframe { 3 } else { 2 };
-                        for poly in surf.isocurve_polylines(inner, inner, 24) {
+                        for poly in surf.isocurve_polylines(inner, inner, 36) {
                             for pair in poly.windows(2) {
                                 scene.push_line(
                                     [pair[0].x as f32, pair[0].y as f32, pair[0].z as f32],
@@ -284,7 +282,7 @@ impl RenderScene {
                     }
                 }
                 Geometry::Surface(surf) => {
-                    let mesh = surf.tessellate(24, 8);
+                    let mesh = surf.tessellate_display();
                     self.push_mesh(
                         &mesh.positions,
                         &mesh.normals,

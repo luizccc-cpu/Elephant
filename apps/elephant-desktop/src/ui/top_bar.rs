@@ -99,6 +99,39 @@ impl ElephantApp {
                         }
                     }
                 });
+                ui.menu_button("Surface", |ui| {
+                    for cmd in [
+                        "Plane",
+                        "Extrude",
+                        "PlanarSrf",
+                        "Loft",
+                        "Revolve",
+                        "RailRevolve",
+                        "Sweep1",
+                        "Sweep2",
+                        "EdgeSrf",
+                        "NetworkSrf",
+                        "BlendSrf",
+                        "Patch",
+                        "OffsetSrf",
+                        "ExtendSrf",
+                        "MatchSrf",
+                        "RebuildSrf",
+                        "SplitSrf",
+                        "ExtractIsocurve",
+                        "DupBorder",
+                        "DupEdge",
+                        "Flip",
+                        "ChangeDegree",
+                        "PointsOn",
+                        "PointsOff",
+                    ] {
+                        if ui.button(cmd).clicked() {
+                            self.execute_command(cmd);
+                            ui.close_menu();
+                        }
+                    }
+                });
                 ui.menu_button("Solid", |ui| {
                     for cmd in [
                         "Extrude",

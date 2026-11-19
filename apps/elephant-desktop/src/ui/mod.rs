@@ -10,11 +10,15 @@ use crate::state::ElephantApp;
 impl eframe::App for ElephantApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.gumball_prompt.is_some() {
+            if self.uvn_prompt.is_some() {
+                self.uvn_prompt = None;
+            } else if self.gumball_prompt.is_some() {
                 self.gumball_prompt = None;
             } else if self.session.is_active() {
                 let msg = self.session.cancel();
                 self.log(msg);
+            } else if !self.selected_cps.is_empty() {
+                self.selected_cps.clear();
             } else {
                 self.doc.clear_selection();
                 self.mark_doc_dirty();
@@ -89,5 +93,6 @@ impl eframe::App for ElephantApp {
             });
 
         self.draw_gumball_prompt_window(ctx);
+        self.draw_uvn_prompt_window(ctx);
     }
 }

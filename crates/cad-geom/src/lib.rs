@@ -6,6 +6,7 @@ pub mod error;
 pub mod mesh;
 pub mod nurbs_curve;
 pub mod nurbs_surface;
+pub mod surface_ops;
 
 pub use cad_math::{Aabb, Continuity, DMat4, DVec3, Plane, Ray, Tolerances, UnitSystem};
 pub use csg::{BooleanOp, mesh_boolean};
@@ -17,7 +18,17 @@ pub use curve_ops::{
 pub use error::GeomError;
 pub use mesh::TriangleMesh;
 pub use nurbs_curve::{ControlPoint, CurvatureSample, NurbsCurve};
-pub use nurbs_surface::NurbsSurface;
+pub use nurbs_surface::{
+    NurbsSurface, SurfaceCurvature, SurfaceDerivatives, SurfaceEdge, SurfaceFrame,
+};
+pub use surface_ops::{
+    BoundaryLock, LoftStyle, PatchBoundaryConstraint, PatchOptions, PatchReport,
+    SoftTransformFalloff, SurfaceRebuildReport, apply_soft_transform_surface,
+    apply_weighted_deltas_curve, apply_weighted_deltas_surface, blend_srf, closest_edge_pair,
+    edge_srf, extend_srf, loft_nurbs, make_curves_compatible, match_srf, network_srf, offset_srf,
+    partition_network_curves, patch_srf, rail_revolve_nurbs, rebuild_srf, revolve_nurbs,
+    soft_transform_weights_curve, soft_transform_weights_surface, sweep1, sweep2,
+};
 use serde::{Deserialize, Serialize};
 
 /// Unified geometric entity stored in an Elephant document.

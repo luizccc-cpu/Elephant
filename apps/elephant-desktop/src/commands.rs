@@ -1,8 +1,12 @@
 use cad_doc::{AnnotationItem, AnnotationKind, Document};
 use cad_geom::{
-    BooleanOp, Continuity, DMat4, DVec3, Geometry, NurbsCurve, NurbsSurface, Plane, TriangleMesh,
-    UnitSystem, blend_curves, chamfer_two_curves, fair_curve, fillet_two_curves,
-    intersect_curves, match_curve, mesh_boolean, rebuild_adaptive, rebuild_uniform, tween_curves,
+    BooleanOp, BoundaryLock, Continuity, DMat4, DVec3, Geometry, LoftStyle, NurbsCurve,
+    NurbsSurface, PatchBoundaryConstraint, PatchOptions, Plane, SoftTransformFalloff,
+    SurfaceEdge, TriangleMesh, UnitSystem, blend_curves, blend_srf, chamfer_two_curves,
+    closest_edge_pair, edge_srf, extend_srf, fair_curve, fillet_two_curves, intersect_curves,
+    loft_nurbs, match_curve, match_srf, mesh_boolean, network_srf, offset_srf,
+    partition_network_curves, patch_srf, rebuild_adaptive, rebuild_srf, rebuild_uniform, sweep1,
+    sweep2, tween_curves,
 };
 use cad_render::DisplayMode;
 
@@ -70,20 +74,17 @@ impl ElephantApp {
             }
             "sphere" => {
                 let r = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.5);
-                let id = self.doc.add_object(
-                    "Sphere",
-                    Geometry::Mesh(TriangleMesh::from_sphere(
-                        DVec3::new(0.0, 0.0, r),
-                        r,
-                        24,
-                        16,
-                    )),
-                );
-                if let Some(obj) = self.doc.objects.get_mut(id) {
-                    obj.name = Some("Sphere".to_string());
+                match NurbsSurface::sphere(DVec3::new(0.0, 0.0, r), r) {
+                    Ok(srf) => {
+                        let id = self.doc.add_object("Sphere", Geometry::Surface(srf));
+                        if let Some(obj) = self.doc.objects.get_mut(id) {
+                            obj.name = Some("Sphere".to_string());
+                        }
+                        self.mark_scene_dirty();
+                        self.log(format!("Created NURBS Sphere (r = {r})."));
+                    }
+                    Err(e) => self.log(format!("Sphere error: {e}")),
                 }
-                self.mark_scene_dirty();
-                self.log(format!("Created Sphere (r = {r})."));
             }
             "circle" => {
                 let r = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(3.0);
@@ -106,32 +107,38 @@ impl ElephantApp {
             "cylinder" => {
                 let r = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.5);
                 let h = args.get(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(4.0);
-                self.doc.add_object(
-                    "Cylinder",
-                    Geometry::Mesh(TriangleMesh::from_cylinder(DVec3::ZERO, r, h, 32)),
-                );
-                self.mark_scene_dirty();
-                self.log(format!("Created Cylinder (r={r}, h={h})."));
+                match NurbsSurface::cylinder(DVec3::ZERO, r, h) {
+                    Ok(srf) => {
+                        self.doc.add_object("Cylinder", Geometry::Surface(srf));
+                        self.mark_scene_dirty();
+                        self.log(format!("Created NURBS Cylinder (r={r}, h={h})."));
+                    }
+                    Err(e) => self.log(format!("Cylinder error: {e}")),
+                }
             }
             "cone" => {
                 let r = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(2.0);
                 let h = args.get(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(4.0);
-                self.doc.add_object(
-                    "Cone",
-                    Geometry::Mesh(TriangleMesh::from_cone(DVec3::ZERO, r, h, 32)),
-                );
-                self.mark_scene_dirty();
-                self.log(format!("Created Cone (r={r}, h={h})."));
+                match NurbsSurface::cone(DVec3::ZERO, r, h) {
+                    Ok(srf) => {
+                        self.doc.add_object("Cone", Geometry::Surface(srf));
+                        self.mark_scene_dirty();
+                        self.log(format!("Created NURBS Cone (r={r}, h={h})."));
+                    }
+                    Err(e) => self.log(format!("Cone error: {e}")),
+                }
             }
             "torus" => {
                 let maj = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(3.0);
                 let min = args.get(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
-                self.doc.add_object(
-                    "Torus",
-                    Geometry::Mesh(TriangleMesh::from_torus(DVec3::ZERO, maj, min, 32, 16)),
-                );
-                self.mark_scene_dirty();
-                self.log(format!("Created Torus (R={maj}, r={min})."));
+                match NurbsSurface::torus(DVec3::ZERO, maj, min) {
+                    Ok(srf) => {
+                        self.doc.add_object("Torus", Geometry::Surface(srf));
+                        self.mark_scene_dirty();
+                        self.log(format!("Created NURBS Torus (R={maj}, r={min})."));
+                    }
+                    Err(e) => self.log(format!("Torus error: {e}")),
+                }
             }
             "plane" => {
                 let w = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(6.0);
@@ -200,23 +207,626 @@ impl ElephantApp {
                 }
             }
             "loft" => {
-                let curves: Vec<NurbsCurve> = self
+                let mut style = LoftStyle::Normal;
+                let mut closed = false;
+                for arg in &args {
+                    match arg.to_ascii_lowercase().as_str() {
+                        "loose" => style = LoftStyle::Loose,
+                        "tight" => style = LoftStyle::Tight,
+                        "straight" => style = LoftStyle::Straight,
+                        "normal" => style = LoftStyle::Normal,
+                        "close" | "closed" => closed = true,
+                        _ => {}
+                    }
+                }
+                let curves: Vec<(cad_doc::LayerId, NurbsCurve)> = self
                     .doc
-                    .objects
-                    .values()
-                    .filter(|o| o.selected)
-                    .filter_map(|o| match &o.geometry {
-                        Geometry::Curve(c) => Some(c.clone()),
-                        _ => None,
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                            _ => None,
+                        })
                     })
                     .collect();
-                if let Some(mesh) = TriangleMesh::loft_curves(&curves, 32) {
-                    self.doc.add_object("Loft", Geometry::Mesh(mesh));
-                    self.mark_scene_dirty();
-                    self.log(format!("Lofted {} curves.", curves.len()));
+                if curves.len() < 2 {
+                    self.log("Select 2 or more curves to Loft [normal|loose|tight|straight] [closed].");
                 } else {
-                    self.log("Select 2 or more curves to Loft.");
+                    let lid = curves[0].0;
+                    let raw: Vec<NurbsCurve> = curves.into_iter().map(|(_, c)| c).collect();
+                    let n_crvs = raw.len();
+                    match loft_nurbs(&raw, style, closed) {
+                        Ok(srf) => {
+                            self.doc
+                                .add_object_on_layer("Loft", lid, Geometry::Surface(srf));
+                            self.mark_scene_dirty();
+                            self.log(format!("Lofted {n_crvs} curves into NURBS surface ({style:?})."));
+                        }
+                        Err(e) => self.log(format!("Loft error: {e}")),
+                    }
                 }
+            }
+            "sweep1" => {
+                let roadlike = args
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case("roadlike") || a.eq_ignore_ascii_case("road"));
+                let curves: Vec<(cad_doc::LayerId, NurbsCurve)> = self
+                    .doc
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                if curves.len() < 2 {
+                    self.log("Select rail curve first, then 1+ profile curves: Sweep1 [roadlike].");
+                } else {
+                    let lid = curves[0].0;
+                    let rail = &curves[0].1;
+                    let profs: Vec<NurbsCurve> = curves[1..].iter().map(|c| c.1.clone()).collect();
+                    let up = roadlike.then_some(cplane.z_axis);
+                    match sweep1(rail, &profs, up) {
+                        Ok(srf) => {
+                            self.doc
+                                .add_object_on_layer("Sweep1", lid, Geometry::Surface(srf));
+                            self.mark_scene_dirty();
+                            self.log(format!("Created Sweep1 NURBS surface from {} profile(s).", profs.len()));
+                        }
+                        Err(e) => self.log(format!("Sweep1 error: {e}")),
+                    }
+                }
+            }
+            "sweep2" => {
+                let curves: Vec<(cad_doc::LayerId, NurbsCurve)> = self
+                    .doc
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                if curves.len() < 3 {
+                    self.log("Select 2 rail curves first, then 1+ profile curves: Sweep2.");
+                } else {
+                    let lid = curves[0].0;
+                    let profs: Vec<NurbsCurve> = curves[2..].iter().map(|c| c.1.clone()).collect();
+                    match sweep2(&curves[0].1, &curves[1].1, &profs) {
+                        Ok(srf) => {
+                            self.doc
+                                .add_object_on_layer("Sweep2", lid, Geometry::Surface(srf));
+                            self.mark_scene_dirty();
+                            self.log(format!("Created Sweep2 NURBS surface from {} profile(s).", profs.len()));
+                        }
+                        Err(e) => self.log(format!("Sweep2 error: {e}")),
+                    }
+                }
+            }
+            "edgesrf" => {
+                let curves: Vec<(cad_doc::LayerId, NurbsCurve)> = self
+                    .doc
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                if !(2..=4).contains(&curves.len()) {
+                    self.log("Select 2, 3, or 4 boundary curves for EdgeSrf.");
+                } else {
+                    let lid = curves[0].0;
+                    let raw: Vec<NurbsCurve> = curves.into_iter().map(|c| c.1).collect();
+                    match edge_srf(&raw) {
+                        Ok(srf) => {
+                            self.doc
+                                .add_object_on_layer("EdgeSrf", lid, Geometry::Surface(srf));
+                            self.mark_scene_dirty();
+                            self.log("Created Coons NURBS EdgeSrf.");
+                        }
+                        Err(e) => self.log(format!("EdgeSrf error: {e}")),
+                    }
+                }
+            }
+            "networksrf" => {
+                let curves: Vec<(cad_doc::LayerId, NurbsCurve)> = self
+                    .doc
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                if curves.len() < 4 {
+                    self.log("Select 4 or more intersecting curves (2+ U, 2+ V) for NetworkSrf.");
+                } else {
+                    let lid = curves[0].0;
+                    let raw: Vec<NurbsCurve> = curves.into_iter().map(|c| c.1).collect();
+                    let tol = self.doc.tolerances.absolute.max(1e-2);
+                    if let Some((ug, vg)) = partition_network_curves(&raw, tol) {
+                        match network_srf(&ug, &vg) {
+                            Ok(srf) => {
+                                self.doc
+                                    .add_object_on_layer("NetworkSrf", lid, Geometry::Surface(srf));
+                                self.mark_scene_dirty();
+                                self.log(format!(
+                                    "Created Gordon NURBS NetworkSrf ({} U x {} V curves).",
+                                    ug.len(),
+                                    vg.len()
+                                ));
+                            }
+                            Err(e) => self.log(format!("NetworkSrf error: {e}")),
+                        }
+                    } else {
+                        self.log(
+                            "Could not partition curves into 2 crossing U/V families.",
+                        );
+                    }
+                }
+            }
+            "blendsrf" => {
+                let mut cont = Continuity::G2;
+                let mut bulge = 1.0_f64;
+                for arg in &args {
+                    match arg.to_ascii_lowercase().as_str() {
+                        "g0" => cont = Continuity::G0,
+                        "g1" => cont = Continuity::G1,
+                        "g2" => cont = Continuity::G2,
+                        "g3" => cont = Continuity::G3,
+                        _ => {
+                            if let Ok(v) = arg.parse::<f64>() {
+                                bulge = v.clamp(0.05, 5.0);
+                            }
+                        }
+                    }
+                }
+                let surfs: Vec<(cad_doc::LayerId, NurbsSurface)> = self
+                    .doc
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::Surface(s) => Some((o.layer_id, s.clone())),
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                if surfs.len() != 2 {
+                    self.log("Select 2 NURBS surfaces to BlendSrf [g0|g1|g2|g3] [bulge].");
+                } else {
+                    let (ea, eb) = closest_edge_pair(&surfs[0].1, &surfs[1].1);
+                    match blend_srf(&surfs[0].1, ea, &surfs[1].1, eb, cont, bulge, bulge) {
+                        Ok(blend) => {
+                            self.doc
+                                .add_object_on_layer("BlendSrf", surfs[0].0, Geometry::Surface(blend));
+                            self.mark_scene_dirty();
+                            self.log(format!("Created {} BlendSrf between closest edges.", cont.label()));
+                        }
+                        Err(e) => self.log(format!("BlendSrf error: {e}")),
+                    }
+                }
+            }
+            "matchsrf" => {
+                let cont = match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+                    Some("g0") => Continuity::G0,
+                    Some("g1") => Continuity::G1,
+                    Some("g3") => Continuity::G3,
+                    _ => Continuity::G2,
+                };
+                let surfs: Vec<(cad_doc::ObjectId, NurbsSurface)> = self
+                    .doc
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::Surface(s) => Some((id, s.clone())),
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                if surfs.len() != 2 {
+                    self.log("Select 2 NURBS surfaces (1st matched to 2nd): MatchSrf [g0|g1|g2].");
+                } else {
+                    let (ea, eb) = closest_edge_pair(&surfs[0].1, &surfs[1].1);
+                    match match_srf(&surfs[0].1, ea, &surfs[1].1, eb, cont) {
+                        Ok(matched) => {
+                            let id_a = surfs[0].0;
+                            let before = self.doc.objects[id_a].clone();
+                            self.doc.objects[id_a].geometry = Geometry::Surface(matched);
+                            self.doc.objects[id_a].refresh_aabb();
+                            self.doc.record_object_modified("MatchSrf", id_a, before);
+                            self.mark_scene_dirty();
+                            self.log(format!("Matched surface edge with {}.", cont.label()));
+                        }
+                        Err(e) => self.log(format!("MatchSrf error: {e}")),
+                    }
+                }
+            }
+            "offsetsrf" => {
+                let dist = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
+                let surfs: Vec<_> = self
+                    .doc
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::Surface(s) => Some((o.layer_id, s.clone())),
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                if surfs.is_empty() {
+                    self.log("Select NURBS surface(s) to OffsetSrf [distance].");
+                } else {
+                    let mut created = 0;
+                    for (lid, s) in &surfs {
+                        if let Ok(off) = offset_srf(s, dist) {
+                            self.doc
+                                .add_object_on_layer("OffsetSrf", *lid, Geometry::Surface(off));
+                            created += 1;
+                        }
+                    }
+                    self.mark_scene_dirty();
+                    self.log(format!("Offset {created} NURBS surface(s) by {dist:.3}."));
+                }
+            }
+            "extendsrf" => {
+                let len = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(2.0);
+                let edge = match args.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+                    Some("umin") => SurfaceEdge::UMin,
+                    Some("vmin") => SurfaceEdge::VMin,
+                    Some("vmax") => SurfaceEdge::VMax,
+                    _ => SurfaceEdge::UMax,
+                };
+                let ids: Vec<_> = self
+                    .doc
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter(|&id| {
+                        self.doc
+                            .objects
+                            .get(id)
+                            .is_some_and(|o| matches!(o.geometry, Geometry::Surface(_)))
+                    })
+                    .collect();
+                if ids.is_empty() {
+                    self.log("Select NURBS surface(s) to ExtendSrf [length] [umin|umax|vmin|vmax].");
+                } else {
+                    for id in ids {
+                        let before = self.doc.objects[id].clone();
+                        if let Geometry::Surface(s) = &before.geometry {
+                            match extend_srf(s, edge, len) {
+                                Ok(ext) => {
+                                    self.doc.objects[id].geometry = Geometry::Surface(ext);
+                                    self.doc.objects[id].refresh_aabb();
+                                    self.doc.record_object_modified("ExtendSrf", id, before);
+                                    self.log(format!("Extended surface edge {edge:?} by {len:.3}."));
+                                }
+                                Err(e) => self.log(format!("ExtendSrf error: {e}")),
+                            }
+                        }
+                    }
+                    self.mark_scene_dirty();
+                }
+            }
+            "patch" => {
+                let mut opts = PatchOptions::default();
+                for arg in &args {
+                    match arg.to_ascii_lowercase().as_str() {
+                        "g0" => opts.continuity = Continuity::G0,
+                        "g1" => opts.continuity = Continuity::G1,
+                        "g2" => opts.continuity = Continuity::G2,
+                        _ => {
+                            if let Ok(n) = arg.parse::<usize>() {
+                                let sp = n.clamp(2, 8);
+                                opts.spans_u = sp;
+                                opts.spans_v = sp;
+                            } else if let Ok(st) = arg.parse::<f64>() {
+                                opts.stiffness = st.clamp(0.0001, 5.0);
+                            }
+                        }
+                    }
+                }
+                let mut curves = Vec::new();
+                let mut ref_surfs = Vec::new();
+                let mut interior_pts = Vec::new();
+                let mut target_lid = self.doc.active_layer;
+                for id in self.doc.selected_ids_ordered() {
+                    if let Some(o) = self.doc.objects.get(id) {
+                        target_lid = o.layer_id;
+                        match &o.geometry {
+                            Geometry::Curve(c) => curves.push(c.clone()),
+                            Geometry::Point(p) => interior_pts.push(*p),
+                            Geometry::Surface(s) => ref_surfs.push(s.clone()),
+                            _ => {}
+                        }
+                    }
+                }
+                if curves.is_empty() && interior_pts.len() < 3 {
+                    self.log(
+                        "Select boundary curves (and optional interior points or reference surfaces) to run Patch [spans] [stiffness] [g0|g1|g2].",
+                    );
+                } else {
+                    let bcs: Vec<PatchBoundaryConstraint> = curves
+                        .into_iter()
+                        .map(|c| {
+                            let mid = c.evaluate(0.5 * (c.domain().0 + c.domain().1));
+                            let ref_surface = ref_surfs
+                                .iter()
+                                .filter_map(|rs| {
+                                    let (_, _, _, d) = rs.closest_point(mid);
+                                    (d < 0.25).then(|| (rs.clone(), SurfaceEdge::UMin))
+                                })
+                                .next();
+                            PatchBoundaryConstraint {
+                                curve: c,
+                                reference_surface: ref_surface,
+                            }
+                        })
+                        .collect();
+                    match patch_srf(&bcs, &interior_pts, &opts) {
+                        Ok(rep) => {
+                            self.doc.add_object_on_layer(
+                                "Patch",
+                                target_lid,
+                                Geometry::Surface(rep.surface),
+                            );
+                            self.mark_scene_dirty();
+                            self.log(format!(
+                                "Created NURBS Patch ({}x{} spans, {}, max dev {:.5}).",
+                                opts.spans_u,
+                                opts.spans_v,
+                                opts.continuity.label(),
+                                rep.max_deviation
+                            ));
+                        }
+                        Err(e) => self.log(format!("Patch error: {e}")),
+                    }
+                }
+            }
+            "rebuildsrf" => {
+                let nu = args.first().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8);
+                let nv = args.get(1).and_then(|v| v.parse::<usize>().ok()).unwrap_or(nu);
+                let du = args.get(2).and_then(|v| v.parse::<usize>().ok()).unwrap_or(3);
+                let dv = args.get(3).and_then(|v| v.parse::<usize>().ok()).unwrap_or(du);
+                let ids: Vec<_> = self
+                    .doc
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter(|&id| {
+                        self.doc
+                            .objects
+                            .get(id)
+                            .is_some_and(|o| matches!(o.geometry, Geometry::Surface(_)))
+                    })
+                    .collect();
+                if ids.is_empty() {
+                    self.log("Select NURBS surface(s) to RebuildSrf [u_count] [v_count] [deg_u] [deg_v].");
+                } else {
+                    for id in ids {
+                        let before = self.doc.objects[id].clone();
+                        if let Geometry::Surface(s) = &before.geometry {
+                            match rebuild_srf(s, nu, nv, du, dv) {
+                                Ok(rep) => {
+                                    self.doc.objects[id].geometry = Geometry::Surface(rep.surface);
+                                    self.doc.objects[id].refresh_aabb();
+                                    self.doc.record_object_modified("RebuildSrf", id, before);
+                                    self.log(format!(
+                                        "Rebuilt surface: {}x{} -> {}x{} CPs (deg {}x{}, max dev {:.5}).",
+                                        rep.old_u, rep.old_v, rep.new_u, rep.new_v, du, dv, rep.max_deviation
+                                    ));
+                                }
+                                Err(e) => self.log(format!("RebuildSrf error: {e}")),
+                            }
+                        }
+                    }
+                    self.mark_scene_dirty();
+                }
+            }
+            "dupborder" | "dupedge" => {
+                let join_loop = cmd == "dupborder";
+                let surfs: Vec<_> = self
+                    .doc
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::Surface(s) => Some((o.layer_id, s.clone())),
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                if surfs.is_empty() {
+                    self.log(format!("Select NURBS surface(s) first, then run {cmd}."));
+                } else {
+                    let mut created = 0usize;
+                    let tol = self.doc.tolerances.absolute.max(1e-3);
+                    for (lid, s) in &surfs {
+                        if let Ok(edges) = s.boundary_curves() {
+                            let curves = if join_loop {
+                                NurbsCurve::join_curves(&edges, tol)
+                            } else {
+                                edges.to_vec()
+                            };
+                            for c in curves {
+                                self.doc
+                                    .add_object_on_layer("DupEdge", *lid, Geometry::Curve(c));
+                                created += 1;
+                            }
+                        }
+                    }
+                    self.mark_scene_dirty();
+                    self.log(format!("Extracted {created} boundary curve(s)."));
+                }
+            }
+            "flip" => {
+                let ids: Vec<_> = self.doc.selected_ids_ordered();
+                let mut flipped = 0usize;
+                for id in ids {
+                    let before = self.doc.objects[id].clone();
+                    match &before.geometry {
+                        Geometry::Surface(s) => {
+                            self.doc.objects[id].geometry = Geometry::Surface(s.flip_normal());
+                            self.doc.objects[id].refresh_aabb();
+                            self.doc.record_object_modified("Flip", id, before);
+                            flipped += 1;
+                        }
+                        Geometry::Curve(c) => {
+                            self.doc.objects[id].geometry = Geometry::Curve(c.reverse());
+                            self.doc.objects[id].refresh_aabb();
+                            self.doc.record_object_modified("Flip", id, before);
+                            flipped += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                if flipped == 0 {
+                    self.log("Select NURBS surface(s) or curve(s) to Flip.");
+                } else {
+                    self.mark_scene_dirty();
+                    self.log(format!("Flipped {flipped} object(s)."));
+                }
+            }
+            "extractisocurve" => {
+                let is_u = !args.iter().any(|a| a.eq_ignore_ascii_case("v"));
+                let frac = args
+                    .iter()
+                    .find_map(|a| a.parse::<f64>().ok())
+                    .unwrap_or(0.5)
+                    .clamp(0.0, 1.0);
+                let surfs: Vec<_> = self
+                    .doc
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::Surface(s) => Some((o.layer_id, s.clone())),
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                if surfs.is_empty() {
+                    self.log("Select NURBS surface(s) to ExtractIsocurve [u|v] [t].");
+                } else {
+                    let mut created = 0;
+                    for (lid, s) in &surfs {
+                        let (d0, d1) = if is_u { s.domain_u() } else { s.domain_v() };
+                        let p = d0 + (d1 - d0) * frac;
+                        if let Ok(iso) = s.extract_isocurve(is_u, p) {
+                            self.doc.add_object_on_layer(
+                                "ExtractIsocurve",
+                                *lid,
+                                Geometry::Curve(iso),
+                            );
+                            created += 1;
+                        }
+                    }
+                    self.mark_scene_dirty();
+                    self.log(format!(
+                        "Extracted {created} {}-isocurve(s) at t={frac:.2}.",
+                        if is_u { "U" } else { "V" }
+                    ));
+                }
+            }
+            "splitsrf" => {
+                let split_u = !args.iter().any(|a| a.eq_ignore_ascii_case("v"));
+                let frac = args
+                    .iter()
+                    .find_map(|a| a.parse::<f64>().ok())
+                    .unwrap_or(0.5)
+                    .clamp(0.01, 0.99);
+                let ids: Vec<_> = self
+                    .doc
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter(|&id| {
+                        self.doc
+                            .objects
+                            .get(id)
+                            .is_some_and(|o| matches!(o.geometry, Geometry::Surface(_)))
+                    })
+                    .collect();
+                if ids.is_empty() {
+                    self.log("Select NURBS surface(s) to SplitSrf [u|v] [t].");
+                } else {
+                    let mut split_cnt = 0;
+                    for id in ids {
+                        let lid = self.doc.objects[id].layer_id;
+                        if let Geometry::Surface(s) = &self.doc.objects[id].geometry {
+                            let (d0, d1) = if split_u { s.domain_u() } else { s.domain_v() };
+                            let p = d0 + (d1 - d0) * frac;
+                            let res = if split_u { s.split_u(p) } else { s.split_v(p) };
+                            if let Some((a, b)) = res {
+                                self.doc.replace_object_with_many(
+                                    "SplitSrf",
+                                    id,
+                                    vec![(lid, Geometry::Surface(a)), (lid, Geometry::Surface(b))],
+                                );
+                                split_cnt += 1;
+                            }
+                        }
+                    }
+                    self.prune_points_on();
+                    self.mark_scene_dirty();
+                    self.log(format!(
+                        "Split {split_cnt} surface(s) along {}-isocurve.",
+                        if split_u { "U" } else { "V" }
+                    ));
+                }
+            }
+            "uvn" => {
+                match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+                    Some("on" | "1" | "true") => self.uvn_gumball_enabled = true,
+                    Some("off" | "0" | "false") => self.uvn_gumball_enabled = false,
+                    _ => self.uvn_gumball_enabled = !self.uvn_gumball_enabled,
+                }
+                self.log(format!(
+                    "UVN Gumball: {}.",
+                    if self.uvn_gumball_enabled { "On" } else { "Off" }
+                ));
+            }
+            "softtransform" => {
+                if args.is_empty() {
+                    self.soft_transform_enabled = !self.soft_transform_enabled;
+                } else {
+                    for arg in &args {
+                        match arg.to_ascii_lowercase().as_str() {
+                            "on" | "1" | "true" => self.soft_transform_enabled = true,
+                            "off" | "0" | "false" => self.soft_transform_enabled = false,
+                            "free" => self.soft_transform_lock = BoundaryLock::Free,
+                            "g0" => self.soft_transform_lock = BoundaryLock::FixG0,
+                            "g1" => self.soft_transform_lock = BoundaryLock::FixG1,
+                            "g2" => self.soft_transform_lock = BoundaryLock::FixG2,
+                            "smooth" => self.soft_transform_falloff = SoftTransformFalloff::Smooth,
+                            "linear" => self.soft_transform_falloff = SoftTransformFalloff::Linear,
+                            "sharp" => self.soft_transform_falloff = SoftTransformFalloff::Sharp,
+                            _ => {
+                                if let Ok(r) = arg.parse::<f64>() {
+                                    self.soft_transform_radius = r.clamp(0.1, 200.0);
+                                    self.soft_transform_enabled = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                self.log(format!(
+                    "NURBS Soft Transform: {} (radius={:.2}, lock={:?}, falloff={:?}).",
+                    if self.soft_transform_enabled { "On" } else { "Off" },
+                    self.soft_transform_radius,
+                    self.soft_transform_lock,
+                    self.soft_transform_falloff
+                ));
             }
             "booleanunion" | "booleandifference" | "booleanintersection" => {
                 let op = match cmd.as_str() {
@@ -226,16 +836,18 @@ impl ElephantApp {
                 };
                 let meshes: Vec<_> = self
                     .doc
-                    .objects
-                    .values()
-                    .filter(|o| o.selected)
-                    .filter_map(|o| match &o.geometry {
-                        Geometry::Mesh(m) => Some((o.layer_id, m.clone())),
-                        _ => None,
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::Mesh(m) => Some((o.layer_id, m.clone())),
+                            Geometry::Surface(s) => Some((o.layer_id, s.tessellate_display())),
+                            _ => None,
+                        })
                     })
                     .collect();
                 if meshes.len() < 2 {
-                    self.log("Select 2 or more solid meshes for Boolean operation.");
+                    self.log("Select 2 or more solids/surfaces for Boolean operation.");
                 } else {
                     let lid = meshes[0].0;
                     let mut acc = meshes[0].1.clone();
@@ -247,7 +859,7 @@ impl ElephantApp {
                         .add_object_on_layer("Boolean", lid, Geometry::Mesh(acc));
                     self.prune_points_on();
                     self.mark_scene_dirty();
-                    self.log(format!("Completed {cmd} on {} meshes.", meshes.len()));
+                    self.log(format!("Completed {cmd} on {} solids.", meshes.len()));
                 }
             }
             "pointson" => {
@@ -267,6 +879,9 @@ impl ElephantApp {
             }
             "pointsoff" => {
                 self.points_on_objects.clear();
+                self.selected_cps.clear();
+                self.uvn_drag = None;
+                self.uvn_prompt = None;
                 self.grip_drag = None;
                 self.log("Control points turned off.");
             }
@@ -677,22 +1292,16 @@ impl ElephantApp {
                 }
             }
             "rebuild" => {
-                let cp_count = args.first().and_then(|v| v.parse::<usize>().ok()).unwrap_or(10);
-                let degree = args.get(1).and_then(|v| v.parse::<usize>().ok()).unwrap_or(3);
-                let ids: Vec<_> = self
-                    .doc
-                    .objects
-                    .iter()
-                    .filter(|(_, o)| o.selected && matches!(o.geometry, Geometry::Curve(_)))
-                    .map(|(id, _)| id)
-                    .collect();
-                if ids.is_empty() {
-                    self.log("Select curve(s) to Rebuild [cp_count] [degree].");
-                } else {
-                    for id in ids {
-                        let before = self.doc.objects[id].clone();
-                        if let Geometry::Curve(c) = &before.geometry {
-                            match rebuild_uniform(c, cp_count, degree) {
+                let n0 = args.first().and_then(|v| v.parse::<usize>().ok()).unwrap_or(10);
+                let d0 = args.get(1).and_then(|v| v.parse::<usize>().ok()).unwrap_or(3);
+                let ids = self.doc.selected_ids_ordered();
+                let mut touched = 0usize;
+                for id in ids {
+                    let before = self.doc.objects[id].clone();
+                    match &before.geometry {
+                        Geometry::Curve(c) => {
+                            touched += 1;
+                            match rebuild_uniform(c, n0, d0) {
                                 Ok(rep) => {
                                     self.doc.objects[id].geometry = Geometry::Curve(rep.curve);
                                     self.doc.objects[id].refresh_aabb();
@@ -701,14 +1310,37 @@ impl ElephantApp {
                                         "Rebuilt curve: {} -> {} CPs (deg {}, max dev {:.5}).",
                                         rep.old_cp_count,
                                         rep.new_cp_count,
-                                        degree,
+                                        d0,
                                         rep.max_deviation
                                     ));
                                 }
                                 Err(e) => self.log(format!("Rebuild error: {e}")),
                             }
                         }
+                        Geometry::Surface(s) => {
+                            touched += 1;
+                            let nv = args.get(1).and_then(|v| v.parse::<usize>().ok()).unwrap_or(n0);
+                            let du = args.get(2).and_then(|v| v.parse::<usize>().ok()).unwrap_or(3);
+                            let dv = args.get(3).and_then(|v| v.parse::<usize>().ok()).unwrap_or(du);
+                            match rebuild_srf(s, n0, nv, du, dv) {
+                                Ok(rep) => {
+                                    self.doc.objects[id].geometry = Geometry::Surface(rep.surface);
+                                    self.doc.objects[id].refresh_aabb();
+                                    self.doc.record_object_modified("RebuildSrf", id, before);
+                                    self.log(format!(
+                                        "Rebuilt surface: {}x{} -> {}x{} CPs (max dev {:.5}).",
+                                        rep.old_u, rep.old_v, rep.new_u, rep.new_v, rep.max_deviation
+                                    ));
+                                }
+                                Err(e) => self.log(format!("RebuildSrf error: {e}")),
+                            }
+                        }
+                        _ => {}
                     }
+                }
+                if touched == 0 {
+                    self.log("Select curve(s) or NURBS surface(s) to Rebuild.");
+                } else {
                     self.mark_scene_dirty();
                 }
             }
@@ -800,45 +1432,78 @@ impl ElephantApp {
                 }
             }
             "changedegree" => {
-                let target_deg = args
+                let target_u = args
                     .first()
                     .and_then(|v| v.parse::<usize>().ok())
                     .unwrap_or(3)
                     .clamp(1, 7);
-                let ids: Vec<_> = self
-                    .doc
-                    .objects
-                    .iter()
-                    .filter(|(_, o)| o.selected && matches!(o.geometry, Geometry::Curve(_)))
-                    .map(|(id, _)| id)
-                    .collect();
-                if ids.is_empty() {
-                    self.log("Select curve(s) to ChangeDegree [degree].");
-                } else {
-                    for id in ids {
-                        let before = self.doc.objects[id].clone();
-                        if let Geometry::Curve(c) = &before.geometry {
-                            if target_deg > c.degree {
-                                if let Ok(elevated) = c.elevate_degree(target_deg - c.degree) {
+                let target_v = args
+                    .get(1)
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(target_u)
+                    .clamp(1, 7);
+                let ids = self.doc.selected_ids_ordered();
+                let mut touched = 0usize;
+                for id in ids {
+                    let before = self.doc.objects[id].clone();
+                    match &before.geometry {
+                        Geometry::Curve(c) => {
+                            touched += 1;
+                            if target_u > c.degree {
+                                if let Ok(elevated) = c.elevate_degree(target_u - c.degree) {
                                     self.doc.objects[id].geometry = Geometry::Curve(elevated);
                                     self.doc.objects[id].refresh_aabb();
                                     self.doc.record_object_modified("ChangeDegree", id, before);
-                                    self.log(format!("Elevated curve to degree {target_deg}."));
+                                    self.log(format!("Elevated curve to degree {target_u}."));
                                 }
-                            } else if target_deg < c.degree {
-                                if let Ok(rep) = rebuild_uniform(c, c.control_points.len(), target_deg)
+                            } else if target_u < c.degree {
+                                if let Ok(rep) = rebuild_uniform(c, c.control_points.len(), target_u)
                                 {
                                     self.doc.objects[id].geometry = Geometry::Curve(rep.curve);
                                     self.doc.objects[id].refresh_aabb();
                                     self.doc.record_object_modified("ChangeDegree", id, before);
                                     self.log(format!(
-                                        "Rebuilt curve to degree {target_deg} (max dev {:.5}).",
+                                        "Rebuilt curve to degree {target_u} (max dev {:.5}).",
                                         rep.max_deviation
                                     ));
                                 }
                             }
                         }
+                        Geometry::Surface(s) => {
+                            touched += 1;
+                            if target_u >= s.degree_u && target_v >= s.degree_v {
+                                if let Ok(elevated) = s
+                                    .elevate_degree(target_u - s.degree_u, target_v - s.degree_v)
+                                {
+                                    self.doc.objects[id].geometry = Geometry::Surface(elevated);
+                                    self.doc.objects[id].refresh_aabb();
+                                    self.doc.record_object_modified("ChangeDegree", id, before);
+                                    self.log(format!(
+                                        "Elevated surface to degree {target_u}x{target_v}."
+                                    ));
+                                }
+                            } else if let Ok(rep) = rebuild_srf(
+                                s,
+                                s.count_u.max(target_u + 1),
+                                s.count_v.max(target_v + 1),
+                                target_u,
+                                target_v,
+                            ) {
+                                self.doc.objects[id].geometry = Geometry::Surface(rep.surface);
+                                self.doc.objects[id].refresh_aabb();
+                                self.doc.record_object_modified("ChangeDegree", id, before);
+                                self.log(format!(
+                                    "Rebuilt surface to degree {target_u}x{target_v} (max dev {:.5}).",
+                                    rep.max_deviation
+                                ));
+                            }
+                        }
+                        _ => {}
                     }
+                }
+                if touched == 0 {
+                    self.log("Select curve(s) or surface(s) to ChangeDegree [deg_u] [deg_v].");
+                } else {
                     self.mark_scene_dirty();
                 }
             }
@@ -883,19 +1548,24 @@ impl ElephantApp {
                 let mut count = 0;
                 for obj in self.doc.objects.values() {
                     if obj.selected {
-                        if let Geometry::Curve(c) = &obj.geometry {
-                            if c.is_closed() {
+                        match &obj.geometry {
+                            Geometry::Curve(c) if c.is_closed() => {
                                 total += c.planar_area_approx(&cplane, 64);
                                 count += 1;
                             }
+                            Geometry::Surface(s) => {
+                                total += s.area_approx();
+                                count += 1;
+                            }
+                            _ => {}
                         }
                     }
                 }
                 if count == 0 {
-                    self.log("Select one or more closed planar curves to measure Area.");
+                    self.log("Select closed planar curve(s) or NURBS surface(s) to measure Area.");
                 } else {
                     self.log(format!(
-                        "Total planar area of {count} closed curve(s): {total:.4}"
+                        "Total area of {count} object(s): {total:.4}"
                     ));
                 }
             }
@@ -984,6 +1654,9 @@ impl ElephantApp {
             "new" => {
                 self.session.cancel();
                 self.points_on_objects.clear();
+                self.selected_cps.clear();
+                self.uvn_drag = None;
+                self.uvn_prompt = None;
                 self.curvature_graph_objects.clear();
                 self.grip_drag = None;
                 self.gumball_drag = None;
@@ -1027,7 +1700,7 @@ impl ElephantApp {
                 self.log(self.session.prompt());
             }
             "help" => {
-                self.log("Interactive: Line, Polyline, Curve, InterpCrv, HandleCurve, Conic, Helix, Rectangle, Arc, Circle, Polygon, Box, Cylinder, Cone, Revolve, Move, Copy, Rotate, Scale, Mirror, Offset, SplitCurve, Trim, InsertKnot, ArrayLinear, ArrayPolar, Distance, Dim, TextDot | Quick: Sphere, Torus, Plane, Extrude, PlanarSrf, Loft, BooleanUnion/Difference/Intersection, Join, Explode, Split, Fillet, Chamfer, BlendCrv, Match, Rebuild, RebuildAdaptive (Elmo), Fair, TweenCurves, ChangeDegree, CurvatureGraph, CurvatureGraphOff, PointsOn/Off, Units [mm|cm|m|in|ft], Wireframe/Shaded/Ghosted/Technical/Arctic, ZoomExtents (ZE), Undo, Redo, New");
+                self.log("Interactive: Line, Polyline, Curve, InterpCrv, HandleCurve, Conic, Helix, Rectangle, Arc, Circle, Polygon, Box, Cylinder, Cone, Revolve, RailRevolve, ExtractIsocurve, SplitSrf, Move, Copy, Rotate, Scale, Mirror, Offset, SplitCurve, Trim, InsertKnot, ArrayLinear, ArrayPolar, Distance, Dim, TextDot | Surfacing: Sphere, Torus, Plane, Extrude, PlanarSrf, Loft, Sweep1, Sweep2, EdgeSrf, NetworkSrf, BlendSrf, MatchSrf, OffsetSrf, ExtendSrf, Patch, RebuildSrf, DupBorder, DupEdge, Flip | NURBS Editing: PointsOn/Off, UVN, SoftTransform, Join, Explode, Split, Fillet, Chamfer, BlendCrv, Match, Rebuild, RebuildAdaptive (Elmo), Fair, TweenCurves, ChangeDegree, CurvatureGraph, Area, BooleanUnion/Difference/Intersection, Units [mm|cm|m|in|ft], ZoomExtents (ZE), Undo, Redo");
             }
             _ => {
                 self.log(format!(

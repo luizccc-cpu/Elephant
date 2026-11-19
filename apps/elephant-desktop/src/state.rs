@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use cad_commands::{CommandSession, SnapConfig, SnapKind};
 use cad_doc::{CadObject, Document, ObjectId};
-use cad_geom::{DVec3, Geometry, NurbsCurve, Plane, TriangleMesh, UnitSystem};
+use cad_geom::{
+    BoundaryLock, DVec3, Geometry, NurbsCurve, NurbsSurface, Plane, SoftTransformFalloff,
+    TriangleMesh, UnitSystem,
+};
 use cad_io::{
     ProjectMetadata, export_from_document, import_into_document, open_project_with_meta,
     save_project_file_with_meta,
@@ -36,6 +39,24 @@ pub const KNOWN_COMMANDS: &[&str] = &[
     "PlanarSrf",
     "Loft",
     "Revolve",
+    "RailRevolve",
+    "Sweep1",
+    "Sweep2",
+    "EdgeSrf",
+    "NetworkSrf",
+    "BlendSrf",
+    "MatchSrf",
+    "OffsetSrf",
+    "ExtendSrf",
+    "Patch",
+    "RebuildSrf",
+    "SplitSrf",
+    "ExtractIsocurve",
+    "DupBorder",
+    "DupEdge",
+    "Flip",
+    "UVN",
+    "SoftTransform",
     "BooleanUnion",
     "BooleanDifference",
     "BooleanIntersection",
@@ -151,9 +172,33 @@ pub struct NamedView {
 pub struct GripDrag {
     pub viewport_idx: usize,
     pub object_id: ObjectId,
-    pub cp_index: usize,
-    pub last_world: DVec3,
+    pub start_world: DVec3,
+    pub cp_weights: Vec<f64>,
     pub before_snapshot: CadObject,
+}
+
+#[derive(Debug, Clone)]
+pub struct UvnGumballDrag {
+    pub viewport_idx: usize,
+    pub object_id: ObjectId,
+    pub axis: usize,
+    pub axis_dir: DVec3,
+    pub axis_screen_dir: egui::Vec2,
+    pub px_per_world: f64,
+    pub last_pos: egui::Pos2,
+    pub total_amount: f64,
+    pub moved: bool,
+    pub cp_weights: Vec<f64>,
+    pub before_snapshot: CadObject,
+}
+
+#[derive(Debug, Clone)]
+pub struct UvnNumericPrompt {
+    pub object_id: ObjectId,
+    pub axis: usize,
+    pub axis_dir: DVec3,
+    pub text: String,
+    pub just_opened: bool,
 }
 
 pub struct ElephantApp {
@@ -170,6 +215,15 @@ pub struct ElephantApp {
     pub gumball_prompt: Option<GumballNumericPrompt>,
     pub marquee: Option<MarqueeDrag>,
     pub points_on_objects: HashSet<ObjectId>,
+    pub selected_cps: Vec<(ObjectId, usize)>,
+    pub uvn_gumball_enabled: bool,
+    pub uvn_normal_drag_strength: f64,
+    pub soft_transform_enabled: bool,
+    pub soft_transform_radius: f64,
+    pub soft_transform_falloff: SoftTransformFalloff,
+    pub soft_transform_lock: BoundaryLock,
+    pub uvn_drag: Option<UvnGumballDrag>,
+    pub uvn_prompt: Option<UvnNumericPrompt>,
     pub curvature_graph_objects: HashSet<ObjectId>,
     pub curvature_graph_scale: f64,
     pub grip_drag: Option<GripDrag>,
@@ -216,6 +270,15 @@ impl ElephantApp {
             gumball_prompt: None,
             marquee: None,
             points_on_objects: HashSet::new(),
+            selected_cps: Vec::new(),
+            uvn_gumball_enabled: true,
+            uvn_normal_drag_strength: 0.35,
+            soft_transform_enabled: false,
+            soft_transform_radius: 3.0,
+            soft_transform_falloff: SoftTransformFalloff::Smooth,
+            soft_transform_lock: BoundaryLock::FixG1,
+            uvn_drag: None,
+            uvn_prompt: None,
             curvature_graph_objects: HashSet::new(),
             curvature_graph_scale: 1.0,
             grip_drag: None,
@@ -259,17 +322,13 @@ impl ElephantApp {
             obj.name = Some("Box_01".to_string());
         }
 
-        let sphere_id = self.doc.add_object(
-            "StarterSphere",
-            Geometry::Mesh(TriangleMesh::from_sphere(
-                DVec3::new(4.5, 0.0, 1.5),
-                1.5,
-                24,
-                16,
-            )),
-        );
-        if let Some(obj) = self.doc.objects.get_mut(sphere_id) {
-            obj.name = Some("Sphere_01".to_string());
+        if let Ok(sphere_srf) = NurbsSurface::sphere(DVec3::new(4.5, 0.0, 1.5), 1.5) {
+            let sphere_id = self
+                .doc
+                .add_object("StarterSphere", Geometry::Surface(sphere_srf));
+            if let Some(obj) = self.doc.objects.get_mut(sphere_id) {
+                obj.name = Some("Sphere_01".to_string());
+            }
         }
 
         if let Ok(circle) = NurbsCurve::circle(&Plane::world_xy(), 4.5) {
@@ -300,6 +359,8 @@ impl ElephantApp {
     pub fn prune_points_on(&mut self) {
         self.points_on_objects
             .retain(|id| self.doc.objects.get(*id).is_some_and(|o| o.visible));
+        self.selected_cps
+            .retain(|(oid, _)| self.points_on_objects.contains(oid));
         self.curvature_graph_objects
             .retain(|id| self.doc.objects.get(*id).is_some_and(|o| o.visible));
     }
@@ -362,6 +423,9 @@ impl ElephantApp {
                 Ok((doc, meta)) => {
                     self.session.cancel();
                     self.points_on_objects.clear();
+                    self.selected_cps.clear();
+                    self.uvn_drag = None;
+                    self.uvn_prompt = None;
                     self.curvature_graph_objects.clear();
                     self.grip_drag = None;
                     self.gumball_drag = None;
@@ -483,7 +547,11 @@ impl ElephantApp {
             let mut snap_marker = None;
             if self.session.is_active() {
                 let cplane = self.cameras[self.active_viewport].cplane;
-                previews.extend(self.session.preview_geometry(self.cursor_world, &cplane));
+                previews.extend(self.session.preview_geometry_with_doc(
+                    self.cursor_world,
+                    &cplane,
+                    &self.doc,
+                ));
                 if self.last_snap_kind.is_some() {
                     snap_marker = self.cursor_world;
                 }

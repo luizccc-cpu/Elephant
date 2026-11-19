@@ -19,7 +19,7 @@ pub fn export_stl_bytes(doc: &Document) -> Vec<u8> {
         match &obj.geometry {
             Geometry::Mesh(m) => collect_mesh_tris(m, &mut tris),
             Geometry::Surface(s) => {
-                let m = s.tessellate(24, 8);
+                let m = s.tessellate_display();
                 collect_mesh_tris(&m, &mut tris);
             }
             _ => {}
