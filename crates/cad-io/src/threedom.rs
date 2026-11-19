@@ -142,6 +142,7 @@ pub fn import_3dm_bytes(bytes: &[u8], doc: &mut Document) -> Result<usize, IoErr
                         color,
                         visible,
                         locked,
+                        parent: None,
                     });
                     if first_id.is_none() {
                         first_id = Some(lid);

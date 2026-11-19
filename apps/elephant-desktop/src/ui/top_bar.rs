@@ -1,3 +1,4 @@
+use cad_commands::{AxisLockMode, CommandOptionKind};
 use cad_render::DisplayMode;
 use eframe::egui;
 
@@ -240,6 +241,12 @@ impl ElephantApp {
                         }
                     });
                     ui.separator();
+                    ui.checkbox(&mut self.show_left_palette, "Left Tool Palette");
+                    if ui.button("Radial Quick Menu (Q)").clicked() {
+                        self.radial_menu_pos = Some(ui.ctx().screen_rect().center());
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Zoom Extents").clicked() {
                         self.zoom_extents_all();
                         ui.close_menu();
@@ -364,6 +371,10 @@ impl ElephantApp {
                 }
                 if self.session.is_active() && ui.small_button("Cancel (Esc)").clicked() {
                     let msg = self.session.cancel();
+                    self.snap.clear_smart_track();
+                    self.snap.axis_lock = AxisLockMode::None;
+                    self.last_inference_guides.clear();
+                    self.smart_track_hover = None;
                     self.log(msg);
                 }
                 ui.separator();
@@ -373,6 +384,111 @@ impl ElephantApp {
                     }
                 }
             });
+
+            if self.session.is_active() {
+                let options = self.session.active_options();
+                let axis_label = match self.snap.axis_lock {
+                    AxisLockMode::None => "Off",
+                    AxisLockMode::X => "X",
+                    AxisLockMode::Y => "Y",
+                    AxisLockMode::Z => "Z",
+                };
+                let st_count = self.snap.smart_track_points.len();
+                if !options.is_empty() || self.snap.axis_lock != AxisLockMode::None || st_count > 0 {
+                    let mut pending_opt: Option<(String, String)> = None;
+                    let mut cycle_axis = false;
+                    let mut clear_st = false;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new("Options:")
+                                .small()
+                                .strong()
+                                .color(egui::Color32::from_rgb(165, 195, 225)),
+                        );
+                        for opt in &options {
+                            match &opt.kind {
+                                CommandOptionKind::Toggle(val) => {
+                                    let text = format!("{}: {}", opt.label, if *val { "Yes" } else { "No" });
+                                    if ui.selectable_label(*val, text).clicked() {
+                                        pending_opt = Some((opt.key.to_string(), (!*val).to_string()));
+                                    }
+                                }
+                                CommandOptionKind::Int { value, min, max } => {
+                                    ui.label(egui::RichText::new(format!("{}:", opt.label)).small());
+                                    if ui.small_button("-").clicked() {
+                                        pending_opt = Some((opt.key.to_string(), (value - 1).max(*min).to_string()));
+                                    }
+                                    ui.label(egui::RichText::new(value.to_string()).small().strong());
+                                    if ui.small_button("+").clicked() {
+                                        pending_opt = Some((opt.key.to_string(), (value + 1).min(*max).to_string()));
+                                    }
+                                }
+                                CommandOptionKind::Float { value, step, suffix } => {
+                                    ui.label(egui::RichText::new(format!("{}:", opt.label)).small());
+                                    if ui.small_button("-").clicked() {
+                                        pending_opt = Some((opt.key.to_string(), format!("{:.3}", value - step)));
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(format!("{:.2}{}", value, suffix))
+                                            .small()
+                                            .strong(),
+                                    );
+                                    if ui.small_button("+").clicked() {
+                                        pending_opt = Some((opt.key.to_string(), format!("{:.3}", value + step)));
+                                    }
+                                }
+                                CommandOptionKind::Choice { current, choices } => {
+                                    let idx = choices.iter().position(|c| *c == *current).unwrap_or(0);
+                                    let next = choices[(idx + 1) % choices.len().max(1)];
+                                    if ui
+                                        .small_button(format!("{}: {}", opt.label, current))
+                                        .on_hover_text("Click to cycle option")
+                                        .clicked()
+                                    {
+                                        pending_opt = Some((opt.key.to_string(), next.to_string()));
+                                    }
+                                }
+                            }
+                        }
+                        if ui
+                            .selectable_label(
+                                self.snap.axis_lock != AxisLockMode::None,
+                                format!("Axis: {axis_label}"),
+                            )
+                            .on_hover_text("Cycle axis lock (or use Arrow Right / Left / Up)")
+                            .clicked()
+                        {
+                            cycle_axis = true;
+                        }
+                        if st_count > 0
+                            && ui
+                                .small_button(format!("Clear SmartTrack ({st_count})"))
+                                .on_hover_text("Clear temporary SmartTrack reference points (Shift+T)")
+                                .clicked()
+                        {
+                            clear_st = true;
+                        }
+                    });
+                    if let Some((k, v)) = pending_opt {
+                        if let Some(msg) = self.session.apply_option(&k, &v) {
+                            self.log(msg);
+                        }
+                    }
+                    if cycle_axis {
+                        self.snap.axis_lock = match self.snap.axis_lock {
+                            AxisLockMode::None => AxisLockMode::X,
+                            AxisLockMode::X => AxisLockMode::Y,
+                            AxisLockMode::Y => AxisLockMode::Z,
+                            AxisLockMode::Z => AxisLockMode::None,
+                        };
+                    }
+                    if clear_st {
+                        self.snap.clear_smart_track();
+                        self.last_inference_guides.clear();
+                        self.smart_track_hover = None;
+                    }
+                }
+            }
 
             let typed = self.command_input.trim().to_ascii_lowercase();
             if !typed.is_empty() && !self.session.is_active() {

@@ -1,5 +1,6 @@
 use cad_math::linalg::solve_least_squares_vec3;
 use cad_math::{Continuity, DVec3, PARAM_EPSILON, Plane};
+use serde::{Deserialize, Serialize};
 
 use crate::error::GeomError;
 use crate::nurbs_curve::{
@@ -14,7 +15,7 @@ pub struct CurveIntersection {
     pub distance: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OffsetCornerStyle {
     Sharp,
     Round,

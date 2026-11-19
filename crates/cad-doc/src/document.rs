@@ -1,8 +1,11 @@
+use std::collections::{HashSet, VecDeque};
+
 use cad_geom::{Aabb, DMat4, DVec3, Geometry, Ray, Tolerances, UnitSystem};
 use slotmap::SlotMap;
 
 use crate::history::{UndoAction, UndoHistory, UndoTransaction};
 use crate::layer::{Layer, LayerId};
+use crate::modeling_history::{HistoryOp, HistoryRecord};
 use crate::object::{AnnotationItem, CadObject, ObjectId, ObjectStore};
 use crate::spatial::{SpatialEntry, SpatialIndex};
 
@@ -15,6 +18,8 @@ pub struct Document {
     pub objects: ObjectStore,
     pub annotations: Vec<AnnotationItem>,
     pub last_created: Vec<ObjectId>,
+    pub record_history: bool,
+    pub history_records: Vec<HistoryRecord>,
     selection_order: Vec<ObjectId>,
     next_group_id: u64,
     spatial: SpatialIndex,
@@ -40,6 +45,8 @@ impl Document {
             objects: ObjectStore::new(),
             annotations: Vec::new(),
             last_created: Vec::new(),
+            record_history: true,
+            history_records: Vec::new(),
             selection_order: Vec::new(),
             next_group_id: 1,
             spatial: SpatialIndex::default(),
@@ -85,20 +92,101 @@ impl Document {
     pub fn visible_bounding_box(&self) -> Aabb {
         let mut total = Aabb::EMPTY;
         for (_, obj) in &self.objects {
-            if !obj.visible {
+            if !obj.visible || !self.is_layer_effectively_visible(obj.layer_id) {
                 continue;
             }
-            if let Some(layer) = self.layers.get(obj.layer_id) {
-                if layer.visible {
-                    total = total.union(&obj.aabb);
-                }
-            }
+            total = total.union(&obj.aabb);
         }
         total
     }
 
     pub fn add_layer(&mut self, name: impl Into<String>, color: [u8; 4]) -> LayerId {
         self.layers.insert(Layer::new(name, color))
+    }
+
+    pub fn add_sublayer(
+        &mut self,
+        name: impl Into<String>,
+        color: [u8; 4],
+        parent: LayerId,
+    ) -> LayerId {
+        self.layers.insert(Layer::new_child(name, color, parent))
+    }
+
+    pub fn is_layer_effectively_visible(&self, lid: LayerId) -> bool {
+        let mut cur = Some(lid);
+        for _ in 0..32 {
+            let Some(id) = cur else {
+                break;
+            };
+            let Some(layer) = self.layers.get(id) else {
+                return false;
+            };
+            if !layer.visible {
+                return false;
+            }
+            cur = layer.parent;
+        }
+        true
+    }
+
+    pub fn is_layer_effectively_locked(&self, lid: LayerId) -> bool {
+        let mut cur = Some(lid);
+        for _ in 0..32 {
+            let Some(id) = cur else {
+                break;
+            };
+            let Some(layer) = self.layers.get(id) else {
+                return false;
+            };
+            if layer.locked {
+                return true;
+            }
+            cur = layer.parent;
+        }
+        false
+    }
+
+    pub fn ordered_layer_tree(&self) -> Vec<(LayerId, usize)> {
+        let all_ids: Vec<LayerId> = self.layers.keys().collect();
+        let mut out = Vec::with_capacity(all_ids.len());
+        let mut visited = HashSet::with_capacity(all_ids.len());
+        for &id in &all_ids {
+            let is_root = self
+                .layers
+                .get(id)
+                .and_then(|l| l.parent)
+                .is_none_or(|p| !self.layers.contains_key(p) || p == id);
+            if is_root {
+                self.collect_layer_children(id, 0, &all_ids, &mut visited, &mut out);
+            }
+        }
+        // Append any cyclic orphans cleanly
+        for &id in &all_ids {
+            if !visited.contains(&id) {
+                out.push((id, 0));
+            }
+        }
+        out
+    }
+
+    fn collect_layer_children(
+        &self,
+        id: LayerId,
+        depth: usize,
+        all_ids: &[LayerId],
+        visited: &mut HashSet<LayerId>,
+        out: &mut Vec<(LayerId, usize)>,
+    ) {
+        if !visited.insert(id) || depth > 32 {
+            return;
+        }
+        out.push((id, depth));
+        for &cand in all_ids {
+            if self.layers.get(cand).and_then(|l| l.parent) == Some(id) {
+                self.collect_layer_children(cand, depth + 1, all_ids, visited, out);
+            }
+        }
     }
 
     pub fn add_annotation(&mut self, item: AnnotationItem) {
@@ -163,7 +251,7 @@ impl Document {
             return 0;
         }
         let mut actions = Vec::with_capacity(selected.len());
-        for id in selected {
+        for &id in &selected {
             if let Some(obj) = self.objects.get_mut(id) {
                 let before = obj.clone();
                 obj.geometry.transform(mat);
@@ -172,7 +260,8 @@ impl Document {
                 actions.push(UndoAction::Modified { id, before, after });
             }
         }
-        let count = actions.len();
+        let count = selected.len();
+        self.apply_history_replay(&selected, &mut actions);
         self.history.push(UndoTransaction {
             label: label.into(),
             actions,
@@ -189,9 +278,11 @@ impl Document {
         before: CadObject,
     ) {
         if let Some(after) = self.objects.get(id).cloned() {
+            let mut actions = vec![UndoAction::Modified { id, before, after }];
+            self.apply_history_replay(&[id], &mut actions);
             self.history.push(UndoTransaction {
                 label: label.into(),
-                actions: vec![UndoAction::Modified { id, before, after }],
+                actions,
             });
             self.rebuild_spatial_index();
         }
@@ -290,11 +381,8 @@ impl Document {
             if !obj.visible {
                 continue;
             }
-            let unlocked = self
-                .layers
-                .get(obj.layer_id)
-                .map(|l| l.visible && !l.locked)
-                .unwrap_or(true);
+            let unlocked = layer_effectively_visible(&self.layers, obj.layer_id)
+                && !layer_effectively_locked(&self.layers, obj.layer_id);
             if unlocked {
                 obj.selected = true;
                 count += 1;
@@ -308,11 +396,8 @@ impl Document {
         let mut count = 0;
         for (_, obj) in &mut self.objects {
             let selectable = obj.visible
-                && self
-                    .layers
-                    .get(obj.layer_id)
-                    .map(|l| l.visible && !l.locked)
-                    .unwrap_or(true);
+                && layer_effectively_visible(&self.layers, obj.layer_id)
+                && !layer_effectively_locked(&self.layers, obj.layer_id);
             if selectable {
                 obj.selected = !obj.selected;
                 if obj.selected {
@@ -348,11 +433,8 @@ impl Document {
         let mut count = 0;
         for (_, obj) in &mut self.objects {
             let selectable = obj.visible
-                && self
-                    .layers
-                    .get(obj.layer_id)
-                    .map(|l| l.visible && !l.locked)
-                    .unwrap_or(true);
+                && layer_effectively_visible(&self.layers, obj.layer_id)
+                && !layer_effectively_locked(&self.layers, obj.layer_id);
             if selectable && pred(&obj.geometry) {
                 obj.selected = true;
                 count += 1;
@@ -482,13 +564,10 @@ impl Document {
             let Some(obj) = self.objects.get(id) else {
                 continue;
             };
-            if !obj.visible {
-                continue;
-            }
-            let Some(layer) = self.layers.get(obj.layer_id) else {
-                continue;
-            };
-            if !layer.visible || layer.locked {
+            if !obj.visible
+                || !self.is_layer_effectively_visible(obj.layer_id)
+                || self.is_layer_effectively_locked(obj.layer_id)
+            {
                 continue;
             }
             match &obj.geometry {
@@ -628,6 +707,160 @@ impl Document {
         self.history.can_redo()
     }
 
+    pub fn add_history_record(
+        &mut self,
+        child_id: ObjectId,
+        parent_ids: Vec<ObjectId>,
+        op: HistoryOp,
+    ) {
+        if !self.record_history || parent_ids.is_empty() || parent_ids.contains(&child_id) {
+            return;
+        }
+        self.history_records.retain(|r| r.child_id != child_id);
+        self.history_records.push(HistoryRecord {
+            child_id,
+            parent_ids,
+            op,
+        });
+    }
+
+    pub fn break_history_for(&mut self, child_id: ObjectId) -> bool {
+        let before = self.history_records.len();
+        self.history_records.retain(|r| r.child_id != child_id);
+        self.history_records.len() != before
+    }
+
+    pub fn purge_broken_history(&mut self) -> usize {
+        let before = self.history_records.len();
+        self.history_records.retain(|r| {
+            self.objects.get(r.child_id).is_some()
+                && !r.parent_ids.is_empty()
+                && r.parent_ids.iter().all(|&pid| self.objects.get(pid).is_some())
+        });
+        before - self.history_records.len()
+    }
+
+    pub fn history_record_for(&self, child_id: ObjectId) -> Option<&HistoryRecord> {
+        self.history_records.iter().find(|r| r.child_id == child_id)
+    }
+
+    pub fn history_children_of(&self, parent_id: ObjectId) -> Vec<ObjectId> {
+        self.history_records
+            .iter()
+            .filter(|r| r.parent_ids.contains(&parent_id))
+            .map(|r| r.child_id)
+            .collect()
+    }
+
+    pub fn update_history_op(&mut self, child_id: ObjectId, new_op: HistoryOp) -> bool {
+        let Some(pos) = self
+            .history_records
+            .iter()
+            .position(|r| r.child_id == child_id)
+        else {
+            return false;
+        };
+        let parent_ids = self.history_records[pos].parent_ids.clone();
+        self.history_records[pos].op = new_op.clone();
+
+        let parent_geoms: Option<Vec<Geometry>> = parent_ids
+            .iter()
+            .map(|&pid| self.objects.get(pid).map(|o| o.geometry.clone()))
+            .collect();
+        let Some(parent_geoms) = parent_geoms else {
+            return false;
+        };
+        let parent_refs: Vec<&Geometry> = parent_geoms.iter().collect();
+        let tol = self.tolerances.absolute.max(1e-4);
+        let Some(new_geom) = new_op.evaluate(&parent_refs, tol) else {
+            return false;
+        };
+        let Some(obj) = self.objects.get_mut(child_id) else {
+            return false;
+        };
+        let before = obj.clone();
+        obj.geometry = new_geom;
+        obj.refresh_aabb();
+        let after = obj.clone();
+
+        let mut actions = vec![UndoAction::Modified {
+            id: child_id,
+            before,
+            after,
+        }];
+        self.apply_history_replay(&[child_id], &mut actions);
+        self.history.push(UndoTransaction {
+            label: "Edit History".to_string(),
+            actions,
+        });
+        self.rebuild_spatial_index();
+        true
+    }
+
+    fn apply_history_replay(
+        &mut self,
+        modified_ids: &[ObjectId],
+        undo_actions: &mut Vec<UndoAction>,
+    ) -> Vec<ObjectId> {
+        if self.history_records.is_empty() || modified_ids.is_empty() {
+            return Vec::new();
+        }
+        // Non-blocking detach: editing a child directly without its parents breaks its link cleanly.
+        for &mid in modified_ids {
+            let should_break = self
+                .history_records
+                .iter()
+                .find(|r| r.child_id == mid)
+                .is_some_and(|rec| !rec.parent_ids.iter().any(|pid| modified_ids.contains(pid)));
+            if should_break {
+                self.break_history_for(mid);
+            }
+        }
+
+        let tol = self.tolerances.absolute.max(1e-4);
+        let mut queue: VecDeque<ObjectId> = modified_ids.iter().copied().collect();
+        let mut updated_set: HashSet<ObjectId> = modified_ids.iter().copied().collect();
+        let mut updated = Vec::new();
+
+        while let Some(cur_id) = queue.pop_front() {
+            let matching: Vec<(ObjectId, Vec<ObjectId>, HistoryOp)> = self
+                .history_records
+                .iter()
+                .filter(|r| r.parent_ids.contains(&cur_id) && !updated_set.contains(&r.child_id))
+                .map(|r| (r.child_id, r.parent_ids.clone(), r.op.clone()))
+                .collect();
+
+            for (child_id, parent_ids, op) in matching {
+                let parent_geoms: Option<Vec<Geometry>> = parent_ids
+                    .iter()
+                    .map(|&pid| self.objects.get(pid).map(|o| o.geometry.clone()))
+                    .collect();
+                let Some(parent_geoms) = parent_geoms else {
+                    continue;
+                };
+                let parent_refs: Vec<&Geometry> = parent_geoms.iter().collect();
+                let Some(new_geom) = op.evaluate(&parent_refs, tol) else {
+                    continue;
+                };
+                if let Some(obj) = self.objects.get_mut(child_id) {
+                    let before = obj.clone();
+                    obj.geometry = new_geom;
+                    obj.refresh_aabb();
+                    let after = obj.clone();
+                    undo_actions.push(UndoAction::Modified {
+                        id: child_id,
+                        before,
+                        after,
+                    });
+                    updated_set.insert(child_id);
+                    updated.push(child_id);
+                    queue.push_back(child_id);
+                }
+            }
+        }
+        updated
+    }
+
     pub fn rebuild_spatial_index(&mut self) {
         let entries = self
             .objects
@@ -636,6 +869,40 @@ impl Document {
             .collect();
         self.spatial.rebuild(entries);
     }
+}
+
+fn layer_effectively_visible(layers: &SlotMap<LayerId, Layer>, lid: LayerId) -> bool {
+    let mut cur = Some(lid);
+    for _ in 0..32 {
+        let Some(id) = cur else {
+            break;
+        };
+        let Some(layer) = layers.get(id) else {
+            return false;
+        };
+        if !layer.visible {
+            return false;
+        }
+        cur = layer.parent;
+    }
+    true
+}
+
+fn layer_effectively_locked(layers: &SlotMap<LayerId, Layer>, lid: LayerId) -> bool {
+    let mut cur = Some(lid);
+    for _ in 0..32 {
+        let Some(id) = cur else {
+            break;
+        };
+        let Some(layer) = layers.get(id) else {
+            return false;
+        };
+        if layer.locked {
+            return true;
+        }
+        cur = layer.parent;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -787,5 +1054,90 @@ mod tests {
         doc.undo();
         assert!(doc.objects.get(c).is_none());
         assert_eq!(doc.selected_ids_ordered(), vec![b]);
+    }
+
+    #[test]
+    fn nested_sublayers_inherit_visibility_and_lock() {
+        let mut doc = Document::new();
+        let root = doc.add_layer("Root", [200, 200, 200, 255]);
+        let sub = doc.add_sublayer("Sub", [100, 200, 255, 255], root);
+        let leaf = doc.add_sublayer("Leaf", [255, 180, 100, 255], sub);
+
+        let tree = doc.ordered_layer_tree();
+        let sub_pos = tree.iter().position(|&(id, _)| id == sub).unwrap();
+        let leaf_pos = tree.iter().position(|&(id, _)| id == leaf).unwrap();
+        assert_eq!(tree[sub_pos].1, 1);
+        assert_eq!(tree[leaf_pos].1, 2);
+        assert!(leaf_pos > sub_pos);
+
+        let oid = doc.add_object_on_layer(
+            "Box",
+            leaf,
+            Geometry::Mesh(TriangleMesh::from_box(DVec3::ZERO, DVec3::splat(2.0))),
+        );
+        let ray = Ray::new(DVec3::new(0.0, 0.0, 10.0), DVec3::new(0.0, 0.0, -1.0));
+        assert_eq!(doc.pick_ray(&ray), Some(oid));
+
+        doc.layers[root].visible = false;
+        assert!(!doc.is_layer_effectively_visible(leaf));
+        assert_eq!(doc.pick_ray(&ray), None);
+        doc.layers[root].visible = true;
+
+        doc.layers[sub].locked = true;
+        assert!(doc.is_layer_effectively_locked(leaf));
+        assert_eq!(doc.pick_ray(&ray), None);
+    }
+
+    #[test]
+    fn modeling_history_updates_extrude_and_mirror_and_breaks_on_direct_child_edit() {
+        use cad_geom::{NurbsCurve, NurbsSurface};
+        let mut doc = Document::new();
+        let line = NurbsCurve::line(DVec3::ZERO, DVec3::new(4.0, 0.0, 0.0));
+        let p_id = doc.add_object("Profile", Geometry::Curve(line.clone()));
+
+        let ext_srf = NurbsSurface::extrude_curve(&line, DVec3::new(0.0, 0.0, 5.0));
+        let ext_id = doc.add_object("Extrude", Geometry::Surface(ext_srf));
+        doc.add_history_record(
+            ext_id,
+            vec![p_id],
+            HistoryOp::Extrude {
+                direction: DVec3::new(0.0, 0.0, 5.0),
+                solid: false,
+            },
+        );
+
+        let mir_op = HistoryOp::Mirror {
+            plane_origin: DVec3::ZERO,
+            plane_normal: DVec3::X,
+        };
+        let mir_geom = mir_op.evaluate(&[&doc.objects[ext_id].geometry], 1e-4).unwrap();
+        let mir_id = doc.add_object("Mirror", mir_geom);
+        doc.add_history_record(mir_id, vec![ext_id], mir_op);
+
+        // Moving parent line in +Y propagates through Extrude AND chained Mirror
+        doc.clear_selection();
+        doc.set_selected(p_id, true);
+        doc.transform_selected("MoveParent", &DMat4::from_translation(DVec3::new(0.0, 6.0, 0.0)));
+        assert!((doc.objects[ext_id].aabb.center().y - 6.0).abs() < 1e-6);
+        assert!((doc.objects[mir_id].aabb.center().y - 6.0).abs() < 1e-6);
+
+        // Single Undo reverts parent AND children together cleanly!
+        assert_eq!(doc.undo().as_deref(), Some("MoveParent"));
+        assert!((doc.objects[p_id].aabb.center().y - 0.0).abs() < 1e-6);
+        assert!((doc.objects[ext_id].aabb.center().y - 0.0).abs() < 1e-6);
+        assert!((doc.objects[mir_id].aabb.center().y - 0.0).abs() < 1e-6);
+
+        // Directly transforming child breaks history link smoothly without blocking edit
+        doc.clear_selection();
+        doc.set_selected(ext_id, true);
+        doc.transform_selected("DirectMoveChild", &DMat4::from_translation(DVec3::new(0.0, 2.0, 0.0)));
+        assert!(doc.history_record_for(ext_id).is_none());
+        assert!((doc.objects[mir_id].aabb.center().y - 2.0).abs() < 1e-6);
+
+        // Now moving parent no longer alters detached ext_id
+        doc.clear_selection();
+        doc.set_selected(p_id, true);
+        doc.transform_selected("MoveParentAgain", &DMat4::from_translation(DVec3::new(0.0, 10.0, 0.0)));
+        assert!((doc.objects[ext_id].aabb.center().y - 2.0).abs() < 1e-6);
     }
 }

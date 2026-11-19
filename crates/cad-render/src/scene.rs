@@ -78,15 +78,12 @@ impl RenderScene {
         };
 
         for (_, obj) in &doc.objects {
-            if !obj.visible {
+            if !obj.visible || !doc.is_layer_effectively_visible(obj.layer_id) {
                 continue;
             }
             let Some(layer) = doc.layers.get(obj.layer_id) else {
                 continue;
             };
-            if !layer.visible {
-                continue;
-            }
 
             let raw_rgb = obj.color.unwrap_or(layer.color);
             let is_pure_black = raw_rgb[0] == 0 && raw_rgb[1] == 0 && raw_rgb[2] == 0;
@@ -265,10 +262,8 @@ impl RenderScene {
 
         // Render dimension extension lines & dimension lines for annotations
         for ann in &doc.annotations {
-            if let Some(layer) = doc.layers.get(ann.layer_id) {
-                if !layer.visible {
-                    continue;
-                }
+            if !doc.is_layer_effectively_visible(ann.layer_id) {
+                continue;
             }
             if ann.kind == AnnotationKind::Dimension {
                 if let (Some(p1), Some(p2), Some(off)) = (ann.p1, ann.p2, ann.offset_pt) {

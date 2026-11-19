@@ -3,8 +3,9 @@ pub mod gumball;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use cad_commands::{AxisLockMode, DimensionUnitKind, InferenceGuideKind, SnapKind};
 use cad_doc::{AnnotationKind, ObjectId};
-use cad_geom::{BoundaryLock, DVec3, Geometry, SubObjectRef};
+use cad_geom::{BoundaryLock, DMat4, DVec3, Geometry, SubObjectRef};
 use cad_render::{DisplayMode, ViewportPaintCallback};
 use eframe::egui;
 
@@ -14,7 +15,7 @@ use crate::state::{
 };
 use gumball::{
     compute_gumball_handles, compute_uvn_gumball_handles, draw_gumball_overlay,
-    draw_uvn_gumball_overlay, gumball_matrix, hit_gumball, hit_uvn_gumball,
+    draw_uvn_gumball_overlay, gumball_matrix_aligned, hit_gumball, hit_uvn_gumball,
 };
 
 pub fn world_to_screen(pt: DVec3, m: &[f32; 16], rect: egui::Rect) -> Option<egui::Pos2> {
@@ -105,20 +106,54 @@ impl ElephantApp {
                 let cplane = self.cameras[idx].cplane;
                 let vp_cols = self.cameras[idx].view_proj_f32(aspect).to_cols_array();
 
-                let (gumball_origin, gumball_handles) =
-                    compute_gumball_handles(self, &vp_cols, rect);
+                let (gumball_origin, gumball_axes, gumball_overlay) =
+                    compute_gumball_handles(self, &cplane, &vp_cols, rect);
                 let uvn_bundle = compute_uvn_gumball_handles(self, &vp_cols, rect);
+                let mut hover_screen_pos: Option<egui::Pos2> = None;
 
                 if response.hovered() {
                     self.active_viewport = idx;
                     if self.session.is_active() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                        if !ui.ctx().wants_keyboard_input() {
+                            if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                                self.snap.axis_lock = if self.snap.axis_lock == AxisLockMode::X {
+                                    AxisLockMode::None
+                                } else {
+                                    AxisLockMode::X
+                                };
+                            } else if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                                self.snap.axis_lock = if self.snap.axis_lock == AxisLockMode::Y {
+                                    AxisLockMode::None
+                                } else {
+                                    AxisLockMode::Y
+                                };
+                            } else if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                                self.snap.axis_lock = if self.snap.axis_lock == AxisLockMode::Z {
+                                    AxisLockMode::None
+                                } else {
+                                    AxisLockMode::Z
+                                };
+                            } else if ui.input(|i| i.key_pressed(egui::Key::T)) {
+                                if ui.input(|i| i.modifiers.shift) {
+                                    self.snap.clear_smart_track();
+                                    self.log("Cleared SmartTrack anchors.");
+                                } else if let Some(pt) = self.cursor_world {
+                                    self.snap.add_smart_track_point(pt);
+                                    self.log(format!(
+                                        "Added SmartTrack anchor ({} total).",
+                                        self.snap.smart_track_points.len()
+                                    ));
+                                }
+                            }
+                        }
                     }
                     let scroll = ui.input(|i| i.smooth_scroll_delta.y as f64);
                     if scroll.abs() > 0.0 {
                         self.cameras[idx].zoom(scroll);
                     }
                     if let Some(pos) = response.hover_pos() {
+                        hover_screen_pos = Some(pos);
                         let ndc_x = ((pos.x - rect.left()) / rect.width().max(1.0)) * 2.0 - 1.0;
                         let ndc_y = 1.0 - ((pos.y - rect.top()) / rect.height().max(1.0)) * 2.0;
                         let ray = self.cameras[idx].screen_to_ray(ndc_x as f64, ndc_y as f64, aspect);
@@ -133,9 +168,47 @@ impl ElephantApp {
                             );
                             self.cursor_world = Some(res.point);
                             self.last_snap_kind = res.kind;
+                            self.last_inference_guides = res.guides;
+
+                            if self.snap.smart_track && self.session.is_active() {
+                                let is_geom_snap = matches!(
+                                    res.kind,
+                                    Some(
+                                        SnapKind::End
+                                            | SnapKind::Mid
+                                            | SnapKind::Center
+                                            | SnapKind::Quad
+                                            | SnapKind::Int
+                                            | SnapKind::Vertex
+                                            | SnapKind::Knot
+                                            | SnapKind::Tan
+                                    )
+                                );
+                                if is_geom_snap {
+                                    let now = ui.input(|i| i.time);
+                                    match self.smart_track_hover {
+                                        Some((prev_p, t0)) if prev_p.distance(res.point) <= 1e-4 => {
+                                            if now - t0 >= 0.45 {
+                                                self.snap.add_smart_track_point(res.point);
+                                                self.smart_track_hover = Some((res.point, now + 999.0));
+                                            } else {
+                                                ui.ctx().request_repaint();
+                                            }
+                                        }
+                                        _ => {
+                                            self.smart_track_hover = Some((res.point, now));
+                                            ui.ctx().request_repaint();
+                                        }
+                                    }
+                                } else {
+                                    self.smart_track_hover = None;
+                                }
+                            }
                         } else {
                             self.cursor_world = None;
                             self.last_snap_kind = None;
+                            self.last_inference_guides.clear();
+                            self.smart_track_hover = None;
                         }
                     }
                 }
@@ -154,6 +227,12 @@ impl ElephantApp {
                         let outcome = self.session.finish_or_cancel(&mut self.doc);
                         for m in outcome.messages {
                             self.log(m);
+                        }
+                        if outcome.finished {
+                            self.snap.clear_smart_track();
+                            self.snap.axis_lock = AxisLockMode::None;
+                            self.last_inference_guides.clear();
+                            self.smart_track_hover = None;
                         }
                         self.mark_scene_dirty();
                     } else if let Some(prev) = self.last_command.clone() {
@@ -260,26 +339,76 @@ impl ElephantApp {
                                             before_snapshot,
                                         });
                                     }
-                                } else if let Some((axis, mode, axis_screen_dir, px_per_world)) =
-                                    hit_gumball(&gumball_handles, pos)
-                                {
-                                    self.gumball_drag = Some(GumballDrag {
-                                        viewport_idx: idx,
-                                        axis,
-                                        mode,
-                                        origin: gumball_origin,
-                                        last_pos: pos,
-                                        axis_screen_dir,
-                                        px_per_world,
-                                        total_amount: 0.0,
-                                        moved: false,
-                                    });
                                 } else {
-                                    self.marquee = Some(MarqueeDrag {
-                                        viewport_idx: idx,
-                                        start: pos,
-                                        current: pos,
-                                    });
+                                    let ctrl = ui.input(|i| i.modifiers.ctrl);
+                                    let shift = ui.input(|i| i.modifiers.shift);
+                                    let alt = ui.input(|i| i.modifiers.alt);
+                                    if let Some(hit) = hit_gumball(&gumball_overlay, pos, ctrl, shift) {
+                                        let alt_copy = alt
+                                            && matches!(
+                                                hit.mode,
+                                                GumballMode::Move
+                                                    | GumballMode::MovePlanar { .. }
+                                                    | GumballMode::Rotate
+                                                    | GumballMode::Scale1D
+                                                    | GumballMode::Scale3D
+                                            );
+                                        let mut copied_ids = Vec::new();
+                                        if alt_copy {
+                                            let copies: Vec<_> = self
+                                                .doc
+                                                .selected_ids_ordered()
+                                                .into_iter()
+                                                .filter_map(|id| {
+                                                    self.doc.objects.get(id).map(|o| {
+                                                        (o.layer_id, o.geometry.clone())
+                                                    })
+                                                })
+                                                .collect();
+                                            self.doc.clear_selection();
+                                            for (lid, geom) in copies {
+                                                let cid = self.doc.add_object_on_layer(
+                                                    "Gumball Copy",
+                                                    lid,
+                                                    geom,
+                                                );
+                                                self.doc.set_selected(cid, true);
+                                                copied_ids.push(cid);
+                                            }
+                                            self.mark_doc_dirty();
+                                        }
+                                        let init_amount = if matches!(
+                                            hit.mode,
+                                            GumballMode::Scale1D | GumballMode::Scale3D
+                                        ) {
+                                            1.0
+                                        } else {
+                                            0.0
+                                        };
+                                        self.gumball_drag = Some(GumballDrag {
+                                            viewport_idx: idx,
+                                            axis: hit.axis,
+                                            mode: hit.mode,
+                                            origin: gumball_origin,
+                                            axes: gumball_axes,
+                                            last_pos: pos,
+                                            axis_screen_dir: hit.axis_screen_dir,
+                                            plane_u_screen: hit.plane_u_screen,
+                                            plane_v_screen: hit.plane_v_screen,
+                                            px_per_world: hit.px_per_world,
+                                            total_amount: init_amount,
+                                            total_vec: DVec3::ZERO,
+                                            moved: false,
+                                            alt_copy,
+                                            copied_ids,
+                                        });
+                                    } else {
+                                        self.marquee = Some(MarqueeDrag {
+                                            viewport_idx: idx,
+                                            start: pos,
+                                            current: pos,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -368,45 +497,192 @@ impl ElephantApp {
                                 if let Some(pos) = response.interact_pointer_pos() {
                                     let delta = pos - drag.last_pos;
                                     drag.last_pos = pos;
-                                    let d_amt = match drag.mode {
-                                        GumballMode::Move => {
-                                            let px = delta.dot(drag.axis_screen_dir) as f64;
-                                            px / drag.px_per_world.max(1e-4)
+                                    match drag.mode {
+                                        GumballMode::Relocate => {
+                                            let ndc_x = ((pos.x - rect.left())
+                                                / rect.width().max(1.0))
+                                                * 2.0
+                                                - 1.0;
+                                            let ndc_y = 1.0
+                                                - ((pos.y - rect.top()) / rect.height().max(1.0))
+                                                    * 2.0;
+                                            let ray = self.cameras[idx].screen_to_ray(
+                                                ndc_x as f64,
+                                                ndc_y as f64,
+                                                aspect,
+                                            );
+                                            let mut p = cplane;
+                                            p.origin = drag.origin;
+                                            if let Some(new_o) = p.intersect_ray(&ray) {
+                                                drag.origin = new_o;
+                                                self.gumball_custom_origin = Some(new_o);
+                                                drag.moved = true;
+                                            }
                                         }
-                                        GumballMode::Rotate => (delta.x - delta.y) as f64 * 0.01,
-                                    };
-                                    if d_amt.abs() > 1e-9 {
-                                        let mat = gumball_matrix(
-                                            drag.axis,
-                                            drag.mode,
-                                            drag.origin,
-                                            d_amt,
-                                        );
-                                        self.apply_raw_selected_transform(&mat);
-                                        drag.total_amount += d_amt;
-                                        drag.moved = true;
+                                        GumballMode::MovePlanar { axis_u, axis_v } => {
+                                            let du = (delta.dot(drag.plane_u_screen) as f64)
+                                                / drag.px_per_world.max(1e-4);
+                                            let dv = (delta.dot(drag.plane_v_screen) as f64)
+                                                / drag.px_per_world.max(1e-4);
+                                            let dv_world =
+                                                drag.axes[axis_u] * du + drag.axes[axis_v] * dv;
+                                            if dv_world.length_squared() > 1e-12 {
+                                                self.apply_raw_selected_transform(
+                                                    &DMat4::from_translation(dv_world),
+                                                );
+                                                drag.total_vec += dv_world;
+                                                drag.moved = true;
+                                            }
+                                        }
+                                        GumballMode::Extrude | GumballMode::Cut => {
+                                            let px = delta.dot(drag.axis_screen_dir) as f64;
+                                            let d_world = px / drag.px_per_world.max(1e-4);
+                                            if d_world.abs() > 1e-9 {
+                                                drag.total_amount += d_world;
+                                                drag.moved = true;
+                                            }
+                                        }
+                                        GumballMode::Scale1D | GumballMode::Scale3D => {
+                                            let px = delta.dot(drag.axis_screen_dir) as f64;
+                                            if px.abs() > 1e-5 {
+                                                let factor = (1.0 + px * 0.008).clamp(0.5, 2.0);
+                                                let next_total = (drag.total_amount * factor)
+                                                    .clamp(0.02, 50.0);
+                                                let ratio = next_total / drag.total_amount;
+                                                if (ratio - 1.0).abs() > 1e-7 {
+                                                    let mat = gumball_matrix_aligned(
+                                                        drag.axes,
+                                                        drag.axis,
+                                                        drag.mode,
+                                                        drag.origin,
+                                                        ratio,
+                                                        DVec3::ZERO,
+                                                    );
+                                                    self.apply_raw_selected_transform(&mat);
+                                                    drag.total_amount = next_total;
+                                                    drag.moved = true;
+                                                }
+                                            }
+                                        }
+                                        GumballMode::Move | GumballMode::Rotate => {
+                                            let d_amt = match drag.mode {
+                                                GumballMode::Move => {
+                                                    let px = delta.dot(drag.axis_screen_dir) as f64;
+                                                    px / drag.px_per_world.max(1e-4)
+                                                }
+                                                GumballMode::Rotate => {
+                                                    (delta.x - delta.y) as f64 * 0.01
+                                                }
+                                                _ => 0.0,
+                                            };
+                                            if d_amt.abs() > 1e-9 {
+                                                let mat = gumball_matrix_aligned(
+                                                    drag.axes,
+                                                    drag.axis,
+                                                    drag.mode,
+                                                    drag.origin,
+                                                    d_amt,
+                                                    DVec3::ZERO,
+                                                );
+                                                self.apply_raw_selected_transform(&mat);
+                                                drag.total_amount += d_amt;
+                                                drag.moved = true;
+                                            }
+                                        }
                                     }
                                 }
                                 self.gumball_drag = Some(drag);
-                            } else if drag.moved && drag.total_amount.abs() > 1e-9 {
-                                let revert = gumball_matrix(
-                                    drag.axis,
-                                    drag.mode,
-                                    drag.origin,
-                                    -drag.total_amount,
-                                );
-                                self.apply_raw_selected_transform(&revert);
-                                let final_mat = gumball_matrix(
-                                    drag.axis,
-                                    drag.mode,
-                                    drag.origin,
-                                    drag.total_amount,
-                                );
-                                let label = match drag.mode {
-                                    GumballMode::Move => "Gumball Move",
-                                    GumballMode::Rotate => "Gumball Rotate",
-                                };
-                                self.doc.transform_selected(label, &final_mat);
+                            } else if drag.moved {
+                                match drag.mode {
+                                    GumballMode::Relocate => {
+                                        self.log(format!(
+                                            "Relocated Gumball origin to ({:.2}, {:.2}, {:.2}).",
+                                            drag.origin.x, drag.origin.y, drag.origin.z
+                                        ));
+                                    }
+                                    GumballMode::Extrude => {
+                                        let dir = drag.axes[drag.axis] * drag.total_amount;
+                                        self.execute_gumball_extrude(dir);
+                                    }
+                                    GumballMode::Cut => {
+                                        let dir = drag.axes[drag.axis] * drag.total_amount;
+                                        self.execute_gumball_cut(dir);
+                                    }
+                                    GumballMode::MovePlanar { .. } => {
+                                        let revert = cad_geom::DMat4::from_translation(-drag.total_vec);
+                                        self.apply_raw_selected_transform(&revert);
+                                        let final_mat =
+                                            cad_geom::DMat4::from_translation(drag.total_vec);
+                                        self.doc.transform_selected("Gumball Planar Move", &final_mat);
+                                        if let Some(co) = self.gumball_custom_origin {
+                                            self.gumball_custom_origin = Some(co + drag.total_vec);
+                                        }
+                                        self.mark_scene_dirty();
+                                    }
+                                    GumballMode::Scale1D | GumballMode::Scale3D => {
+                                        let rev_amt = 1.0 / drag.total_amount.max(0.01);
+                                        let revert = gumball_matrix_aligned(
+                                            drag.axes,
+                                            drag.axis,
+                                            drag.mode,
+                                            drag.origin,
+                                            rev_amt,
+                                            DVec3::ZERO,
+                                        );
+                                        self.apply_raw_selected_transform(&revert);
+                                        let final_mat = gumball_matrix_aligned(
+                                            drag.axes,
+                                            drag.axis,
+                                            drag.mode,
+                                            drag.origin,
+                                            drag.total_amount,
+                                            DVec3::ZERO,
+                                        );
+                                        let label = if drag.mode == GumballMode::Scale3D {
+                                            "Gumball Scale 3D"
+                                        } else {
+                                            "Gumball Scale 1D"
+                                        };
+                                        self.doc.transform_selected(label, &final_mat);
+                                        self.mark_scene_dirty();
+                                    }
+                                    GumballMode::Move | GumballMode::Rotate => {
+                                        let revert = gumball_matrix_aligned(
+                                            drag.axes,
+                                            drag.axis,
+                                            drag.mode,
+                                            drag.origin,
+                                            -drag.total_amount,
+                                            DVec3::ZERO,
+                                        );
+                                        self.apply_raw_selected_transform(&revert);
+                                        let final_mat = gumball_matrix_aligned(
+                                            drag.axes,
+                                            drag.axis,
+                                            drag.mode,
+                                            drag.origin,
+                                            drag.total_amount,
+                                            DVec3::ZERO,
+                                        );
+                                        let label = match drag.mode {
+                                            GumballMode::Move => "Gumball Move",
+                                            GumballMode::Rotate => "Gumball Rotate",
+                                            _ => "Gumball Transform",
+                                        };
+                                        self.doc.transform_selected(label, &final_mat);
+                                        if drag.mode == GumballMode::Move {
+                                            if let Some(co) = self.gumball_custom_origin {
+                                                self.gumball_custom_origin =
+                                                    Some(final_mat.transform_point3(co));
+                                            }
+                                        }
+                                        self.mark_scene_dirty();
+                                    }
+                                }
+                            } else if drag.alt_copy && !drag.copied_ids.is_empty() {
+                                for _ in 0..drag.copied_ids.len() {
+                                    self.doc.undo();
+                                }
                                 self.mark_scene_dirty();
                             }
                         } else {
@@ -447,16 +723,17 @@ impl ElephantApp {
                                         if !shift && !ctrl {
                                             self.doc.clear_selection();
                                             self.selected_cps.clear();
+                                            self.selected_subobjects.clear();
                                         }
                                         let ids: Vec<_> = self.doc.objects.keys().collect();
                                         for id in ids {
                                             let Some(obj) = self.doc.objects.get(id) else {
                                                 continue;
                                             };
-                                            let Some(layer) = self.doc.layers.get(obj.layer_id) else {
-                                                continue;
-                                            };
-                                            if !layer.visible || layer.locked {
+                                            if !obj.visible
+                                                || !self.doc.is_layer_effectively_visible(obj.layer_id)
+                                                || self.doc.is_layer_effectively_locked(obj.layer_id)
+                                            {
                                                 continue;
                                             }
                                             let min = obj.aabb.min;
@@ -516,10 +793,17 @@ impl ElephantApp {
                                     &cplane,
                                     snap_world_r,
                                 );
+                                self.last_inference_guides = res.guides;
                                 let outcome =
                                     self.session.on_point(res.point, &mut self.doc, &cplane);
                                 for m in outcome.messages {
                                     self.log(m);
+                                }
+                                if outcome.finished {
+                                    self.snap.clear_smart_track();
+                                    self.snap.axis_lock = AxisLockMode::None;
+                                    self.last_inference_guides.clear();
+                                    self.smart_track_hover = None;
                                 }
                                 self.mark_scene_dirty();
                             }
@@ -570,18 +854,23 @@ impl ElephantApp {
                             } else {
                                 self.selected_cps = vec![pair];
                             }
-                        } else if let Some((axis, mode, _, _)) = hit_gumball(&gumball_handles, pos) {
-                            self.gumball_prompt = Some(GumballNumericPrompt {
-                                axis,
-                                mode,
-                                text: String::new(),
-                                just_opened: true,
-                            });
                         } else {
-                            let shift = ui.input(|i| i.modifiers.shift);
                             let ctrl = ui.input(|i| i.modifiers.ctrl);
-                            let pick_tol = (world_per_px * 10.0).max(1e-4);
-                            self.pick_viewport_object_or_subobject(&ray, pick_tol, shift, ctrl);
+                            let shift = ui.input(|i| i.modifiers.shift);
+                            if let Some(hit) = hit_gumball(&gumball_overlay, pos, ctrl, shift) {
+                                if hit.mode != GumballMode::Relocate {
+                                    self.gumball_prompt = Some(GumballNumericPrompt {
+                                        axis: hit.axis,
+                                        mode: hit.mode,
+                                        axes: gumball_axes,
+                                        text: String::new(),
+                                        just_opened: true,
+                                    });
+                                }
+                            } else {
+                                let pick_tol = (world_per_px * 10.0).max(1e-4);
+                                self.pick_viewport_object_or_subobject(&ray, pick_tol, shift, ctrl);
+                            }
                         }
                     }
                 }
@@ -695,7 +984,7 @@ impl ElephantApp {
                 if let Some((_, _, uvn_handles)) = &uvn_bundle {
                     draw_uvn_gumball_overlay(&painter, uvn_handles);
                 } else {
-                    draw_gumball_overlay(&painter, &gumball_handles);
+                    draw_gumball_overlay(&painter, &gumball_overlay);
                 }
 
                 // Draw CurvatureGraph combs for tracked curves
@@ -751,13 +1040,8 @@ impl ElephantApp {
                     let naked_stroke =
                         egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(255, 60, 210));
                     for (_, obj) in &self.doc.objects {
-                        if !obj.visible {
+                        if !obj.visible || !self.doc.is_layer_effectively_visible(obj.layer_id) {
                             continue;
-                        }
-                        if let Some(layer) = self.doc.layers.get(obj.layer_id) {
-                            if !layer.visible {
-                                continue;
-                            }
                         }
                         if let Geometry::BRep(brep) = &obj.geometry {
                             for ei in brep.naked_edges() {
@@ -899,6 +1183,189 @@ impl ElephantApp {
                     }
                 }
 
+                // Draw SmartTrack anchor rings & Inference guide lines
+                if self.session.is_active() {
+                    for &anchor in &self.snap.smart_track_points {
+                        if let Some(sp) = world_to_screen(anchor, &vp_cols, rect) {
+                            painter.circle_stroke(
+                                sp,
+                                5.5,
+                                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(75, 225, 245)),
+                            );
+                        }
+                    }
+                    if is_active {
+                        for g in &self.last_inference_guides {
+                            if let (Some(a), Some(b)) = (
+                                world_to_screen(g.start, &vp_cols, rect),
+                                world_to_screen(g.end, &vp_cols, rect),
+                            ) {
+                                let col = match g.kind {
+                                    InferenceGuideKind::AxisX => {
+                                        egui::Color32::from_rgb(240, 85, 85)
+                                    }
+                                    InferenceGuideKind::AxisY => {
+                                        egui::Color32::from_rgb(85, 220, 105)
+                                    }
+                                    InferenceGuideKind::AxisZ => {
+                                        egui::Color32::from_rgb(90, 155, 250)
+                                    }
+                                    InferenceGuideKind::Extension => {
+                                        egui::Color32::from_rgb(75, 225, 245)
+                                    }
+                                    InferenceGuideKind::Perp => {
+                                        egui::Color32::from_rgb(235, 95, 220)
+                                    }
+                                };
+                                draw_dashed_segment(&painter, a, b, col);
+                                let mid = egui::pos2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+                                draw_screen_pill(&painter, mid, g.label, col);
+                            }
+                        }
+
+                        // Instant3D live dimension badges during active command
+                        let unit_lbl = self.doc.units.label();
+                        for badge in self.session.live_dimensions(self.cursor_world, &cplane) {
+                            if let Some(sp) = world_to_screen(badge.world_pos, &vp_cols, rect) {
+                                let text = match badge.unit_kind {
+                                    DimensionUnitKind::Length => {
+                                        format!("{}{:.2} {unit_lbl}", badge.prefix, badge.value)
+                                    }
+                                    DimensionUnitKind::Angle => {
+                                        format!("{}{:.1} deg", badge.prefix, badge.value)
+                                    }
+                                    DimensionUnitKind::Factor => {
+                                        format!("{}{:.2}x", badge.prefix, badge.value)
+                                    }
+                                };
+                                draw_screen_pill(
+                                    &painter,
+                                    sp + egui::vec2(0.0, -14.0),
+                                    &text,
+                                    egui::Color32::from_rgb(245, 210, 85),
+                                );
+                            }
+                        }
+
+                        // Live cursor snap badge
+                        if let Some(hpos) = hover_screen_pos {
+                            if let Some(kind) = self.last_snap_kind {
+                                let snap_txt = if kind == SnapKind::AxisLock {
+                                    format!("Axis {}", self.snap.axis_lock.label())
+                                } else {
+                                    kind.label().to_string()
+                                };
+                                draw_screen_pill(
+                                    &painter,
+                                    hpos + egui::vec2(18.0, -16.0),
+                                    &snap_txt,
+                                    egui::Color32::from_rgb(255, 130, 235),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Active Gumball drag preview line & Instant3D readout badge
+                if let Some(drag) = &self.gumball_drag {
+                    if drag.viewport_idx == idx && drag.moved {
+                        let unit_lbl = self.doc.units.label();
+                        let copy_tag = if drag.alt_copy { " [Alt: Copy]" } else { "" };
+                        let (anchor_w, text, accent) = match drag.mode {
+                            GumballMode::Move => (
+                                drag.origin,
+                                format!(
+                                    "Move {}: {:.2} {unit_lbl}{copy_tag}",
+                                    ["X", "Y", "Z"][drag.axis.min(2)],
+                                    drag.total_amount
+                                ),
+                                egui::Color32::from_rgb(120, 215, 255),
+                            ),
+                            GumballMode::MovePlanar { axis_u, axis_v } => (
+                                drag.origin,
+                                format!(
+                                    "Planar {}{}: {:.2} {unit_lbl}{copy_tag}",
+                                    ["X", "Y", "Z"][axis_u],
+                                    ["X", "Y", "Z"][axis_v],
+                                    drag.total_vec.length()
+                                ),
+                                egui::Color32::from_rgb(120, 215, 255),
+                            ),
+                            GumballMode::Rotate => (
+                                drag.origin,
+                                format!(
+                                    "Rotate {}: {:.1} deg{copy_tag}",
+                                    ["X", "Y", "Z"][drag.axis.min(2)],
+                                    drag.total_amount.to_degrees()
+                                ),
+                                egui::Color32::from_rgb(245, 200, 90),
+                            ),
+                            GumballMode::Scale1D => (
+                                drag.origin,
+                                format!(
+                                    "Scale {}: {:.2}x{copy_tag}",
+                                    ["X", "Y", "Z"][drag.axis.min(2)],
+                                    drag.total_amount
+                                ),
+                                egui::Color32::from_rgb(140, 240, 145),
+                            ),
+                            GumballMode::Scale3D => (
+                                drag.origin,
+                                format!("Scale 3D: {:.2}x{copy_tag}", drag.total_amount),
+                                egui::Color32::from_rgb(140, 240, 145),
+                            ),
+                            GumballMode::Extrude => {
+                                let tip_w = drag.origin + drag.axes[drag.axis] * drag.total_amount;
+                                if let (Some(a), Some(b)) = (
+                                    world_to_screen(drag.origin, &vp_cols, rect),
+                                    world_to_screen(tip_w, &vp_cols, rect),
+                                ) {
+                                    painter.line_segment(
+                                        [a, b],
+                                        egui::Stroke::new(
+                                            2.5_f32,
+                                            egui::Color32::from_rgb(255, 195, 70),
+                                        ),
+                                    );
+                                }
+                                (
+                                    tip_w,
+                                    format!("Extrude: {:.2} {unit_lbl}", drag.total_amount),
+                                    egui::Color32::from_rgb(255, 195, 70),
+                                )
+                            }
+                            GumballMode::Cut => {
+                                let tip_w = drag.origin + drag.axes[drag.axis] * drag.total_amount;
+                                if let (Some(a), Some(b)) = (
+                                    world_to_screen(drag.origin, &vp_cols, rect),
+                                    world_to_screen(tip_w, &vp_cols, rect),
+                                ) {
+                                    painter.line_segment(
+                                        [a, b],
+                                        egui::Stroke::new(
+                                            2.5_f32,
+                                            egui::Color32::from_rgb(70, 225, 245),
+                                        ),
+                                    );
+                                }
+                                (
+                                    tip_w,
+                                    format!("Cut: {:.2} {unit_lbl}", drag.total_amount),
+                                    egui::Color32::from_rgb(70, 225, 245),
+                                )
+                            }
+                            GumballMode::Relocate => (
+                                drag.origin,
+                                "Relocate Pivot".to_string(),
+                                egui::Color32::WHITE,
+                            ),
+                        };
+                        if let Some(sp) = world_to_screen(anchor_w, &vp_cols, rect) {
+                            draw_screen_pill(&painter, sp + egui::vec2(0.0, -24.0), &text, accent);
+                        }
+                    }
+                }
+
                 // Draw Marquee selection rectangle
                 if let Some(m) = &self.marquee {
                     if m.viewport_idx == idx {
@@ -963,6 +1430,7 @@ impl ElephantApp {
             self.doc.clear_selection();
             self.selected_cps.clear();
             self.selected_subobjects.clear();
+            self.gumball_custom_origin = None;
         }
         if let Some(hit_id) = self.doc.pick_ray_with_tolerance(ray, pick_tol) {
             if ctrl {
@@ -979,4 +1447,45 @@ impl ElephantApp {
         }
         self.mark_doc_dirty();
     }
+}
+
+fn draw_dashed_segment(
+    painter: &egui::Painter,
+    a: egui::Pos2,
+    b: egui::Pos2,
+    color: egui::Color32,
+) {
+    let delta = b - a;
+    let len = delta.length();
+    if len < 2.0 {
+        return;
+    }
+    let dir = delta / len;
+    let dash = 7.0_f32;
+    let gap = 5.0_f32;
+    let mut t = 0.0_f32;
+    let stroke = egui::Stroke::new(1.4_f32, color);
+    while t < len {
+        let t_end = (t + dash).min(len);
+        painter.line_segment([a + dir * t, a + dir * t_end], stroke);
+        t += dash + gap;
+    }
+}
+
+fn draw_screen_pill(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    text: &str,
+    accent: egui::Color32,
+) {
+    let galley = painter.layout_no_wrap(text.to_string(), egui::FontId::proportional(11.0), accent);
+    let pad = egui::vec2(5.0, 2.0);
+    let bg = egui::Rect::from_center_size(center, galley.size() + pad * 2.0);
+    painter.rect(
+        bg,
+        3.0,
+        egui::Color32::from_rgba_unmultiplied(24, 27, 33, 215),
+        egui::Stroke::new(1.0_f32, accent),
+    );
+    painter.galley(bg.min + pad, galley, accent);
 }

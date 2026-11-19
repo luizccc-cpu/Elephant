@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use cad_commands::{CommandSession, SnapConfig, SnapKind};
-use cad_doc::{CadObject, Document, ObjectId};
+use cad_commands::{AxisLockMode, CommandSession, InferenceGuide, SnapConfig, SnapKind};
+use cad_doc::{CadObject, Document, LayerId, ObjectId};
 use cad_geom::{
     BRep, BoundaryLock, DVec3, Geometry, NurbsCurve, NurbsSurface, Plane, SoftTransformFalloff,
     SubObjectRef, UnitSystem,
@@ -130,6 +130,15 @@ pub const KNOWN_COMMANDS: &[&str] = &[
     "Technical",
     "Arctic",
     "Units",
+    "AutoCPlane",
+    "SmartTrack",
+    "GumballAlign",
+    "GumballRelocate",
+    "GumballReset",
+    "History",
+    "BreakHistory",
+    "HistoryPurge",
+    "RadialMenu",
     "New",
     "Help",
 ];
@@ -142,9 +151,88 @@ pub enum ToolPanelTab {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GumballAlignMode {
+    World,
+    CPlane,
+    Object,
+}
+
+impl GumballAlignMode {
+    pub const ALL: [Self; 3] = [Self::World, Self::CPlane, Self::Object];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::World => "World",
+            Self::CPlane => "CPlane",
+            Self::Object => "Object",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GumballMode {
     Move,
+    MovePlanar { axis_u: usize, axis_v: usize },
     Rotate,
+    Scale1D,
+    Scale3D,
+    Extrude,
+    Cut,
+    Relocate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPaletteTab {
+    Standard,
+    Curves,
+    Surfaces,
+    Solids,
+    Transform,
+    Analysis,
+    Drafting,
+}
+
+impl ToolPaletteTab {
+    pub const ALL: [Self; 7] = [
+        Self::Standard,
+        Self::Curves,
+        Self::Surfaces,
+        Self::Solids,
+        Self::Transform,
+        Self::Analysis,
+        Self::Drafting,
+    ];
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Standard => "Std",
+            Self::Curves => "Crv",
+            Self::Surfaces => "Srf",
+            Self::Solids => "Sol",
+            Self::Transform => "Xfm",
+            Self::Analysis => "Ana",
+            Self::Drafting => "Dft",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Standard => "Standard",
+            Self::Curves => "Curves",
+            Self::Surfaces => "Surfaces",
+            Self::Solids => "Solids & B-Rep",
+            Self::Transform => "Transform",
+            Self::Analysis => "Analysis",
+            Self::Drafting => "Drafting",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InspectorTab {
+    Outliner,
+    Properties,
+    History,
 }
 
 #[derive(Debug, Clone)]
@@ -153,17 +241,24 @@ pub struct GumballDrag {
     pub axis: usize,
     pub mode: GumballMode,
     pub origin: DVec3,
+    pub axes: [DVec3; 3],
     pub last_pos: egui::Pos2,
     pub axis_screen_dir: egui::Vec2,
+    pub plane_u_screen: egui::Vec2,
+    pub plane_v_screen: egui::Vec2,
     pub px_per_world: f64,
     pub total_amount: f64,
+    pub total_vec: DVec3,
     pub moved: bool,
+    pub alt_copy: bool,
+    pub copied_ids: Vec<ObjectId>,
 }
 
 #[derive(Debug, Clone)]
 pub struct GumballNumericPrompt {
     pub axis: usize,
     pub mode: GumballMode,
+    pub axes: [DVec3; 3],
     pub text: String,
     pub just_opened: bool,
 }
@@ -224,6 +319,8 @@ pub struct ElephantApp {
     pub session: CommandSession,
     pub snap: SnapConfig,
     pub gumball_enabled: bool,
+    pub gumball_align: GumballAlignMode,
+    pub gumball_custom_origin: Option<DVec3>,
     pub gumball_drag: Option<GumballDrag>,
     pub gumball_prompt: Option<GumballNumericPrompt>,
     pub marquee: Option<MarqueeDrag>,
@@ -250,7 +347,16 @@ pub struct ElephantApp {
     pub new_layer_name: String,
     pub cursor_world: Option<DVec3>,
     pub last_snap_kind: Option<SnapKind>,
+    pub last_inference_guides: Vec<InferenceGuide>,
+    pub smart_track_hover: Option<(DVec3, f64)>,
+    pub auto_cplane: bool,
     pub tool_tab: ToolPanelTab,
+    pub palette_tab: ToolPaletteTab,
+    pub show_left_palette: bool,
+    pub inspector_tab: InspectorTab,
+    pub collapsed_layers: HashSet<LayerId>,
+    pub new_sublayer_parent: Option<LayerId>,
+    pub radial_menu_pos: Option<egui::Pos2>,
     pub parametric_graph: ParametricGraph,
     pub script_source: String,
     pub rescale_on_unit_change: bool,
@@ -281,6 +387,8 @@ impl ElephantApp {
             session: CommandSession::default(),
             snap: SnapConfig::default(),
             gumball_enabled: true,
+            gumball_align: GumballAlignMode::CPlane,
+            gumball_custom_origin: None,
             gumball_drag: None,
             gumball_prompt: None,
             marquee: None,
@@ -310,7 +418,16 @@ impl ElephantApp {
             new_layer_name: String::new(),
             cursor_world: None,
             last_snap_kind: None,
+            last_inference_guides: Vec::new(),
+            smart_track_hover: None,
+            auto_cplane: false,
             tool_tab: ToolPanelTab::None,
+            palette_tab: ToolPaletteTab::Standard,
+            show_left_palette: true,
+            inspector_tab: InspectorTab::Outliner,
+            collapsed_layers: HashSet::new(),
+            new_sublayer_parent: None,
+            radial_menu_pos: None,
             parametric_graph: ParametricGraph::default(),
             script_source: DEFAULT_SAMPLE_SCRIPT.to_string(),
             rescale_on_unit_change: true,
@@ -366,13 +483,80 @@ impl ElephantApp {
 
     pub fn mark_doc_dirty(&mut self) {
         self.prune_selected_subobjects();
+        self.update_auto_cplane();
         self.doc_dirty = true;
     }
 
     pub fn mark_scene_dirty(&mut self) {
         self.prune_selected_subobjects();
+        self.update_auto_cplane();
         self.doc_dirty = true;
         self.grids_dirty = true;
+    }
+
+    pub fn selection_object_plane(&self) -> Option<Plane> {
+        // 1. Sub-selected B-Rep Face takes priority
+        for &(oid, sub) in &self.selected_subobjects {
+            if let SubObjectRef::Face(fi) = sub {
+                if let Some(obj) = self.doc.objects.get(oid) {
+                    if let Geometry::BRep(b) = &obj.geometry {
+                        if let Some(face) = b.faces.get(fi) {
+                            if let Some((u, v, pt, n)) = face.interior_sample_point() {
+                                let d = face.surface.evaluate_derivatives(u, v);
+                                return Some(orthonormal_plane_from_tangent(pt, d.du, n));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 2. First selected object in click order
+        let oid = self.doc.selected_ids_ordered().into_iter().next()?;
+        let obj = self.doc.objects.get(oid)?;
+        match &obj.geometry {
+            Geometry::BRep(b) => {
+                let face = b.faces.first()?;
+                let (u, v, pt, n) = face.interior_sample_point()?;
+                let d = face.surface.evaluate_derivatives(u, v);
+                Some(orthonormal_plane_from_tangent(pt, d.du, n))
+            }
+            Geometry::Surface(s) => {
+                let (u0, u1) = s.domain_u();
+                let (v0, v1) = s.domain_v();
+                let (u, v) = (0.5 * (u0 + u1), 0.5 * (v0 + v1));
+                let (pt, n) = s.evaluate_point_and_normal(u, v);
+                let d = s.evaluate_derivatives(u, v);
+                Some(orthonormal_plane_from_tangent(pt, d.du, n))
+            }
+            Geometry::Curve(c) => planar_curve_plane(c, obj.aabb.center()),
+            _ => None,
+        }
+    }
+
+    pub fn update_auto_cplane(&mut self) {
+        if !self.auto_cplane {
+            return;
+        }
+        let vp_idx = self.active_viewport.min(3);
+        let default_plane = ViewportCamera::preset(self.cameras[vp_idx].kind).cplane;
+        let target = self.selection_object_plane().unwrap_or(default_plane);
+        let cur = self.cameras[vp_idx].cplane;
+        let changed = cur.origin.distance(target.origin) > 1e-5
+            || cur.x_axis.distance(target.x_axis) > 1e-5
+            || cur.z_axis.distance(target.z_axis) > 1e-5;
+        if changed {
+            self.cameras[vp_idx].cplane = target;
+            self.grids_dirty = true;
+        }
+    }
+
+    pub fn reset_phase4_interaction_state(&mut self) {
+        self.gumball_custom_origin = None;
+        self.last_inference_guides.clear();
+        self.smart_track_hover = None;
+        self.radial_menu_pos = None;
+        self.snap.clear_smart_track();
+        self.snap.axis_lock = AxisLockMode::None;
     }
 
     pub fn prune_selected_subobjects(&mut self) {
@@ -470,6 +654,8 @@ impl ElephantApp {
                     self.gumball_drag = None;
                     self.gumball_prompt = None;
                     self.marquee = None;
+                    self.selected_subobjects.clear();
+                    self.reset_phase4_interaction_state();
                     self.doc = doc;
                     self.named_views = meta
                         .named_views
@@ -605,4 +791,60 @@ impl ElephantApp {
             self.cached_overlay = None;
         }
     }
+}
+
+fn orthonormal_plane_from_tangent(origin: DVec3, tangent_u: DVec3, normal: DVec3) -> Plane {
+    let z_axis = normal.normalize_or(DVec3::Z);
+    let proj = tangent_u - z_axis * tangent_u.dot(z_axis);
+    let x_axis = if proj.length_squared() > 1e-10 {
+        proj.normalize()
+    } else {
+        let ref_v = if z_axis.x.abs() < 0.9 { DVec3::X } else { DVec3::Y };
+        ref_v.cross(z_axis).normalize_or(DVec3::X)
+    };
+    let y_axis = z_axis.cross(x_axis).normalize_or(DVec3::Y);
+    Plane {
+        origin,
+        x_axis,
+        y_axis,
+        z_axis,
+    }
+}
+
+fn planar_curve_plane(curve: &NurbsCurve, fallback_origin: DVec3) -> Option<Plane> {
+    let pts = curve.sample_polyline(16);
+    if pts.len() < 3 {
+        return None;
+    }
+    let p0 = pts[0];
+    let p1 = pts
+        .iter()
+        .copied()
+        .max_by(|a, b| a.distance(p0).total_cmp(&b.distance(p0)))?;
+    let chord = p1 - p0;
+    let span = chord.length();
+    if span < 1e-6 {
+        return None;
+    }
+    let x_axis = chord / span;
+    let p2 = pts.iter().copied().max_by(|&a, &b| {
+        let da = (a - p0).cross(x_axis).length();
+        let db = (b - p0).cross(x_axis).length();
+        da.total_cmp(&db)
+    })?;
+    let z_axis = x_axis.cross(p2 - p0).normalize_or_zero();
+    if z_axis.length_squared() < 1e-8 {
+        return None;
+    }
+    let tol = (span * 5e-3).max(1e-4);
+    if pts.iter().any(|&p| (p - p0).dot(z_axis).abs() > tol) {
+        return None;
+    }
+    let y_axis = z_axis.cross(x_axis).normalize_or(DVec3::Y);
+    Some(Plane {
+        origin: fallback_origin,
+        x_axis,
+        y_axis,
+        z_axis,
+    })
 }

@@ -1,8 +1,11 @@
 pub mod inspector;
+pub mod radial_menu;
 pub mod status_bar;
+pub mod tool_palette;
 pub mod tools_panel;
 pub mod top_bar;
 
+use cad_commands::AxisLockMode;
 use eframe::egui;
 
 use crate::state::ElephantApp;
@@ -10,20 +13,43 @@ use crate::state::ElephantApp;
 impl eframe::App for ElephantApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.uvn_prompt.is_some() {
+            if self.radial_menu_pos.is_some() {
+                self.radial_menu_pos = None;
+            } else if self.uvn_prompt.is_some() {
                 self.uvn_prompt = None;
             } else if self.gumball_prompt.is_some() {
                 self.gumball_prompt = None;
             } else if self.session.is_active() {
-                let msg = self.session.cancel();
-                self.log(msg);
+                if self.snap.axis_lock != AxisLockMode::None {
+                    self.snap.axis_lock = AxisLockMode::None;
+                } else {
+                    let msg = self.session.cancel();
+                    self.snap.clear_smart_track();
+                    self.last_inference_guides.clear();
+                    self.smart_track_hover = None;
+                    self.log(msg);
+                }
             } else if !self.selected_cps.is_empty() {
                 self.selected_cps.clear();
             } else if !self.selected_subobjects.is_empty() {
                 self.selected_subobjects.clear();
             } else {
                 self.doc.clear_selection();
+                self.gumball_custom_origin = None;
                 self.mark_doc_dirty();
+            }
+        }
+        if !ctx.wants_keyboard_input()
+            && (ctx.input(|i| i.key_pressed(egui::Key::Q))
+                || (!self.session.is_active() && ctx.input(|i| i.key_pressed(egui::Key::Space))))
+        {
+            if self.radial_menu_pos.is_some() {
+                self.radial_menu_pos = None;
+            } else {
+                let pos = ctx
+                    .input(|i| i.pointer.hover_pos())
+                    .unwrap_or_else(|| ctx.screen_rect().center());
+                self.radial_menu_pos = Some(pos);
             }
         }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Z)) {
@@ -51,6 +77,7 @@ impl eframe::App for ElephantApp {
         self.draw_inspector(ctx);
         self.draw_status_bar(ctx);
         self.draw_tools_panel(ctx);
+        self.draw_tool_palette(ctx);
 
         self.ensure_render_caches();
 
@@ -96,5 +123,6 @@ impl eframe::App for ElephantApp {
 
         self.draw_gumball_prompt_window(ctx);
         self.draw_uvn_prompt_window(ctx);
+        self.draw_radial_menu(ctx);
     }
 }

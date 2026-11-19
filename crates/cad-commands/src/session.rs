@@ -1,8 +1,49 @@
-use cad_doc::{AnnotationItem, AnnotationKind, Document, ObjectId};
+use cad_doc::{AnnotationItem, AnnotationKind, Document, HistoryOp, ObjectId};
 use cad_geom::{
     BRep, DMat4, DVec3, Geometry, NurbsCurve, NurbsSurface, OffsetCornerStyle, Plane,
     rail_revolve_nurbs, revolve_nurbs, trim_curve_with_cutters,
 };
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandOptionKind {
+    Toggle(bool),
+    Int {
+        value: usize,
+        min: usize,
+        max: usize,
+    },
+    Float {
+        value: f64,
+        step: f64,
+        suffix: &'static str,
+    },
+    Choice {
+        current: &'static str,
+        choices: &'static [&'static str],
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandOption {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub kind: CommandOptionKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DimensionUnitKind {
+    Length,
+    Angle,
+    Factor,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveDimensionBadge {
+    pub world_pos: DVec3,
+    pub prefix: &'static str,
+    pub value: f64,
+    pub unit_kind: DimensionUnitKind,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActiveTool {
@@ -784,17 +825,27 @@ impl CommandSession {
                     }
                     let curves: Vec<_> = doc
                         .objects
-                        .values()
-                        .filter(|o| o.selected)
-                        .filter_map(|o| match &o.geometry {
-                            Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                        .iter()
+                        .filter(|(_, o)| o.selected)
+                        .filter_map(|(id, o)| match &o.geometry {
+                            Geometry::Curve(c) => Some((id, o.layer_id, c.clone())),
                             _ => None,
                         })
                         .collect();
                     let mut created = 0;
-                    for (lid, c) in curves {
+                    for (pid, lid, c) in curves {
                         if let Ok(srf) = revolve_nurbs(&c, a, dir, deg.to_radians()) {
-                            doc.add_object_on_layer("Revolve", lid, Geometry::Surface(srf));
+                            let cid =
+                                doc.add_object_on_layer("Revolve", lid, Geometry::Surface(srf));
+                            doc.add_history_record(
+                                cid,
+                                vec![pid],
+                                HistoryOp::Revolve {
+                                    axis_origin: a,
+                                    axis_dir: dir,
+                                    angle_rad: deg.to_radians(),
+                                },
+                            );
                             created += 1;
                         }
                     }
@@ -1086,17 +1137,25 @@ impl CommandSession {
                     let mat = DMat4::from_translation(a) * refl * DMat4::from_translation(-a);
                     let copies: Vec<_> = doc
                         .objects
-                        .values()
-                        .filter(|o| o.selected)
-                        .map(|o| {
+                        .iter()
+                        .filter(|(_, o)| o.selected)
+                        .map(|(id, o)| {
                             let mut g = o.geometry.clone();
                             g.transform(&mat);
-                            (o.layer_id, g)
+                            (id, o.layer_id, g)
                         })
                         .collect();
                     let count = copies.len();
-                    for (lid, g) in copies {
-                        doc.add_object_on_layer("Mirror", lid, g);
+                    for (pid, lid, g) in copies {
+                        let cid = doc.add_object_on_layer("Mirror", lid, g);
+                        doc.add_history_record(
+                            cid,
+                            vec![pid],
+                            HistoryOp::Mirror {
+                                plane_origin: a,
+                                plane_normal: n,
+                            },
+                        );
                     }
                     self.tool = ActiveTool::Idle;
                     CommandOutcome::done(format!("Mirrored {count} object(s)."))
@@ -1109,19 +1168,29 @@ impl CommandSession {
                 let d = *distance;
                 let curves: Vec<_> = doc
                     .objects
-                    .values()
-                    .filter(|o| o.selected)
-                    .filter_map(|o| match &o.geometry {
-                        Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                    .iter()
+                    .filter(|(_, o)| o.selected)
+                    .filter_map(|(id, o)| match &o.geometry {
+                        Geometry::Curve(c) => Some((id, o.layer_id, c.clone())),
                         _ => None,
                     })
                     .collect();
                 let mut created = 0;
-                for (lid, c) in &curves {
+                for (pid, lid, c) in &curves {
                     if let Ok(off) =
                         c.offset_nurbs_in_plane(cplane, d, pt, OffsetCornerStyle::Sharp)
                     {
-                        doc.add_object_on_layer("Offset", *lid, Geometry::Curve(off));
+                        let cid = doc.add_object_on_layer("Offset", *lid, Geometry::Curve(off));
+                        doc.add_history_record(
+                            cid,
+                            vec![*pid],
+                            HistoryOp::OffsetCurve {
+                                distance: d,
+                                plane: *cplane,
+                                side_pt: pt,
+                                corner: OffsetCornerStyle::Sharp,
+                            },
+                        );
                         created += 1;
                     }
                 }
@@ -1284,17 +1353,22 @@ impl CommandSession {
                     let total_copies = *count;
                     let selected: Vec<_> = doc
                         .objects
-                        .values()
-                        .filter(|o| o.selected)
-                        .map(|o| (o.layer_id, o.geometry.clone()))
+                        .iter()
+                        .filter(|(_, o)| o.selected)
+                        .map(|(id, o)| (id, o.layer_id, o.geometry.clone()))
                         .collect();
                     let mut created = 0;
                     for i in 1..total_copies {
                         let mat = DMat4::from_translation(step * i as f64);
-                        for (lid, g) in &selected {
+                        for (pid, lid, g) in &selected {
                             let mut ng = g.clone();
                             ng.transform(&mat);
-                            doc.add_object_on_layer("ArrayLinear", *lid, ng);
+                            let cid = doc.add_object_on_layer("ArrayLinear", *lid, ng);
+                            doc.add_history_record(
+                                cid,
+                                vec![*pid],
+                                HistoryOp::ArrayLinear { index: i, step },
+                            );
                             created += 1;
                         }
                     }
@@ -1309,9 +1383,9 @@ impl CommandSession {
                 let total = *count;
                 let selected: Vec<_> = doc
                     .objects
-                    .values()
-                    .filter(|o| o.selected)
-                    .map(|o| (o.layer_id, o.geometry.clone()))
+                    .iter()
+                    .filter(|(_, o)| o.selected)
+                    .map(|(id, o)| (id, o.layer_id, o.geometry.clone()))
                     .collect();
                 let mut created = 0;
                 for i in 1..total {
@@ -1319,10 +1393,20 @@ impl CommandSession {
                     let mat = DMat4::from_translation(pt)
                         * DMat4::from_axis_angle(cplane.z_axis, angle)
                         * DMat4::from_translation(-pt);
-                    for (lid, g) in &selected {
+                    for (pid, lid, g) in &selected {
                         let mut ng = g.clone();
                         ng.transform(&mat);
-                        doc.add_object_on_layer("ArrayPolar", *lid, ng);
+                        let cid = doc.add_object_on_layer("ArrayPolar", *lid, ng);
+                        doc.add_history_record(
+                            cid,
+                            vec![*pid],
+                            HistoryOp::ArrayPolar {
+                                index: i,
+                                total,
+                                center: pt,
+                                axis: cplane.z_axis,
+                            },
+                        );
                         created += 1;
                     }
                 }
@@ -1835,6 +1919,305 @@ impl CommandSession {
             _ => Vec::new(),
         }
     }
+
+    pub fn active_options(&self) -> Vec<CommandOption> {
+        match &self.tool {
+            ActiveTool::Curve { degree, closed, .. }
+            | ActiveTool::InterpCrv { degree, closed, .. } => vec![
+                CommandOption {
+                    key: "degree",
+                    label: "Degree",
+                    kind: CommandOptionKind::Int {
+                        value: *degree,
+                        min: 1,
+                        max: 7,
+                    },
+                },
+                CommandOption {
+                    key: "closed",
+                    label: "Closed",
+                    kind: CommandOptionKind::Toggle(*closed),
+                },
+            ],
+            ActiveTool::Helix { turns, .. } => vec![CommandOption {
+                key: "turns",
+                label: "Turns",
+                kind: CommandOptionKind::Float {
+                    value: *turns,
+                    step: 0.5,
+                    suffix: "x",
+                },
+            }],
+            ActiveTool::Polygon { sides, .. } => vec![CommandOption {
+                key: "sides",
+                label: "Sides",
+                kind: CommandOptionKind::Int {
+                    value: *sides,
+                    min: 3,
+                    max: 64,
+                },
+            }],
+            ActiveTool::Revolve { angle_deg, .. } => vec![CommandOption {
+                key: "angle",
+                label: "Angle",
+                kind: CommandOptionKind::Float {
+                    value: *angle_deg,
+                    step: 45.0,
+                    suffix: "deg",
+                },
+            }],
+            ActiveTool::ExtractIsocurve { dir_v }
+            | ActiveTool::SplitSrf { dir_v }
+            | ActiveTool::InsertKnot { dir_v } => vec![CommandOption {
+                key: "dir",
+                label: "Dir",
+                kind: CommandOptionKind::Choice {
+                    current: if *dir_v { "V" } else { "U" },
+                    choices: &["U", "V"],
+                },
+            }],
+            ActiveTool::Offset { distance } => vec![CommandOption {
+                key: "distance",
+                label: "Dist",
+                kind: CommandOptionKind::Float {
+                    value: *distance,
+                    step: 0.5,
+                    suffix: "",
+                },
+            }],
+            ActiveTool::ArrayLinear { count, .. } | ActiveTool::ArrayPolar { count } => {
+                vec![CommandOption {
+                    key: "count",
+                    label: "Count",
+                    kind: CommandOptionKind::Int {
+                        value: *count,
+                        min: 2,
+                        max: 64,
+                    },
+                }]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn apply_option(&mut self, key: &str, value: &str) -> Option<String> {
+        let lower_key = key.to_ascii_lowercase();
+        let lower_val = value.to_ascii_lowercase();
+        match &mut self.tool {
+            ActiveTool::Curve { degree, closed, .. }
+            | ActiveTool::InterpCrv { degree, closed, .. } => match lower_key.as_str() {
+                "degree" => {
+                    if let Ok(d) = value.trim().parse::<usize>() {
+                        *degree = d.clamp(1, 7);
+                        return Some(format!("Curve degree = {}.", *degree));
+                    }
+                }
+                "closed" => {
+                    *closed = match lower_val.as_str() {
+                        "true" | "1" | "yes" => true,
+                        "false" | "0" | "no" => false,
+                        _ => !*closed,
+                    };
+                    return Some(format!("Curve closed = {}.", *closed));
+                }
+                _ => {}
+            },
+            ActiveTool::Helix { turns, .. } if lower_key == "turns" => {
+                if let Ok(t) = value.trim().parse::<f64>() {
+                    if t.abs() >= 0.05 {
+                        *turns = t.clamp(-100.0, 100.0);
+                        return Some(format!("Helix turns = {:.2}.", *turns));
+                    }
+                }
+            }
+            ActiveTool::Polygon { sides, .. } if lower_key == "sides" => {
+                if let Ok(s) = value.trim().parse::<usize>() {
+                    *sides = s.clamp(3, 64);
+                    return Some(format!("Polygon sides = {}.", *sides));
+                }
+            }
+            ActiveTool::Revolve { angle_deg, .. } if lower_key == "angle" => {
+                if let Ok(a) = value.trim().parse::<f64>() {
+                    *angle_deg = a.clamp(-360.0, 360.0);
+                    return Some(format!("Revolve angle = {:.1} deg.", *angle_deg));
+                }
+            }
+            ActiveTool::ExtractIsocurve { dir_v }
+            | ActiveTool::SplitSrf { dir_v }
+            | ActiveTool::InsertKnot { dir_v }
+                if lower_key == "dir" =>
+            {
+                *dir_v = match lower_val.as_str() {
+                    "u" => false,
+                    "v" => true,
+                    _ => !*dir_v,
+                };
+                return Some(format!(
+                    "Surface parameter direction = {}.",
+                    if *dir_v { "V" } else { "U" }
+                ));
+            }
+            ActiveTool::Offset { distance } if lower_key == "distance" => {
+                if let Ok(d) = value.trim().parse::<f64>() {
+                    *distance = d.max(1e-3);
+                    return Some(format!("Offset distance = {:.3}.", *distance));
+                }
+            }
+            ActiveTool::ArrayLinear { count, .. } | ActiveTool::ArrayPolar { count }
+                if lower_key == "count" =>
+            {
+                if let Ok(c) = value.trim().parse::<usize>() {
+                    *count = c.clamp(2, 64);
+                    return Some(format!("Array count = {}.", *count));
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    pub fn live_dimensions(&self, cursor: Option<DVec3>, cplane: &Plane) -> Vec<LiveDimensionBadge> {
+        let Some(cur) = cursor else {
+            return Vec::new();
+        };
+        match &self.tool {
+            ActiveTool::Line { start: Some(s) }
+            | ActiveTool::Move { base: Some(s) }
+            | ActiveTool::Copy { base: Some(s) }
+            | ActiveTool::Distance { first: Some(s) }
+            | ActiveTool::ArrayLinear { base: Some(s), .. } => {
+                let d = s.distance(cur);
+                if d > 1e-6 {
+                    vec![LiveDimensionBadge {
+                        world_pos: (*s + cur) * 0.5,
+                        prefix: "L=",
+                        value: d,
+                        unit_kind: DimensionUnitKind::Length,
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            ActiveTool::Rectangle { corner1: Some(a) }
+            | ActiveTool::Box {
+                base: Some(a),
+                corner: None,
+            } => {
+                let delta = cur - *a;
+                let w = delta.dot(cplane.x_axis).abs();
+                let h = delta.dot(cplane.y_axis).abs();
+                let dx_vec = cplane.x_axis * delta.dot(cplane.x_axis);
+                let dy_vec = cplane.y_axis * delta.dot(cplane.y_axis);
+                let mut out = Vec::with_capacity(2);
+                if w > 1e-5 {
+                    out.push(LiveDimensionBadge {
+                        world_pos: *a + dx_vec * 0.5,
+                        prefix: "W=",
+                        value: w,
+                        unit_kind: DimensionUnitKind::Length,
+                    });
+                }
+                if h > 1e-5 {
+                    out.push(LiveDimensionBadge {
+                        world_pos: *a + dy_vec * 0.5,
+                        prefix: "D=",
+                        value: h,
+                        unit_kind: DimensionUnitKind::Length,
+                    });
+                }
+                out
+            }
+            ActiveTool::Box {
+                base: Some(_),
+                corner: Some(c),
+            }
+            | ActiveTool::Cylinder {
+                center: Some(c),
+                radius: Some(_),
+            }
+            | ActiveTool::Cone {
+                center: Some(c),
+                radius: Some(_),
+            } => {
+                let h = (cur - *c).dot(cplane.z_axis).abs();
+                if h > 1e-5 {
+                    vec![LiveDimensionBadge {
+                        world_pos: (*c + cur) * 0.5,
+                        prefix: "H=",
+                        value: h,
+                        unit_kind: DimensionUnitKind::Length,
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            ActiveTool::Circle { center: Some(c) }
+            | ActiveTool::Cylinder {
+                center: Some(c),
+                radius: None,
+            }
+            | ActiveTool::Cone {
+                center: Some(c),
+                radius: None,
+            } => {
+                let r = c.distance(cur);
+                if r > 1e-5 {
+                    vec![LiveDimensionBadge {
+                        world_pos: (*c + cur) * 0.5,
+                        prefix: "R=",
+                        value: r,
+                        unit_kind: DimensionUnitKind::Length,
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            ActiveTool::Rotate {
+                center: Some(c),
+                ref_vec: Some(v0),
+            } => {
+                let v1 = (cur - *c).normalize_or_zero();
+                if v1.length_squared() > 1e-6 {
+                    let sign = if v0.cross(v1).dot(cplane.z_axis) >= 0.0 {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    let deg = v0.angle_between(v1).to_degrees() * sign;
+                    vec![LiveDimensionBadge {
+                        world_pos: cur,
+                        prefix: "A=",
+                        value: deg,
+                        unit_kind: DimensionUnitKind::Angle,
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            ActiveTool::Scale {
+                origin: Some(o),
+                ref_dist: Some(d0),
+            } => {
+                let factor = o.distance(cur).max(1e-4) / (*d0).max(1e-6);
+                vec![LiveDimensionBadge {
+                    world_pos: cur,
+                    prefix: "S=",
+                    value: factor,
+                    unit_kind: DimensionUnitKind::Factor,
+                }]
+            }
+            ActiveTool::Dim {
+                p1: Some(a),
+                p2: Some(b),
+            } => vec![LiveDimensionBadge {
+                world_pos: cur,
+                prefix: "Dim=",
+                value: a.distance(*b),
+                unit_kind: DimensionUnitKind::Length,
+            }],
+            _ => Vec::new(),
+        }
+    }
 }
 
 pub fn parse_point_input(raw: &str, base: Option<DVec3>) -> Option<DVec3> {
@@ -2019,5 +2402,47 @@ mod tests {
         assert_eq!(srf_count, 2);
         assert_eq!(doc.undo().as_deref(), Some("SplitSrf"));
         assert!(doc.objects.get(rev_id).is_some());
+    }
+
+    #[test]
+    fn command_options_and_live_dimension_badges_work_across_tools() {
+        let mut doc = Document::new();
+        let mut session = CommandSession::default();
+        let plane = Plane::world_xy();
+
+        // Curve options
+        session.start_tool("curve", &doc);
+        let opts = session.active_options();
+        assert_eq!(opts.len(), 2);
+        assert!(session.apply_option("degree", "5").is_some());
+        assert!(session.apply_option("closed", "true").is_some());
+        let updated = session.active_options();
+        assert_eq!(
+            updated[0].kind,
+            CommandOptionKind::Int {
+                value: 5,
+                min: 1,
+                max: 7
+            }
+        );
+        assert_eq!(updated[1].kind, CommandOptionKind::Toggle(true));
+        session.cancel();
+
+        // Line live dimension badge
+        session.start_tool("line", &doc);
+        session.on_point(DVec3::ZERO, &mut doc, &plane);
+        let badges = session.live_dimensions(Some(DVec3::new(10.0, 0.0, 0.0)), &plane);
+        assert_eq!(badges.len(), 1);
+        assert!((badges[0].value - 10.0).abs() < 1e-9);
+        assert_eq!(badges[0].unit_kind, DimensionUnitKind::Length);
+        session.cancel();
+
+        // Rectangle live dimension badges (W and D)
+        session.start_tool("rectangle", &doc);
+        session.on_point(DVec3::ZERO, &mut doc, &plane);
+        let rect_badges = session.live_dimensions(Some(DVec3::new(6.0, 4.0, 0.0)), &plane);
+        assert_eq!(rect_badges.len(), 2);
+        assert!((rect_badges[0].value - 6.0).abs() < 1e-9);
+        assert!((rect_badges[1].value - 4.0).abs() < 1e-9);
     }
 }

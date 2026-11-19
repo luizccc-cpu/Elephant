@@ -1,4 +1,4 @@
-use cad_doc::{AnnotationItem, AnnotationKind, Document, Layer};
+use cad_doc::{AnnotationItem, AnnotationKind, Document, HistoryOp, HistoryRecord, Layer};
 use cad_geom::{DVec3, Geometry, Tolerances, UnitSystem};
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +25,8 @@ struct SavedLayer {
     visible: bool,
     locked: bool,
     active: bool,
+    #[serde(default)]
+    parent_index: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,6 +59,13 @@ struct SavedAnnotation {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct SavedHistoryRecord {
+    child_index: usize,
+    parent_indices: Vec<usize>,
+    op: HistoryOp,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct ElephantProject {
     version: u32,
     #[serde(default)]
@@ -66,6 +75,8 @@ struct ElephantProject {
     objects: Vec<SavedObject>,
     #[serde(default)]
     annotations: Vec<SavedAnnotation>,
+    #[serde(default)]
+    history_records: Vec<SavedHistoryRecord>,
     #[serde(default)]
     metadata: ProjectMetadata,
 }
@@ -80,20 +91,25 @@ pub fn save_project_with_meta(
         .iter()
         .map(|&lid| {
             let l = &doc.layers[lid];
+            let parent_index = l
+                .parent
+                .and_then(|p| layer_keys.iter().position(|&k| k == p));
             SavedLayer {
                 name: l.name.clone(),
                 color: l.color,
                 visible: l.visible,
                 locked: l.locked,
                 active: lid == doc.active_layer,
+                parent_index,
             }
         })
         .collect();
 
-    let objects = doc
-        .objects
-        .values()
-        .map(|obj| {
+    let obj_keys: Vec<_> = doc.objects.keys().collect();
+    let objects = obj_keys
+        .iter()
+        .map(|&oid| {
+            let obj = &doc.objects[oid];
             let layer_index = layer_keys
                 .iter()
                 .position(|&lid| lid == obj.layer_id)
@@ -130,6 +146,24 @@ pub fn save_project_with_meta(
         })
         .collect();
 
+    let history_records = doc
+        .history_records
+        .iter()
+        .filter_map(|rec| {
+            let child_index = obj_keys.iter().position(|&id| id == rec.child_id)?;
+            let parent_indices: Option<Vec<usize>> = rec
+                .parent_ids
+                .iter()
+                .map(|pid| obj_keys.iter().position(|&id| id == *pid))
+                .collect();
+            Some(SavedHistoryRecord {
+                child_index,
+                parent_indices: parent_indices?,
+                op: rec.op.clone(),
+            })
+        })
+        .collect();
+
     let proj = ElephantProject {
         version: 2,
         units: doc.units,
@@ -137,6 +171,7 @@ pub fn save_project_with_meta(
         layers,
         objects,
         annotations,
+        history_records,
         metadata: meta.clone(),
     };
     Ok(serde_json::to_string_pretty(&proj)?)
@@ -157,21 +192,35 @@ pub fn load_project_with_meta(input: &str) -> Result<(Document, ProjectMetadata)
     if !proj.layers.is_empty() {
         doc.layers.clear();
         let mut new_keys = Vec::with_capacity(proj.layers.len());
+        let mut parent_indices = Vec::with_capacity(proj.layers.len());
         let mut active_idx = 0usize;
         for (i, sl) in proj.layers.into_iter().enumerate() {
             if sl.active {
                 active_idx = i;
             }
-            let lid = doc.layers.insert(Layer {
-                name: sl.name,
-                color: sl.color,
-                visible: sl.visible,
-                locked: sl.locked,
-            });
+            parent_indices.push(sl.parent_index);
+            let lid = doc.layers.insert(Layer::new(sl.name, sl.color));
+            if let Some(l) = doc.layers.get_mut(lid) {
+                l.visible = sl.visible;
+                l.locked = sl.locked;
+            }
             new_keys.push(lid);
         }
+        for (i, pidx) in parent_indices.into_iter().enumerate() {
+            if let Some(pi) = pidx {
+                if pi != i {
+                    if let Some(&parent_lid) = new_keys.get(pi) {
+                        if let Some(layer) = doc.layers.get_mut(new_keys[i]) {
+                            layer.parent = Some(parent_lid);
+                        }
+                    }
+                }
+            }
+        }
+
         let restore_active = new_keys[active_idx];
         let mut max_gid = 0_u64;
+        let mut restored_obj_ids = Vec::with_capacity(proj.objects.len());
 
         for so in proj.objects {
             let lid = *new_keys.get(so.layer_index).unwrap_or(&restore_active);
@@ -185,8 +234,26 @@ pub fn load_project_with_meta(input: &str) -> Result<(Document, ProjectMetadata)
                     max_gid = max_gid.max(gid);
                 }
             }
+            restored_obj_ids.push(oid);
         }
         doc.ensure_next_group_id_above(max_gid);
+
+        for shr in proj.history_records {
+            if let Some(&child_id) = restored_obj_ids.get(shr.child_index) {
+                let parent_ids: Option<Vec<_>> = shr
+                    .parent_indices
+                    .into_iter()
+                    .map(|idx| restored_obj_ids.get(idx).copied())
+                    .collect();
+                if let Some(parent_ids) = parent_ids {
+                    doc.history_records.push(HistoryRecord {
+                        child_id,
+                        parent_ids,
+                        op: shr.op,
+                    });
+                }
+            }
+        }
 
         for sa in proj.annotations {
             let lid = *new_keys.get(sa.layer_index).unwrap_or(&restore_active);
@@ -317,5 +384,62 @@ mod tests {
             }
             other => panic!("expected BRep after roundtrip, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn roundtrips_nested_layers_and_modeling_history() {
+        let mut doc = Document::new();
+        let parent_layer = doc.add_layer("Assemblies", [120, 180, 240, 255]);
+        let child_layer = doc.add_sublayer("Brackets", [240, 160, 120, 255], parent_layer);
+        doc.layers[parent_layer].visible = false;
+        assert!(!doc.is_layer_effectively_visible(child_layer));
+
+        let line = NurbsCurve::line(DVec3::ZERO, DVec3::new(3.0, 0.0, 0.0));
+        let p_id = doc.add_object_on_layer("Line", child_layer, Geometry::Curve(line));
+        let ext = cad_geom::NurbsSurface::extrude_curve(
+            match &doc.objects[p_id].geometry {
+                Geometry::Curve(c) => c,
+                _ => unreachable!(),
+            },
+            DVec3::new(0.0, 0.0, 4.0),
+        );
+        let c_id = doc.add_object_on_layer("Extrude", child_layer, Geometry::Surface(ext));
+        doc.add_history_record(
+            c_id,
+            vec![p_id],
+            HistoryOp::Extrude {
+                direction: DVec3::new(0.0, 0.0, 4.0),
+                solid: false,
+            },
+        );
+
+        let json = save_project_json(&doc).unwrap();
+        let loaded = load_project_json(&json).unwrap();
+        assert_eq!(loaded.layers.len(), 3);
+        let loaded_child = loaded
+            .layers
+            .iter()
+            .find(|(_, l)| l.name == "Brackets")
+            .map(|(id, _)| id)
+            .unwrap();
+        assert!(!loaded.is_layer_effectively_visible(loaded_child));
+        assert_eq!(loaded.history_records.len(), 1);
+
+        // Moving parent in loaded doc still updates child via preserved history!
+        let mut loaded = loaded;
+        let restored_parent = loaded
+            .objects
+            .iter()
+            .find(|(_, o)| matches!(o.geometry, Geometry::Curve(_)))
+            .map(|(id, _)| id)
+            .unwrap();
+        loaded.clear_selection();
+        loaded.set_selected(restored_parent, true);
+        loaded.transform_selected(
+            "MoveParent",
+            &cad_geom::DMat4::from_translation(DVec3::new(0.0, 5.0, 0.0)),
+        );
+        let restored_child = loaded.history_records[0].child_id;
+        assert!((loaded.objects[restored_child].aabb.center().y - 5.0).abs() < 1e-6);
     }
 }

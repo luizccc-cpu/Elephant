@@ -11,6 +11,8 @@ pub struct Layer {
     pub color: [u8; 4],
     pub visible: bool,
     pub locked: bool,
+    #[serde(default)]
+    pub parent: Option<LayerId>,
 }
 
 impl Layer {
@@ -20,6 +22,17 @@ impl Layer {
             color,
             visible: true,
             locked: false,
+            parent: None,
+        }
+    }
+
+    pub fn new_child(name: impl Into<String>, color: [u8; 4], parent: LayerId) -> Self {
+        Self {
+            name: name.into(),
+            color,
+            visible: true,
+            locked: false,
+            parent: Some(parent),
         }
     }
 }

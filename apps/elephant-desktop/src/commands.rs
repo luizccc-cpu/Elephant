@@ -1,4 +1,4 @@
-use cad_doc::{AnnotationItem, AnnotationKind, Document, ObjectId};
+use cad_doc::{AnnotationItem, AnnotationKind, Document, HistoryOp, ObjectId};
 use cad_geom::{
     BRep, BooleanOp, BoundaryLock, Continuity, DMat4, DVec3, Geometry, LoftStyle, NurbsCurve,
     NurbsSurface, PatchBoundaryConstraint, PatchOptions, Plane, SoftTransformFalloff,
@@ -167,46 +167,66 @@ impl ElephantApp {
             "extrude" => {
                 let h = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(3.0);
                 let dir = cplane.z_axis * h;
-                let curves: Vec<_> = self
+                let curves: Vec<(ObjectId, cad_doc::LayerId, NurbsCurve)> = self
                     .doc
-                    .objects
-                    .values()
-                    .filter(|o| o.selected)
-                    .filter_map(|o| match &o.geometry {
-                        Geometry::Curve(c) => Some((o.layer_id, c.clone())),
-                        _ => None,
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::Curve(c) => Some((id, o.layer_id, c.clone())),
+                            _ => None,
+                        })
                     })
                     .collect();
                 if curves.is_empty() {
                     self.log("Select one or more curves first, then run Extrude.");
                 } else {
-                    for (lid, c) in &curves {
+                    for (pid, lid, c) in &curves {
                         if c.is_closed() {
                             if let Ok(solid) = BRep::extrude_curve_solid(c, dir) {
-                                self.doc.add_object_on_layer(
+                                let cid = self.doc.add_object_on_layer(
                                     "ExtrudeSolid",
                                     *lid,
                                     Geometry::BRep(solid),
+                                );
+                                self.doc.add_history_record(
+                                    cid,
+                                    vec![*pid],
+                                    HistoryOp::Extrude {
+                                        direction: dir,
+                                        solid: true,
+                                    },
                                 );
                                 continue;
                             }
                         }
                         let surf = NurbsSurface::extrude_curve(c, dir);
-                        self.doc
+                        let cid = self
+                            .doc
                             .add_object_on_layer("Extrude", *lid, Geometry::Surface(surf));
+                        self.doc.add_history_record(
+                            cid,
+                            vec![*pid],
+                            HistoryOp::Extrude {
+                                direction: dir,
+                                solid: false,
+                            },
+                        );
                     }
                     self.mark_scene_dirty();
                     self.log(format!("Extruded {} curve(s) by {h}.", curves.len()));
                 }
             }
             "planarsrf" => {
-                let curves: Vec<_> = self
+                let curves: Vec<(ObjectId, cad_doc::LayerId, NurbsCurve)> = self
                     .doc
                     .selected_ids_ordered()
                     .into_iter()
                     .filter_map(|id| {
                         self.doc.objects.get(id).and_then(|o| match &o.geometry {
-                            Geometry::Curve(c) if c.is_closed() => Some((o.layer_id, c.clone())),
+                            Geometry::Curve(c) if c.is_closed() => {
+                                Some((id, o.layer_id, c.clone()))
+                            }
                             _ => None,
                         })
                     })
@@ -214,22 +234,30 @@ impl ElephantApp {
                 if curves.is_empty() {
                     self.log("Select closed planar curve(s) first, then run PlanarSrf.");
                 } else {
-                    let lid0 = curves[0].0;
+                    let lid0 = curves[0].1;
+                    let pids: Vec<ObjectId> = curves.iter().map(|(id, _, _)| *id).collect();
                     let only_curves: Vec<NurbsCurve> =
-                        curves.iter().map(|(_, c)| c.clone()).collect();
+                        curves.iter().map(|(_, _, c)| c.clone()).collect();
                     let mut created = 0usize;
                     if let Ok(brep) = BRep::from_planar_curves(&only_curves) {
+                        let cid = self.doc.add_object_on_layer(
+                            "PlanarSrf",
+                            lid0,
+                            Geometry::BRep(brep),
+                        );
                         self.doc
-                            .add_object_on_layer("PlanarSrf", lid0, Geometry::BRep(brep));
+                            .add_history_record(cid, pids, HistoryOp::PlanarSrf);
                         created = 1;
                     } else {
-                        for (lid, c) in &curves {
+                        for (pid, lid, c) in &curves {
                             if let Ok(brep) = BRep::from_planar_curves(std::slice::from_ref(c)) {
-                                self.doc.add_object_on_layer(
+                                let cid = self.doc.add_object_on_layer(
                                     "PlanarSrf",
                                     *lid,
                                     Geometry::BRep(brep),
                                 );
+                                self.doc
+                                    .add_history_record(cid, vec![*pid], HistoryOp::PlanarSrf);
                                 created += 1;
                             }
                         }
@@ -255,13 +283,13 @@ impl ElephantApp {
                         _ => {}
                     }
                 }
-                let curves: Vec<(cad_doc::LayerId, NurbsCurve)> = self
+                let curves: Vec<(ObjectId, cad_doc::LayerId, NurbsCurve)> = self
                     .doc
                     .selected_ids_ordered()
                     .into_iter()
                     .filter_map(|id| {
                         self.doc.objects.get(id).and_then(|o| match &o.geometry {
-                            Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                            Geometry::Curve(c) => Some((id, o.layer_id, c.clone())),
                             _ => None,
                         })
                     })
@@ -269,13 +297,17 @@ impl ElephantApp {
                 if curves.len() < 2 {
                     self.log("Select 2 or more curves to Loft [normal|loose|tight|straight] [closed].");
                 } else {
-                    let lid = curves[0].0;
-                    let raw: Vec<NurbsCurve> = curves.into_iter().map(|(_, c)| c).collect();
+                    let lid = curves[0].1;
+                    let pids: Vec<ObjectId> = curves.iter().map(|(id, _, _)| *id).collect();
+                    let raw: Vec<NurbsCurve> = curves.into_iter().map(|(_, _, c)| c).collect();
                     let n_crvs = raw.len();
                     match loft_nurbs(&raw, style, closed) {
                         Ok(srf) => {
-                            self.doc
+                            let cid = self
+                                .doc
                                 .add_object_on_layer("Loft", lid, Geometry::Surface(srf));
+                            self.doc
+                                .add_history_record(cid, pids, HistoryOp::Loft { style, closed });
                             self.mark_scene_dirty();
                             self.log(format!("Lofted {n_crvs} curves into NURBS surface ({style:?})."));
                         }
@@ -287,13 +319,13 @@ impl ElephantApp {
                 let roadlike = args
                     .iter()
                     .any(|a| a.eq_ignore_ascii_case("roadlike") || a.eq_ignore_ascii_case("road"));
-                let curves: Vec<(cad_doc::LayerId, NurbsCurve)> = self
+                let curves: Vec<(ObjectId, cad_doc::LayerId, NurbsCurve)> = self
                     .doc
                     .selected_ids_ordered()
                     .into_iter()
                     .filter_map(|id| {
                         self.doc.objects.get(id).and_then(|o| match &o.geometry {
-                            Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                            Geometry::Curve(c) => Some((id, o.layer_id, c.clone())),
                             _ => None,
                         })
                     })
@@ -301,14 +333,18 @@ impl ElephantApp {
                 if curves.len() < 2 {
                     self.log("Select rail curve first, then 1+ profile curves: Sweep1 [roadlike].");
                 } else {
-                    let lid = curves[0].0;
-                    let rail = &curves[0].1;
-                    let profs: Vec<NurbsCurve> = curves[1..].iter().map(|c| c.1.clone()).collect();
+                    let lid = curves[0].1;
+                    let pids: Vec<ObjectId> = curves.iter().map(|(id, _, _)| *id).collect();
+                    let rail = &curves[0].2;
+                    let profs: Vec<NurbsCurve> =
+                        curves[1..].iter().map(|(_, _, c)| c.clone()).collect();
                     let up = roadlike.then_some(cplane.z_axis);
                     match sweep1(rail, &profs, up) {
                         Ok(srf) => {
-                            self.doc
+                            let cid = self
+                                .doc
                                 .add_object_on_layer("Sweep1", lid, Geometry::Surface(srf));
+                            self.doc.add_history_record(cid, pids, HistoryOp::Sweep1);
                             self.mark_scene_dirty();
                             self.log(format!("Created Sweep1 NURBS surface from {} profile(s).", profs.len()));
                         }
@@ -317,13 +353,13 @@ impl ElephantApp {
                 }
             }
             "sweep2" => {
-                let curves: Vec<(cad_doc::LayerId, NurbsCurve)> = self
+                let curves: Vec<(ObjectId, cad_doc::LayerId, NurbsCurve)> = self
                     .doc
                     .selected_ids_ordered()
                     .into_iter()
                     .filter_map(|id| {
                         self.doc.objects.get(id).and_then(|o| match &o.geometry {
-                            Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                            Geometry::Curve(c) => Some((id, o.layer_id, c.clone())),
                             _ => None,
                         })
                     })
@@ -331,12 +367,16 @@ impl ElephantApp {
                 if curves.len() < 3 {
                     self.log("Select 2 rail curves first, then 1+ profile curves: Sweep2.");
                 } else {
-                    let lid = curves[0].0;
-                    let profs: Vec<NurbsCurve> = curves[2..].iter().map(|c| c.1.clone()).collect();
-                    match sweep2(&curves[0].1, &curves[1].1, &profs) {
+                    let lid = curves[0].1;
+                    let pids: Vec<ObjectId> = curves.iter().map(|(id, _, _)| *id).collect();
+                    let profs: Vec<NurbsCurve> =
+                        curves[2..].iter().map(|(_, _, c)| c.clone()).collect();
+                    match sweep2(&curves[0].2, &curves[1].2, &profs) {
                         Ok(srf) => {
-                            self.doc
+                            let cid = self
+                                .doc
                                 .add_object_on_layer("Sweep2", lid, Geometry::Surface(srf));
+                            self.doc.add_history_record(cid, pids, HistoryOp::Sweep2);
                             self.mark_scene_dirty();
                             self.log(format!("Created Sweep2 NURBS surface from {} profile(s).", profs.len()));
                         }
@@ -345,13 +385,13 @@ impl ElephantApp {
                 }
             }
             "edgesrf" => {
-                let curves: Vec<(cad_doc::LayerId, NurbsCurve)> = self
+                let curves: Vec<(ObjectId, cad_doc::LayerId, NurbsCurve)> = self
                     .doc
                     .selected_ids_ordered()
                     .into_iter()
                     .filter_map(|id| {
                         self.doc.objects.get(id).and_then(|o| match &o.geometry {
-                            Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                            Geometry::Curve(c) => Some((id, o.layer_id, c.clone())),
                             _ => None,
                         })
                     })
@@ -359,12 +399,15 @@ impl ElephantApp {
                 if !(2..=4).contains(&curves.len()) {
                     self.log("Select 2, 3, or 4 boundary curves for EdgeSrf.");
                 } else {
-                    let lid = curves[0].0;
-                    let raw: Vec<NurbsCurve> = curves.into_iter().map(|c| c.1).collect();
+                    let lid = curves[0].1;
+                    let pids: Vec<ObjectId> = curves.iter().map(|(id, _, _)| *id).collect();
+                    let raw: Vec<NurbsCurve> = curves.into_iter().map(|(_, _, c)| c).collect();
                     match edge_srf(&raw) {
                         Ok(srf) => {
-                            self.doc
+                            let cid = self
+                                .doc
                                 .add_object_on_layer("EdgeSrf", lid, Geometry::Surface(srf));
+                            self.doc.add_history_record(cid, pids, HistoryOp::EdgeSrf);
                             self.mark_scene_dirty();
                             self.log("Created Coons NURBS EdgeSrf.");
                         }
@@ -497,7 +540,7 @@ impl ElephantApp {
                     .into_iter()
                     .filter_map(|id| {
                         self.doc.objects.get(id).and_then(|o| match &o.geometry {
-                            Geometry::Surface(s) => Some((o.layer_id, s.clone())),
+                            Geometry::Surface(s) => Some((id, o.layer_id, s.clone())),
                             _ => None,
                         })
                     })
@@ -506,10 +549,19 @@ impl ElephantApp {
                     self.log("Select NURBS surface(s) to OffsetSrf [distance].");
                 } else {
                     let mut created = 0;
-                    for (lid, s) in &surfs {
+                    for (pid, lid, s) in &surfs {
                         if let Ok(off) = offset_srf(s, dist) {
-                            self.doc
+                            let cid = self
+                                .doc
                                 .add_object_on_layer("OffsetSrf", *lid, Geometry::Surface(off));
+                            self.doc.add_history_record(
+                                cid,
+                                vec![*pid],
+                                HistoryOp::OffsetSrf {
+                                    distance: dist,
+                                    solid: false,
+                                },
+                            );
                             created += 1;
                         }
                     }
@@ -1607,24 +1659,34 @@ impl ElephantApp {
                 }
                 let curves: Vec<_> = self
                     .doc
-                    .objects
-                    .values()
-                    .filter(|o| o.selected)
-                    .filter_map(|o| match &o.geometry {
-                        Geometry::Curve(c) => Some((o.layer_id, c.clone())),
-                        _ => None,
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::Curve(c) => Some((id, o.layer_id, c.clone())),
+                            _ => None,
+                        })
                     })
                     .collect();
                 if curves.len() != 2 {
                     self.log("Select exactly 2 curves to BlendCrv [g0|g1|g2|g3] [bulge].");
                 } else {
-                    let (lid, ref ca) = curves[0];
-                    let (_, ref cb) = curves[1];
+                    let (pid_a, lid, ref ca) = curves[0];
+                    let (pid_b, _, ref cb) = curves[1];
                     let (at_end_a, at_end_b) = closest_endpoint_pair(ca, cb);
                     match blend_curves(ca, at_end_a, cb, at_end_b, cont, bulge, bulge) {
                         Ok(blended) => {
-                            self.doc
+                            let cid = self
+                                .doc
                                 .add_object_on_layer("BlendCrv", lid, Geometry::Curve(blended));
+                            self.doc.add_history_record(
+                                cid,
+                                vec![pid_a, pid_b],
+                                HistoryOp::BlendCrv {
+                                    continuity: cont,
+                                    bulge,
+                                },
+                            );
                             self.mark_scene_dirty();
                             self.log(format!("Created {} blend curve.", cont.label()));
                         }
@@ -2054,6 +2116,7 @@ impl ElephantApp {
                 self.gumball_drag = None;
                 self.gumball_prompt = None;
                 self.marquee = None;
+                self.reset_phase4_interaction_state();
                 self.doc = Document::new();
                 self.mark_scene_dirty();
                 self.log("Created new empty document.");
@@ -2575,8 +2638,129 @@ impl ElephantApp {
                     if self.show_naked_edges { "On" } else { "Off" }
                 ));
             }
+            "autocplane" => {
+                match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
+                    Some("on" | "1" | "true") => self.auto_cplane = true,
+                    Some("off" | "0" | "false") => self.auto_cplane = false,
+                    _ => self.auto_cplane = !self.auto_cplane,
+                }
+                self.update_auto_cplane();
+                self.log(format!(
+                    "AutoCPlane: {}.",
+                    if self.auto_cplane { "On" } else { "Off" }
+                ));
+            }
+            "smarttrack" => {
+                match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
+                    Some("clear") => {
+                        self.snap.clear_smart_track();
+                        self.last_inference_guides.clear();
+                        self.smart_track_hover = None;
+                        self.log("Cleared SmartTrack temporary reference points.");
+                    }
+                    Some("on" | "1" | "true") => {
+                        self.snap.smart_track = true;
+                        self.log("SmartTrack: On.");
+                    }
+                    Some("off" | "0" | "false") => {
+                        self.snap.smart_track = false;
+                        self.snap.clear_smart_track();
+                        self.last_inference_guides.clear();
+                        self.smart_track_hover = None;
+                        self.log("SmartTrack: Off.");
+                    }
+                    _ => {
+                        self.snap.smart_track = !self.snap.smart_track;
+                        if !self.snap.smart_track {
+                            self.snap.clear_smart_track();
+                            self.last_inference_guides.clear();
+                            self.smart_track_hover = None;
+                        }
+                        self.log(format!(
+                            "SmartTrack: {}.",
+                            if self.snap.smart_track { "On" } else { "Off" }
+                        ));
+                    }
+                }
+            }
+            "gumballalign" => {
+                use crate::state::GumballAlignMode;
+                self.gumball_align = match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
+                    Some("world") => GumballAlignMode::World,
+                    Some("cplane") => GumballAlignMode::CPlane,
+                    Some("object" | "obj") => GumballAlignMode::Object,
+                    _ => match self.gumball_align {
+                        GumballAlignMode::World => GumballAlignMode::CPlane,
+                        GumballAlignMode::CPlane => GumballAlignMode::Object,
+                        GumballAlignMode::Object => GumballAlignMode::World,
+                    },
+                };
+                self.log(format!("Gumball alignment set to {:?}.", self.gumball_align));
+            }
+            "gumballrelocate" => {
+                if args.len() >= 3 {
+                    if let (Ok(x), Ok(y), Ok(z)) = (
+                        args[0].parse::<f64>(),
+                        args[1].parse::<f64>(),
+                        args[2].parse::<f64>(),
+                    ) {
+                        self.gumball_custom_origin = Some(DVec3::new(x, y, z));
+                        self.log(format!("Relocated Gumball origin to ({x:.3}, {y:.3}, {z:.3})."));
+                    } else {
+                        self.log("Usage: GumballRelocate <x> <y> <z> (or Ctrl+Drag Gumball center).");
+                    }
+                } else {
+                    self.log("Hold Ctrl and drag the Gumball origin to relocate, or pass X Y Z / run GumballReset.");
+                }
+            }
+            "gumballreset" => {
+                self.gumball_custom_origin = None;
+                self.log("Reset Gumball origin to selection centroid.");
+            }
+            "history" => {
+                match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
+                    Some("on" | "1" | "true") => self.doc.record_history = true,
+                    Some("off" | "0" | "false") => self.doc.record_history = false,
+                    _ => self.doc.record_history = !self.doc.record_history,
+                }
+                self.log(format!(
+                    "Modeling History recording: {}.",
+                    if self.doc.record_history { "On" } else { "Off" }
+                ));
+            }
+            "breakhistory" => {
+                let ids = self.doc.selected_ids_ordered();
+                if ids.is_empty() {
+                    self.log("Select object(s) to break Modeling History.");
+                } else {
+                    let mut broken = 0usize;
+                    for id in ids {
+                        if self.doc.break_history_for(id) {
+                            broken += 1;
+                        }
+                    }
+                    if broken > 0 {
+                        self.mark_doc_dirty();
+                    }
+                    self.log(format!("Broke Modeling History on {broken} object(s)."));
+                }
+            }
+            "historypurge" => {
+                let purged = self.doc.purge_broken_history();
+                if purged > 0 {
+                    self.mark_doc_dirty();
+                }
+                self.log(format!("Purged {purged} stale/broken history record(s)."));
+            }
+            "radialmenu" => {
+                if self.radial_menu_pos.is_some() {
+                    self.radial_menu_pos = None;
+                } else {
+                    self.radial_menu_pos = Some(eframe::egui::pos2(640.0, 400.0));
+                }
+            }
             "help" => {
-                self.log("Interactive: Line, Polyline, Curve, InterpCrv, HandleCurve, Conic, Helix, Rectangle, Arc, Circle, Polygon, Box, Cylinder, Cone, Revolve, RailRevolve, ExtractIsocurve, SplitSrf, Move, Copy, Rotate, Scale, Mirror, Offset, SplitCurve, Trim, InsertKnot, ArrayLinear, ArrayPolar, Distance, Dim, TextDot | B-Rep Solids & Surfacing: BooleanUnion/Difference/Intersection/Split, Intersect, Cap, Untrim, FilletSrf, FilletEdge, ChamferEdge, Shell, PushPull, Inset, ExtractSrf, ToBRep, ShowEdges (Ctrl+Shift+Click sub-objects) | Surfacing: Sphere, Torus, Plane, Extrude, PlanarSrf, Loft, Sweep1, Sweep2, EdgeSrf, NetworkSrf, BlendSrf, MatchSrf, OffsetSrf, ExtendSrf, Patch, RebuildSrf, DupBorder, DupEdge, Flip | Editing: PointsOn/Off, UVN, SoftTransform, Join, Explode, Split, Fillet, Chamfer, BlendCrv, Match, Rebuild, RebuildAdaptive (Elmo), Fair, TweenCurves, ChangeDegree, CurvatureGraph, Area, Units [mm|cm|m|in|ft], ZoomExtents (ZE), Undo, Redo");
+                self.log("Interactive: Line, Polyline, Curve, InterpCrv, HandleCurve, Conic, Helix, Rectangle, Arc, Circle, Polygon, Box, Cylinder, Cone, Revolve, RailRevolve, ExtractIsocurve, SplitSrf, Move, Copy, Rotate, Scale, Mirror, Offset, SplitCurve, Trim, InsertKnot, ArrayLinear, ArrayPolar, Distance, Dim, TextDot | B-Rep Solids & Surfacing: BooleanUnion/Difference/Intersection/Split, Intersect, Cap, Untrim, FilletSrf, FilletEdge, ChamferEdge, Shell, PushPull, Inset, ExtractSrf, ToBRep, ShowEdges (Ctrl+Shift+Click sub-objects) | Surfacing: Sphere, Torus, Plane, Extrude, PlanarSrf, Loft, Sweep1, Sweep2, EdgeSrf, NetworkSrf, BlendSrf, MatchSrf, OffsetSrf, ExtendSrf, Patch, RebuildSrf, DupBorder, DupEdge, Flip | Editing & UX: PointsOn/Off, UVN, SoftTransform, Join, Explode, Split, Fillet, Chamfer, BlendCrv, Match, Rebuild, RebuildAdaptive (Elmo), Fair, TweenCurves, ChangeDegree, CurvatureGraph, Area, AutoCPlane, SmartTrack, GumballAlign, GumballRelocate, GumballReset, History, BreakHistory, HistoryPurge, RadialMenu, Units [mm|cm|m|in|ft], ZoomExtents (ZE), Undo, Redo | Shortcuts: Q/Space=Radial Menu, Right/Left/Up=Axis Lock, T=SmartTrack point, Alt+Drag=Copy, Ctrl+Drag=Relocate Gumball");
             }
             _ => {
                 self.log(format!(
