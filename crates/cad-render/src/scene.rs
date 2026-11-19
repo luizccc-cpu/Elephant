@@ -182,6 +182,73 @@ impl RenderScene {
                         }
                     }
                 }
+                Geometry::BRep(brep) => {
+                    if mode != DisplayMode::Wireframe {
+                        let mesh = brep.tessellate_display();
+                        scene.push_mesh_triangles(
+                            &mesh.positions,
+                            &mesh.normals,
+                            &mesh.indices,
+                            shaded_color,
+                        );
+                    }
+                    if mode != DisplayMode::Arctic || obj.selected {
+                        let edge_color = if obj.selected {
+                            SELECTION_COLOR
+                        } else if mode == DisplayMode::Wireframe {
+                            base_color
+                        } else if mode == DisplayMode::Technical {
+                            [0.08, 0.10, 0.14, 1.0]
+                        } else {
+                            [0.12, 0.14, 0.18, 0.92]
+                        };
+                        for edge in &brep.edges {
+                            if edge.curve.degree == 1 && edge.curve.control_points.len() == 2 {
+                                let a = edge.curve.control_points[0].position;
+                                let b = edge.curve.control_points[1].position;
+                                scene.push_line(
+                                    [a.x as f32, a.y as f32, a.z as f32],
+                                    [b.x as f32, b.y as f32, b.z as f32],
+                                    edge_color,
+                                );
+                            } else {
+                                let pts = edge.curve.sample_polyline(32);
+                                for pair in pts.windows(2) {
+                                    scene.push_line(
+                                        [pair[0].x as f32, pair[0].y as f32, pair[0].z as f32],
+                                        [pair[1].x as f32, pair[1].y as f32, pair[1].z as f32],
+                                        edge_color,
+                                    );
+                                }
+                            }
+                        }
+                        let iso_color =
+                            [edge_color[0], edge_color[1], edge_color[2], 0.55];
+                        for f in &brep.faces {
+                            if (f.surface.degree_u > 1 || f.surface.degree_v > 1)
+                                && !f.is_trimmed()
+                            {
+                                for poly in f.surface.isocurve_polylines(1, 1, 32) {
+                                    for pair in poly.windows(2) {
+                                        scene.push_line(
+                                            [
+                                                pair[0].x as f32,
+                                                pair[0].y as f32,
+                                                pair[0].z as f32,
+                                            ],
+                                            [
+                                                pair[1].x as f32,
+                                                pair[1].y as f32,
+                                                pair[1].z as f32,
+                                            ],
+                                            iso_color,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 Geometry::Mesh(mesh) => {
                     scene.push_mesh(
                         &mesh.positions,
@@ -283,6 +350,18 @@ impl RenderScene {
                 }
                 Geometry::Surface(surf) => {
                     let mesh = surf.tessellate_display();
+                    self.push_mesh(
+                        &mesh.positions,
+                        &mesh.normals,
+                        &mesh.indices,
+                        shaded_preview,
+                        preview_color,
+                        DisplayMode::Ghosted,
+                        false,
+                    );
+                }
+                Geometry::BRep(brep) => {
+                    let mesh = brep.tessellate_display();
                     self.push_mesh(
                         &mesh.positions,
                         &mesh.normals,

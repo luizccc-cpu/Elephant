@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use cad_doc::{AnnotationKind, ObjectId};
-use cad_geom::{BoundaryLock, DVec3, Geometry};
+use cad_geom::{BoundaryLock, DVec3, Geometry, SubObjectRef};
 use cad_render::{DisplayMode, ViewportPaintCallback};
 use eframe::egui;
 
@@ -551,27 +551,8 @@ impl ElephantApp {
                             } else {
                                 let shift = ui.input(|i| i.modifiers.shift);
                                 let ctrl = ui.input(|i| i.modifiers.ctrl);
-                                if !shift && !ctrl {
-                                    self.doc.clear_selection();
-                                    self.selected_cps.clear();
-                                }
                                 let pick_tol = (world_per_px * 10.0).max(1e-4);
-                                if let Some(hit_id) =
-                                    self.doc.pick_ray_with_tolerance(&ray, pick_tol)
-                                {
-                                    if ctrl {
-                                        let cur = self
-                                            .doc
-                                            .objects
-                                            .get(hit_id)
-                                            .map(|o| o.selected)
-                                            .unwrap_or(false);
-                                        self.doc.set_selected(hit_id, !cur);
-                                    } else {
-                                        self.doc.set_selected(hit_id, true);
-                                    }
-                                }
-                                self.mark_doc_dirty();
+                                self.pick_viewport_object_or_subobject(&ray, pick_tol, shift, ctrl);
                             }
                         } else if let Some(g) =
                             cp_grips.iter().find(|g| pos.distance(g.screen) <= 9.0)
@@ -599,25 +580,8 @@ impl ElephantApp {
                         } else {
                             let shift = ui.input(|i| i.modifiers.shift);
                             let ctrl = ui.input(|i| i.modifiers.ctrl);
-                            if !shift && !ctrl {
-                                self.doc.clear_selection();
-                                self.selected_cps.clear();
-                            }
                             let pick_tol = (world_per_px * 10.0).max(1e-4);
-                            if let Some(hit_id) = self.doc.pick_ray_with_tolerance(&ray, pick_tol) {
-                                if ctrl {
-                                    let cur = self
-                                        .doc
-                                        .objects
-                                        .get(hit_id)
-                                        .map(|o| o.selected)
-                                        .unwrap_or(false);
-                                    self.doc.set_selected(hit_id, !cur);
-                                } else {
-                                    self.doc.set_selected(hit_id, true);
-                                }
-                            }
-                            self.mark_doc_dirty();
+                            self.pick_viewport_object_or_subobject(&ray, pick_tol, shift, ctrl);
                         }
                     }
                 }
@@ -782,6 +746,107 @@ impl ElephantApp {
                     }
                 }
 
+                // Draw Naked Edges overlay when ShowEdges is active
+                if self.show_naked_edges {
+                    let naked_stroke =
+                        egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(255, 60, 210));
+                    for (_, obj) in &self.doc.objects {
+                        if !obj.visible {
+                            continue;
+                        }
+                        if let Some(layer) = self.doc.layers.get(obj.layer_id) {
+                            if !layer.visible {
+                                continue;
+                            }
+                        }
+                        if let Geometry::BRep(brep) = &obj.geometry {
+                            for ei in brep.naked_edges() {
+                                if let Some(edge) = brep.edges.get(ei) {
+                                    let screen_pts: Vec<egui::Pos2> = edge
+                                        .curve
+                                        .sample_polyline(24)
+                                        .into_iter()
+                                        .filter_map(|p| world_to_screen(p, &vp_cols, rect))
+                                        .collect();
+                                    if screen_pts.len() >= 2 {
+                                        painter.add(egui::Shape::line(screen_pts, naked_stroke));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Draw Sub-Object Selection Highlights (Faces orange, Edges cyan, Vertices yellow)
+                for &(oid, sub) in &self.selected_subobjects {
+                    let Some(obj) = self.doc.objects.get(oid) else {
+                        continue;
+                    };
+                    if !obj.visible {
+                        continue;
+                    }
+                    let Geometry::BRep(brep) = &obj.geometry else {
+                        continue;
+                    };
+                    match sub {
+                        SubObjectRef::Face(fi) => {
+                            if let Some(face) = brep.faces.get(fi) {
+                                let face_stroke = egui::Stroke::new(
+                                    2.5_f32,
+                                    egui::Color32::from_rgb(255, 165, 40),
+                                );
+                                for c in face.boundary_curves_3d() {
+                                    let pts: Vec<egui::Pos2> = c
+                                        .sample_polyline(28)
+                                        .into_iter()
+                                        .filter_map(|p| world_to_screen(p, &vp_cols, rect))
+                                        .collect();
+                                    if pts.len() >= 2 {
+                                        painter.add(egui::Shape::line(pts, face_stroke));
+                                    }
+                                }
+                                if let Some((_, _, center_pt, _)) = face.interior_sample_point() {
+                                    if let Some(sp) = world_to_screen(center_pt, &vp_cols, rect) {
+                                        painter.circle_filled(
+                                            sp,
+                                            4.0,
+                                            egui::Color32::from_rgb(255, 165, 40),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        SubObjectRef::Edge(ei) => {
+                            if let Some(edge) = brep.edges.get(ei) {
+                                let edge_stroke = egui::Stroke::new(
+                                    3.0_f32,
+                                    egui::Color32::from_rgb(60, 235, 255),
+                                );
+                                let pts: Vec<egui::Pos2> = edge
+                                    .curve
+                                    .sample_polyline(28)
+                                    .into_iter()
+                                    .filter_map(|p| world_to_screen(p, &vp_cols, rect))
+                                    .collect();
+                                if pts.len() >= 2 {
+                                    painter.add(egui::Shape::line(pts, edge_stroke));
+                                }
+                            }
+                        }
+                        SubObjectRef::Vertex(vi) => {
+                            if let Some(v) = brep.vertices.get(vi) {
+                                if let Some(sp) = world_to_screen(v.position, &vp_cols, rect) {
+                                    painter.circle_filled(
+                                        sp,
+                                        4.5,
+                                        egui::Color32::from_rgb(255, 225, 65),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Draw Annotations (Dimensions, Text, TextDots, Leaders)
                 for ann in &self.doc.annotations {
                     if let Some(layer) = self.doc.layers.get(ann.layer_id) {
@@ -855,5 +920,63 @@ impl ElephantApp {
                 }
             });
         });
+    }
+
+    fn pick_viewport_object_or_subobject(
+        &mut self,
+        ray: &cad_geom::Ray,
+        pick_tol: f64,
+        shift: bool,
+        ctrl: bool,
+    ) {
+        if ctrl && shift {
+            if let Some(hit_id) = self.doc.pick_ray_with_tolerance(ray, pick_tol) {
+                let sub_hit = self.doc.objects.get(hit_id).and_then(|obj| match &obj.geometry {
+                    Geometry::BRep(b) => b.pick_subobject(ray, pick_tol),
+                    _ => None,
+                });
+                if let Some((sub, _)) = sub_hit {
+                    let key = (hit_id, sub);
+                    if let Some(pos_idx) =
+                        self.selected_subobjects.iter().position(|&item| item == key)
+                    {
+                        self.selected_subobjects.remove(pos_idx);
+                    } else {
+                        self.selected_subobjects.push(key);
+                        let label = match sub {
+                            SubObjectRef::Face(fi) => format!("Face #{fi}"),
+                            SubObjectRef::Edge(ei) => format!("Edge #{ei}"),
+                            SubObjectRef::Vertex(vi) => format!("Vertex #{vi}"),
+                        };
+                        self.log(format!("Sub-selected {label}."));
+                    }
+                    self.doc.set_selected(hit_id, true);
+                } else {
+                    self.doc.set_selected(hit_id, true);
+                }
+                self.mark_doc_dirty();
+            }
+            return;
+        }
+
+        if !shift && !ctrl {
+            self.doc.clear_selection();
+            self.selected_cps.clear();
+            self.selected_subobjects.clear();
+        }
+        if let Some(hit_id) = self.doc.pick_ray_with_tolerance(ray, pick_tol) {
+            if ctrl {
+                let cur = self
+                    .doc
+                    .objects
+                    .get(hit_id)
+                    .map(|o| o.selected)
+                    .unwrap_or(false);
+                self.doc.set_selected(hit_id, !cur);
+            } else {
+                self.doc.set_selected(hit_id, true);
+            }
+        }
+        self.mark_doc_dirty();
     }
 }

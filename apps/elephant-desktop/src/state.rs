@@ -4,8 +4,8 @@ use std::sync::Arc;
 use cad_commands::{CommandSession, SnapConfig, SnapKind};
 use cad_doc::{CadObject, Document, ObjectId};
 use cad_geom::{
-    BoundaryLock, DVec3, Geometry, NurbsCurve, NurbsSurface, Plane, SoftTransformFalloff,
-    TriangleMesh, UnitSystem,
+    BRep, BoundaryLock, DVec3, Geometry, NurbsCurve, NurbsSurface, Plane, SoftTransformFalloff,
+    SubObjectRef, UnitSystem,
 };
 use cad_io::{
     ProjectMetadata, export_from_document, import_into_document, open_project_with_meta,
@@ -60,6 +60,19 @@ pub const KNOWN_COMMANDS: &[&str] = &[
     "BooleanUnion",
     "BooleanDifference",
     "BooleanIntersection",
+    "BooleanSplit",
+    "Intersect",
+    "Cap",
+    "Untrim",
+    "FilletSrf",
+    "FilletEdge",
+    "ChamferEdge",
+    "Shell",
+    "PushPull",
+    "Inset",
+    "ExtractSrf",
+    "ToBRep",
+    "ShowEdges",
     "PointsOn",
     "PointsOff",
     "Join",
@@ -216,6 +229,8 @@ pub struct ElephantApp {
     pub marquee: Option<MarqueeDrag>,
     pub points_on_objects: HashSet<ObjectId>,
     pub selected_cps: Vec<(ObjectId, usize)>,
+    pub selected_subobjects: Vec<(ObjectId, SubObjectRef)>,
+    pub show_naked_edges: bool,
     pub uvn_gumball_enabled: bool,
     pub uvn_normal_drag_strength: f64,
     pub soft_transform_enabled: bool,
@@ -271,6 +286,8 @@ impl ElephantApp {
             marquee: None,
             points_on_objects: HashSet::new(),
             selected_cps: Vec::new(),
+            selected_subobjects: Vec::new(),
+            show_naked_edges: false,
             uvn_gumball_enabled: true,
             uvn_normal_drag_strength: 0.35,
             soft_transform_enabled: false,
@@ -313,7 +330,7 @@ impl ElephantApp {
     pub fn populate_starter_scene(&mut self) {
         let box_id = self.doc.add_object(
             "StarterBox",
-            Geometry::Mesh(TriangleMesh::from_box(
+            Geometry::BRep(BRep::from_box(
                 DVec3::new(0.0, 0.0, 1.0),
                 DVec3::new(3.0, 3.0, 2.0),
             )),
@@ -348,12 +365,33 @@ impl ElephantApp {
     }
 
     pub fn mark_doc_dirty(&mut self) {
+        self.prune_selected_subobjects();
         self.doc_dirty = true;
     }
 
     pub fn mark_scene_dirty(&mut self) {
+        self.prune_selected_subobjects();
         self.doc_dirty = true;
         self.grids_dirty = true;
+    }
+
+    pub fn prune_selected_subobjects(&mut self) {
+        self.selected_subobjects.retain(|(oid, sub)| {
+            let Some(obj) = self.doc.objects.get(*oid) else {
+                return false;
+            };
+            if !obj.visible {
+                return false;
+            }
+            match &obj.geometry {
+                Geometry::BRep(b) => match sub {
+                    SubObjectRef::Face(fi) => *fi < b.faces.len(),
+                    SubObjectRef::Edge(ei) => *ei < b.edges.len(),
+                    SubObjectRef::Vertex(vi) => *vi < b.vertices.len(),
+                },
+                _ => false,
+            }
+        });
     }
 
     pub fn prune_points_on(&mut self) {
@@ -363,6 +401,7 @@ impl ElephantApp {
             .retain(|(oid, _)| self.points_on_objects.contains(oid));
         self.curvature_graph_objects
             .retain(|id| self.doc.objects.get(*id).is_some_and(|o| o.visible));
+        self.prune_selected_subobjects();
     }
 
     pub fn active_display_mode(&self) -> DisplayMode {

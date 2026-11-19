@@ -34,6 +34,10 @@ pub fn export_obj_string(doc: &Document) -> String {
                 let mesh = surf.tessellate_display();
                 write_obj_mesh(&mut out, &mesh, &mut v_offset, &mut vn_offset);
             }
+            Geometry::BRep(brep) => {
+                let mesh = brep.tessellate_display();
+                write_obj_mesh(&mut out, &mesh, &mut v_offset, &mut vn_offset);
+            }
             Geometry::Curve(curve) => {
                 let pts = curve.sample_polyline(48);
                 for p in &pts {

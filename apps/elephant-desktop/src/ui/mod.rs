@@ -19,6 +19,8 @@ impl eframe::App for ElephantApp {
                 self.log(msg);
             } else if !self.selected_cps.is_empty() {
                 self.selected_cps.clear();
+            } else if !self.selected_subobjects.is_empty() {
+                self.selected_subobjects.clear();
             } else {
                 self.doc.clear_selection();
                 self.mark_doc_dirty();

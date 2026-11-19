@@ -181,6 +181,13 @@ impl ElephantApp {
                                 "NURBS Surface ({}x{}, deg {}x{})",
                                 s.count_u, s.count_v, s.degree_u, s.degree_v
                             ),
+                            Geometry::BRep(b) => format!(
+                                "B-Rep {} ({}F, {}E, {}V)",
+                                if b.is_solid() { "Solid" } else { "Polysurface" },
+                                b.faces.len(),
+                                b.edges.len(),
+                                b.vertices.len()
+                            ),
                             Geometry::Mesh(m) => format!(
                                 "Mesh ({} verts, {} tris)",
                                 m.positions.len(),
@@ -205,6 +212,60 @@ impl ElephantApp {
                                 }
                                 if ui.small_button("DupBorder").clicked() {
                                     queued_cmd = Some("DupBorder");
+                                }
+                            });
+                        } else if let Geometry::BRep(b) = &obj.geometry {
+                            let naked_cnt = b.naked_edges().len();
+                            if b.is_solid() {
+                                ui.small(format!(
+                                    "Solid | Area: {:.3} | Vol: {:.3}",
+                                    b.area_approx(),
+                                    b.volume_approx()
+                                ));
+                            } else {
+                                ui.small(format!(
+                                    "Open ({naked_cnt} naked edge(s)) | Area: {:.3}",
+                                    b.area_approx()
+                                ));
+                            }
+                            ui.checkbox(&mut self.show_naked_edges, "ShowEdges (Naked)");
+                            let sub_cnt = self
+                                .selected_subobjects
+                                .iter()
+                                .filter(|(id, _)| *id == oid)
+                                .count();
+                            ui.horizontal(|ui| {
+                                ui.small(format!("Sub-sel: {sub_cnt}"));
+                                if !self.selected_subobjects.is_empty()
+                                    && ui.small_button("Clear Sub-Sel").clicked()
+                                {
+                                    self.selected_subobjects.clear();
+                                }
+                            });
+                            ui.small("Tip: Ctrl+Shift+Click to pick Faces/Edges");
+                            ui.horizontal(|ui| {
+                                if ui.small_button("Cap").clicked() {
+                                    queued_cmd = Some("Cap");
+                                }
+                                if ui.small_button("Untrim").clicked() {
+                                    queued_cmd = Some("Untrim");
+                                }
+                                if ui.small_button("Flip").clicked() {
+                                    queued_cmd = Some("Flip");
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                if ui.small_button("FilletEdge").clicked() {
+                                    queued_cmd = Some("FilletEdge");
+                                }
+                                if ui.small_button("Shell").clicked() {
+                                    queued_cmd = Some("Shell");
+                                }
+                                if ui.small_button("PushPull").clicked() {
+                                    queued_cmd = Some("PushPull");
+                                }
+                                if ui.small_button("Explode").clicked() {
+                                    queued_cmd = Some("Explode");
                                 }
                             });
                         } else if let Geometry::Curve(c) = &obj.geometry {

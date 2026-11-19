@@ -293,4 +293,29 @@ mod tests {
         assert!(doc.annotations.is_empty());
         assert_eq!(meta, ProjectMetadata::default());
     }
+
+    #[test]
+    fn roundtrips_trimmed_brep_in_v2_project() {
+        let mut doc = Document::new();
+        let cyl = cad_geom::BRep::from_cylinder(DVec3::ZERO, 2.0, 5.0).unwrap();
+        let orig_faces = cyl.faces.len();
+        let orig_edges = cyl.edges.len();
+        let orig_vol = cyl.volume_approx();
+        doc.add_object("SolidCyl", Geometry::BRep(cyl));
+
+        let (json, meta) = (save_project_with_meta(&doc, &ProjectMetadata::default()).unwrap(), ProjectMetadata::default());
+        let (loaded, loaded_meta) = load_project_with_meta(&json).unwrap();
+        assert_eq!(loaded_meta, meta);
+        assert_eq!(loaded.objects.len(), 1);
+        let obj = loaded.objects.values().next().unwrap();
+        match &obj.geometry {
+            Geometry::BRep(b) => {
+                assert!(b.is_solid());
+                assert_eq!(b.faces.len(), orig_faces);
+                assert_eq!(b.edges.len(), orig_edges);
+                assert!((b.volume_approx() - orig_vol).abs() < 1e-6);
+            }
+            other => panic!("expected BRep after roundtrip, got {:?}", other),
+        }
+    }
 }

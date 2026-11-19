@@ -1,5 +1,7 @@
-//! Clean-room NURBS curves/surfaces, meshes, and geometric primitives for Elephant.
+//! Clean-room NURBS curves/surfaces, meshes, B-Rep solids, and geometric primitives for Elephant.
 
+pub mod brep;
+pub mod brep_ops;
 pub mod csg;
 pub mod curve_ops;
 pub mod error;
@@ -8,6 +10,14 @@ pub mod nurbs_curve;
 pub mod nurbs_surface;
 pub mod surface_ops;
 
+pub use brep::{BRep, BRepEdge, BRepFace, BRepVertex, SubObjectRef, TrimLoop2D};
+pub use brep_ops::{
+    FilletSurfaceResult, SurfaceIntersectionCurve, brep_boolean, brep_boolean_split,
+    cap_planar_holes, chamfer_brep_edges, fillet_brep_edges, fillet_srf, inset_face,
+    intersect_breps, intersect_surfaces, project_curve_to_surface, pull_curve_to_surface,
+    push_pull_face, shell_brep, split_face_with_uv_curve, tangent_edge_chain,
+    trim_face_with_curve, untrim_brep,
+};
 pub use cad_math::{Aabb, Continuity, DMat4, DVec3, Plane, Ray, Tolerances, UnitSystem};
 pub use csg::{BooleanOp, mesh_boolean};
 pub use curve_ops::{
@@ -37,6 +47,7 @@ pub enum Geometry {
     Point(DVec3),
     Curve(NurbsCurve),
     Surface(NurbsSurface),
+    BRep(BRep),
     Mesh(TriangleMesh),
 }
 
@@ -46,6 +57,7 @@ impl Geometry {
             Self::Point(p) => Aabb::from_points([*p]),
             Self::Curve(c) => c.bounding_box(),
             Self::Surface(s) => s.bounding_box(),
+            Self::BRep(b) => b.bounding_box(),
             Self::Mesh(m) => m.bounding_box(),
         }
     }
@@ -55,11 +67,12 @@ impl Geometry {
             Self::Point(p) => *p = mat.transform_point3(*p),
             Self::Curve(c) => c.transform(mat),
             Self::Surface(s) => s.transform(mat),
+            Self::BRep(b) => b.transform(mat),
             Self::Mesh(m) => m.transform(mat),
         }
     }
 
-    /// Key snap points (endpoints, midpoint) for OSnap queries.
+    /// Key snap points (endpoints, midpoint, B-Rep vertices) for OSnap queries.
     pub fn snap_points(&self) -> Vec<DVec3> {
         match self {
             Self::Point(p) => vec![*p],
@@ -77,6 +90,7 @@ impl Geometry {
                     s.evaluate(u1, v1),
                 ]
             }
+            Self::BRep(b) => b.snap_points(),
             Self::Mesh(m) => m.positions.iter().map(|&p| DVec3::from_array(p)).collect(),
         }
     }

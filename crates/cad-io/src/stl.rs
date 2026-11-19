@@ -22,6 +22,10 @@ pub fn export_stl_bytes(doc: &Document) -> Vec<u8> {
                 let m = s.tessellate_display();
                 collect_mesh_tris(&m, &mut tris);
             }
+            Geometry::BRep(b) => {
+                let m = b.tessellate_display();
+                collect_mesh_tris(&m, &mut tris);
+            }
             _ => {}
         }
     }

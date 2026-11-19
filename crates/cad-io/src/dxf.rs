@@ -31,29 +31,11 @@ pub fn export_dxf_string(doc: &Document) -> String {
                 );
             }
             Geometry::Curve(curve) => {
-                let pts = if curve.degree == 1 {
-                    curve.control_points.iter().map(|c| c.position).collect()
-                } else {
-                    curve.sample_polyline(48)
-                };
-                if pts.len() == 2 {
-                    let a = pts[0];
-                    let b = pts[1];
-                    let _ = writeln!(
-                        out,
-                        "0\nLINE\n8\n{lname}\n10\n{:.6}\n20\n{:.6}\n30\n{:.6}\n11\n{:.6}\n21\n{:.6}\n31\n{:.6}",
-                        a.x, a.y, a.z, b.x, b.y, b.z
-                    );
-                } else if pts.len() >= 2 {
-                    let _ = writeln!(out, "0\nPOLYLINE\n8\n{lname}\n66\n1\n70\n8");
-                    for p in pts {
-                        let _ = writeln!(
-                            out,
-                            "0\nVERTEX\n8\n{lname}\n10\n{:.6}\n20\n{:.6}\n30\n{:.6}",
-                            p.x, p.y, p.z
-                        );
-                    }
-                    let _ = writeln!(out, "0\nSEQEND");
+                write_dxf_curve(&mut out, lname, curve);
+            }
+            Geometry::BRep(brep) => {
+                for edge in &brep.edges {
+                    write_dxf_curve(&mut out, lname, &edge.curve);
                 }
             }
             _ => {}
@@ -62,6 +44,33 @@ pub fn export_dxf_string(doc: &Document) -> String {
 
     let _ = writeln!(out, "0\nENDSEC\n0\nEOF");
     out
+}
+
+fn write_dxf_curve(out: &mut String, lname: &str, curve: &NurbsCurve) {
+    let pts = if curve.degree == 1 {
+        curve.control_points.iter().map(|c| c.position).collect()
+    } else {
+        curve.sample_polyline(48)
+    };
+    if pts.len() == 2 {
+        let a = pts[0];
+        let b = pts[1];
+        let _ = writeln!(
+            out,
+            "0\nLINE\n8\n{lname}\n10\n{:.6}\n20\n{:.6}\n30\n{:.6}\n11\n{:.6}\n21\n{:.6}\n31\n{:.6}",
+            a.x, a.y, a.z, b.x, b.y, b.z
+        );
+    } else if pts.len() >= 2 {
+        let _ = writeln!(out, "0\nPOLYLINE\n8\n{lname}\n66\n1\n70\n8");
+        for p in pts {
+            let _ = writeln!(
+                out,
+                "0\nVERTEX\n8\n{lname}\n10\n{:.6}\n20\n{:.6}\n30\n{:.6}",
+                p.x, p.y, p.z
+            );
+        }
+        let _ = writeln!(out, "0\nSEQEND");
+    }
 }
 
 /// Import ASCII DXF entities (`LINE`, `LWPOLYLINE`, `CIRCLE`, `ARC`, `POINT`).

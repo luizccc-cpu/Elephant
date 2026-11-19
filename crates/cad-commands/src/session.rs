@@ -1,6 +1,6 @@
 use cad_doc::{AnnotationItem, AnnotationKind, Document, ObjectId};
 use cad_geom::{
-    DMat4, DVec3, Geometry, NurbsCurve, NurbsSurface, OffsetCornerStyle, Plane, TriangleMesh,
+    BRep, DMat4, DVec3, Geometry, NurbsCurve, NurbsSurface, OffsetCornerStyle, Plane,
     rail_revolve_nurbs, revolve_nurbs, trim_curve_with_cutters,
 };
 
@@ -717,10 +717,10 @@ impl CommandSession {
                     let h = if h.abs() < 1e-3 { 2.0 } else { h };
                     let size = DVec3::new((c.x - b.x).abs().max(0.1), (c.y - b.y).abs().max(0.1), h.abs());
                     let center = DVec3::new((b.x + c.x) * 0.5, (b.y + c.y) * 0.5, b.z + h * 0.5);
-                    doc.add_object("Box", Geometry::Mesh(TriangleMesh::from_box(center, size)));
+                    doc.add_object("Box", Geometry::BRep(BRep::from_box(center, size)));
                     self.tool = ActiveTool::Idle;
                     CommandOutcome::done(format!(
-                        "Created Box ({:.2} x {:.2} x {:.2}).",
+                        "Created Box B-Rep solid ({:.2} x {:.2} x {:.2}).",
                         size.x, size.y, size.z
                     ))
                 }
@@ -739,10 +739,10 @@ impl CommandSession {
                     let h = (pt - c).dot(cplane.z_axis);
                     let h = if h.abs() < 1e-3 { 3.0 } else { h };
                     self.tool = ActiveTool::Idle;
-                    match NurbsSurface::cylinder(c, r, h) {
-                        Ok(srf) => {
-                            doc.add_object("Cylinder", Geometry::Surface(srf));
-                            CommandOutcome::done(format!("Created NURBS Cylinder (r={r:.2}, h={h:.2})."))
+                    match BRep::from_cylinder(c, r, h) {
+                        Ok(brep) => {
+                            doc.add_object("Cylinder", Geometry::BRep(brep));
+                            CommandOutcome::done(format!("Created B-Rep Cylinder (r={r:.2}, h={h:.2})."))
                         }
                         Err(e) => CommandOutcome::done(format!("Cylinder error: {e}")),
                     }
@@ -762,10 +762,10 @@ impl CommandSession {
                     let h = (pt - c).dot(cplane.z_axis);
                     let h = if h.abs() < 1e-3 { 3.0 } else { h };
                     self.tool = ActiveTool::Idle;
-                    match NurbsSurface::cone(c, r, h) {
-                        Ok(srf) => {
-                            doc.add_object("Cone", Geometry::Surface(srf));
-                            CommandOutcome::done(format!("Created NURBS Cone (r={r:.2}, h={h:.2})."))
+                    match BRep::from_cone(c, r, h) {
+                        Ok(brep) => {
+                            doc.add_object("Cone", Geometry::BRep(brep));
+                            CommandOutcome::done(format!("Created B-Rep Cone (r={r:.2}, h={h:.2})."))
                         }
                         Err(e) => CommandOutcome::done(format!("Cone error: {e}")),
                     }

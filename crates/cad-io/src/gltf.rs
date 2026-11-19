@@ -23,6 +23,7 @@ pub fn export_glb_bytes(doc: &Document) -> Vec<u8> {
         let mesh = match &obj.geometry {
             Geometry::Mesh(m) => m.clone(),
             Geometry::Surface(s) => s.tessellate_display(),
+            Geometry::BRep(b) => b.tessellate_display(),
             _ => continue,
         };
         if mesh.positions.is_empty() || mesh.indices.is_empty() {

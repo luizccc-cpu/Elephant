@@ -517,6 +517,13 @@ impl Document {
                         }
                     }
                 }
+                Geometry::BRep(b) => {
+                    if let Some(t) = b.ray_intersect(ray) {
+                        if best_surf.is_none_or(|b_best| t < b_best.0) {
+                            best_surf = Some((t, id));
+                        }
+                    }
+                }
                 Geometry::Mesh(m) => {
                     if let Some(t) = m.ray_intersect(ray) {
                         if best_surf.is_none_or(|b| t < b.0) {

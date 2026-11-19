@@ -248,6 +248,47 @@ impl SnapConfig {
                         }
                     }
                 }
+                Geometry::BRep(brep) => {
+                    if self.osnap_end {
+                        for v in &brep.vertices {
+                            let d = v.position.distance(raw_point);
+                            if d < best_dist {
+                                best_dist = d;
+                                best = Some((v.position, SnapKind::End));
+                            }
+                        }
+                        for edge in &brep.edges {
+                            let (u0, u1) = edge.curve.domain();
+                            for u in [u0, u1] {
+                                let pt = edge.curve.evaluate(u);
+                                let d = pt.distance(raw_point);
+                                if d < best_dist {
+                                    best_dist = d;
+                                    best = Some((pt, SnapKind::End));
+                                }
+                            }
+                        }
+                    }
+                    if self.osnap_mid {
+                        for edge in &brep.edges {
+                            let (u0, u1) = edge.curve.domain();
+                            let pt = edge.curve.evaluate(0.5 * (u0 + u1));
+                            let d = pt.distance(raw_point);
+                            if d < best_dist {
+                                best_dist = d;
+                                best = Some((pt, SnapKind::Mid));
+                            }
+                        }
+                    }
+                    if self.osnap_center {
+                        let pt = obj.aabb.center();
+                        let d = pt.distance(raw_point);
+                        if d < best_dist {
+                            best_dist = d;
+                            best = Some((pt, SnapKind::Center));
+                        }
+                    }
+                }
                 Geometry::Mesh(_) => {
                     if self.osnap_center {
                         let pt = obj.aabb.center();
@@ -293,6 +334,24 @@ impl SnapConfig {
 
         if best.is_none() && self.osnap_near {
             let mut near_best = snap_radius.max(1e-6);
+            let mut check_curve_near = |curve: &cad_geom::NurbsCurve| {
+                let pts = curve.sample_polyline(16);
+                for w in pts.windows(2) {
+                    let ab = w[1] - w[0];
+                    let len_sq = ab.length_squared();
+                    let t = if len_sq > 1e-12 {
+                        ((raw_point - w[0]).dot(ab) / len_sq).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let proj = w[0] + ab * t;
+                    let d = proj.distance(raw_point);
+                    if d < near_best {
+                        near_best = d;
+                        best = Some((proj, SnapKind::Near));
+                    }
+                }
+            };
             for (_, obj) in &doc.objects {
                 if !obj.visible {
                     continue;
@@ -302,23 +361,14 @@ impl SnapConfig {
                         continue;
                     }
                 }
-                if let Geometry::Curve(curve) = &obj.geometry {
-                    let pts = curve.sample_polyline(16);
-                    for w in pts.windows(2) {
-                        let ab = w[1] - w[0];
-                        let len_sq = ab.length_squared();
-                        let t = if len_sq > 1e-12 {
-                            ((raw_point - w[0]).dot(ab) / len_sq).clamp(0.0, 1.0)
-                        } else {
-                            0.0
-                        };
-                        let proj = w[0] + ab * t;
-                        let d = proj.distance(raw_point);
-                        if d < near_best {
-                            near_best = d;
-                            best = Some((proj, SnapKind::Near));
+                match &obj.geometry {
+                    Geometry::Curve(curve) => check_curve_near(curve),
+                    Geometry::BRep(brep) => {
+                        for edge in &brep.edges {
+                            check_curve_near(&edge.curve);
                         }
                     }
+                    _ => {}
                 }
             }
         }

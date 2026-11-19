@@ -1,12 +1,16 @@
-use cad_doc::{AnnotationItem, AnnotationKind, Document};
+use cad_doc::{AnnotationItem, AnnotationKind, Document, ObjectId};
 use cad_geom::{
-    BooleanOp, BoundaryLock, Continuity, DMat4, DVec3, Geometry, LoftStyle, NurbsCurve,
+    BRep, BooleanOp, BoundaryLock, Continuity, DMat4, DVec3, Geometry, LoftStyle, NurbsCurve,
     NurbsSurface, PatchBoundaryConstraint, PatchOptions, Plane, SoftTransformFalloff,
-    SurfaceEdge, TriangleMesh, UnitSystem, blend_curves, blend_srf, chamfer_two_curves,
-    closest_edge_pair, edge_srf, extend_srf, fair_curve, fillet_two_curves, intersect_curves,
+    SubObjectRef, SurfaceEdge, UnitSystem, blend_curves, blend_srf, brep_boolean,
+    brep_boolean_split, cap_planar_holes, chamfer_brep_edges, chamfer_two_curves,
+    closest_edge_pair, edge_srf, extend_srf, fair_curve, fillet_brep_edges, fillet_srf,
+    fillet_two_curves, inset_face, intersect_breps, intersect_curves, intersect_surfaces,
     loft_nurbs, match_curve, match_srf, mesh_boolean, network_srf, offset_srf,
-    partition_network_curves, patch_srf, rebuild_adaptive, rebuild_srf, rebuild_uniform, sweep1,
-    sweep2, tween_curves,
+    partition_network_curves, patch_srf, project_curve_to_surface, pull_curve_to_surface,
+    push_pull_face, rebuild_adaptive, rebuild_srf, rebuild_uniform, shell_brep,
+    split_face_with_uv_curve, sweep1, sweep2, tangent_edge_chain, trim_face_with_curve,
+    tween_curves, untrim_brep,
 };
 use cad_render::DisplayMode;
 
@@ -49,7 +53,17 @@ impl ElephantApp {
         let cmd = parts.next().unwrap_or("").to_ascii_lowercase();
         let args: Vec<&str> = parts.collect();
 
-        if args.is_empty() {
+        let has_brep_or_srf = self.doc.objects.values().any(|o| {
+            o.selected && matches!(o.geometry, Geometry::BRep(_) | Geometry::Surface(_))
+        });
+        let has_curve = self
+            .doc
+            .objects
+            .values()
+            .any(|o| o.selected && matches!(o.geometry, Geometry::Curve(_)));
+        let surf_trim_intercept = cmd == "trim" && has_brep_or_srf && has_curve;
+
+        if args.is_empty() && !surf_trim_intercept {
             if let Some(prompt) = self.session.start_tool(&cmd, &self.doc) {
                 self.log(prompt);
                 return;
@@ -61,7 +75,7 @@ impl ElephantApp {
                 let s = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(2.0);
                 let id = self.doc.add_object(
                     "Box",
-                    Geometry::Mesh(TriangleMesh::from_box(
+                    Geometry::BRep(BRep::from_box(
                         DVec3::new(0.0, 0.0, s * 0.5),
                         DVec3::splat(s),
                     )),
@@ -70,7 +84,7 @@ impl ElephantApp {
                     obj.name = Some("Box".to_string());
                 }
                 self.mark_scene_dirty();
-                self.log(format!("Created Box ({s} x {s} x {s})."));
+                self.log(format!("Created B-Rep Box ({s} x {s} x {s})."));
             }
             "sphere" => {
                 let r = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.5);
@@ -107,11 +121,11 @@ impl ElephantApp {
             "cylinder" => {
                 let r = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.5);
                 let h = args.get(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(4.0);
-                match NurbsSurface::cylinder(DVec3::ZERO, r, h) {
-                    Ok(srf) => {
-                        self.doc.add_object("Cylinder", Geometry::Surface(srf));
+                match BRep::from_cylinder(DVec3::ZERO, r, h) {
+                    Ok(brep) => {
+                        self.doc.add_object("Cylinder", Geometry::BRep(brep));
                         self.mark_scene_dirty();
-                        self.log(format!("Created NURBS Cylinder (r={r}, h={h})."));
+                        self.log(format!("Created B-Rep Cylinder (r={r}, h={h})."));
                     }
                     Err(e) => self.log(format!("Cylinder error: {e}")),
                 }
@@ -119,11 +133,11 @@ impl ElephantApp {
             "cone" => {
                 let r = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(2.0);
                 let h = args.get(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(4.0);
-                match NurbsSurface::cone(DVec3::ZERO, r, h) {
-                    Ok(srf) => {
-                        self.doc.add_object("Cone", Geometry::Surface(srf));
+                match BRep::from_cone(DVec3::ZERO, r, h) {
+                    Ok(brep) => {
+                        self.doc.add_object("Cone", Geometry::BRep(brep));
                         self.mark_scene_dirty();
-                        self.log(format!("Created NURBS Cone (r={r}, h={h})."));
+                        self.log(format!("Created B-Rep Cone (r={r}, h={h})."));
                     }
                     Err(e) => self.log(format!("Cone error: {e}")),
                 }
@@ -167,14 +181,19 @@ impl ElephantApp {
                     self.log("Select one or more curves first, then run Extrude.");
                 } else {
                     for (lid, c) in &curves {
-                        if let Some(solid) = TriangleMesh::extrude_closed_curve(c, dir) {
-                            self.doc
-                                .add_object_on_layer("ExtrudeSolid", *lid, Geometry::Mesh(solid));
-                        } else {
-                            let surf = NurbsSurface::extrude_curve(c, dir);
-                            self.doc
-                                .add_object_on_layer("Extrude", *lid, Geometry::Surface(surf));
+                        if c.is_closed() {
+                            if let Ok(solid) = BRep::extrude_curve_solid(c, dir) {
+                                self.doc.add_object_on_layer(
+                                    "ExtrudeSolid",
+                                    *lid,
+                                    Geometry::BRep(solid),
+                                );
+                                continue;
+                            }
                         }
+                        let surf = NurbsSurface::extrude_curve(c, dir);
+                        self.doc
+                            .add_object_on_layer("Extrude", *lid, Geometry::Surface(surf));
                     }
                     self.mark_scene_dirty();
                     self.log(format!("Extruded {} curve(s) by {h}.", curves.len()));
@@ -183,27 +202,44 @@ impl ElephantApp {
             "planarsrf" => {
                 let curves: Vec<_> = self
                     .doc
-                    .objects
-                    .values()
-                    .filter(|o| o.selected)
-                    .filter_map(|o| match &o.geometry {
-                        Geometry::Curve(c) => Some((o.layer_id, c.clone())),
-                        _ => None,
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::Curve(c) if c.is_closed() => Some((o.layer_id, c.clone())),
+                            _ => None,
+                        })
                     })
                     .collect();
-                let mut created = 0;
-                for (lid, c) in &curves {
-                    if let Some(mesh) = TriangleMesh::from_planar_curve(c) {
-                        self.doc
-                            .add_object_on_layer("PlanarSrf", *lid, Geometry::Mesh(mesh));
-                        created += 1;
-                    }
-                }
-                if created == 0 {
+                if curves.is_empty() {
                     self.log("Select closed planar curve(s) first, then run PlanarSrf.");
                 } else {
-                    self.mark_scene_dirty();
-                    self.log(format!("Created {created} planar surface(s)."));
+                    let lid0 = curves[0].0;
+                    let only_curves: Vec<NurbsCurve> =
+                        curves.iter().map(|(_, c)| c.clone()).collect();
+                    let mut created = 0usize;
+                    if let Ok(brep) = BRep::from_planar_curves(&only_curves) {
+                        self.doc
+                            .add_object_on_layer("PlanarSrf", lid0, Geometry::BRep(brep));
+                        created = 1;
+                    } else {
+                        for (lid, c) in &curves {
+                            if let Ok(brep) = BRep::from_planar_curves(std::slice::from_ref(c)) {
+                                self.doc.add_object_on_layer(
+                                    "PlanarSrf",
+                                    *lid,
+                                    Geometry::BRep(brep),
+                                );
+                                created += 1;
+                            }
+                        }
+                    }
+                    if created == 0 {
+                        self.log("Could not build planar B-Rep from selected curve(s).");
+                    } else {
+                        self.mark_scene_dirty();
+                        self.log(format!("Created {created} trimmed planar B-Rep(s)."));
+                    }
                 }
             }
             "loft" => {
@@ -635,39 +671,77 @@ impl ElephantApp {
                 }
             }
             "dupborder" | "dupedge" => {
-                let join_loop = cmd == "dupborder";
-                let surfs: Vec<_> = self
-                    .doc
-                    .selected_ids_ordered()
-                    .into_iter()
-                    .filter_map(|id| {
-                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
-                            Geometry::Surface(s) => Some((o.layer_id, s.clone())),
-                            _ => None,
-                        })
-                    })
-                    .collect();
-                if surfs.is_empty() {
-                    self.log(format!("Select NURBS surface(s) first, then run {cmd}."));
-                } else {
-                    let mut created = 0usize;
-                    let tol = self.doc.tolerances.absolute.max(1e-3);
-                    for (lid, s) in &surfs {
-                        if let Ok(edges) = s.boundary_curves() {
-                            let curves = if join_loop {
-                                NurbsCurve::join_curves(&edges, tol)
+                let is_border = cmd == "dupborder";
+                let selected_ids = self.doc.selected_ids_ordered();
+                let mut created = 0usize;
+                let tol = self.doc.tolerances.absolute.max(1e-3);
+                let mut had_source = false;
+
+                for id in selected_ids {
+                    let Some(obj) = self.doc.objects.get(id) else {
+                        continue;
+                    };
+                    let lid = obj.layer_id;
+                    match &obj.geometry {
+                        Geometry::Surface(s) => {
+                            had_source = true;
+                            if let Ok(edges) = s.boundary_curves() {
+                                let curves = if is_border {
+                                    NurbsCurve::join_curves(&edges, tol)
+                                } else {
+                                    edges.to_vec()
+                                };
+                                for c in curves {
+                                    self.doc
+                                        .add_object_on_layer("DupEdge", lid, Geometry::Curve(c));
+                                    created += 1;
+                                }
+                            }
+                        }
+                        Geometry::BRep(b) => {
+                            had_source = true;
+                            let sub_edges: Vec<usize> = self
+                                .selected_subobjects
+                                .iter()
+                                .filter_map(|&(oid, sub)| match sub {
+                                    SubObjectRef::Edge(ei) if oid == id => Some(ei),
+                                    _ => None,
+                                })
+                                .collect();
+                            let raw_curves: Vec<NurbsCurve> = if is_border {
+                                b.naked_edges()
+                                    .into_iter()
+                                    .filter_map(|ei| b.edges.get(ei).map(|e| e.curve.clone()))
+                                    .collect()
+                            } else if !sub_edges.is_empty() {
+                                sub_edges
+                                    .into_iter()
+                                    .filter_map(|ei| b.edges.get(ei).map(|e| e.curve.clone()))
+                                    .collect()
                             } else {
-                                edges.to_vec()
+                                b.edges.iter().map(|e| e.curve.clone()).collect()
+                            };
+                            let curves = if is_border {
+                                NurbsCurve::join_curves(&raw_curves, tol)
+                            } else {
+                                raw_curves
                             };
                             for c in curves {
                                 self.doc
-                                    .add_object_on_layer("DupEdge", *lid, Geometry::Curve(c));
+                                    .add_object_on_layer("DupEdge", lid, Geometry::Curve(c));
                                 created += 1;
                             }
                         }
+                        _ => {}
                     }
+                }
+                if !had_source {
+                    self.log(format!(
+                        "Select NURBS surface(s) or B-Rep(s) first, then run {cmd}."
+                    ));
+                } else {
                     self.mark_scene_dirty();
-                    self.log(format!("Extracted {created} boundary curve(s)."));
+                    self.log(format!("Extracted {created} boundary/edge curve(s)."));
                 }
             }
             "flip" => {
@@ -682,6 +756,14 @@ impl ElephantApp {
                             self.doc.record_object_modified("Flip", id, before);
                             flipped += 1;
                         }
+                        Geometry::BRep(b) => {
+                            let mut fb = b.clone();
+                            fb.flip_normals();
+                            self.doc.objects[id].geometry = Geometry::BRep(fb);
+                            self.doc.objects[id].refresh_aabb();
+                            self.doc.record_object_modified("Flip", id, before);
+                            flipped += 1;
+                        }
                         Geometry::Curve(c) => {
                             self.doc.objects[id].geometry = Geometry::Curve(c.reverse());
                             self.doc.objects[id].refresh_aabb();
@@ -692,7 +774,7 @@ impl ElephantApp {
                     }
                 }
                 if flipped == 0 {
-                    self.log("Select NURBS surface(s) or curve(s) to Flip.");
+                    self.log("Select NURBS surface(s), B-Rep(s), or curve(s) to Flip.");
                 } else {
                     self.mark_scene_dirty();
                     self.log(format!("Flipped {flipped} object(s)."));
@@ -834,19 +916,64 @@ impl ElephantApp {
                     "booleandifference" => BooleanOp::Difference,
                     _ => BooleanOp::Intersection,
                 };
-                let meshes: Vec<_> = self
-                    .doc
-                    .selected_ids_ordered()
-                    .into_iter()
-                    .filter_map(|id| {
-                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
-                            Geometry::Mesh(m) => Some((o.layer_id, m.clone())),
-                            Geometry::Surface(s) => Some((o.layer_id, s.tessellate_display())),
-                            _ => None,
-                        })
-                    })
-                    .collect();
-                if meshes.len() < 2 {
+                let tol = self.doc.tolerances.absolute.max(1e-3);
+                let ordered = self.doc.selected_ids_ordered();
+                let mut breps: Vec<(cad_doc::LayerId, BRep)> = Vec::new();
+                let mut all_brep_capable = ordered.len() >= 2;
+                let mut meshes: Vec<(cad_doc::LayerId, cad_geom::TriangleMesh)> = Vec::new();
+                for id in &ordered {
+                    let Some(o) = self.doc.objects.get(*id) else {
+                        continue;
+                    };
+                    match &o.geometry {
+                        Geometry::BRep(b) => {
+                            breps.push((o.layer_id, b.clone()));
+                            meshes.push((o.layer_id, b.tessellate_display()));
+                        }
+                        Geometry::Surface(s) => {
+                            let b = BRep::from_surface(s.clone());
+                            meshes.push((o.layer_id, s.tessellate_display()));
+                            breps.push((o.layer_id, b));
+                        }
+                        Geometry::Mesh(m) => {
+                            all_brep_capable = false;
+                            meshes.push((o.layer_id, m.clone()));
+                        }
+                        _ => {
+                            all_brep_capable = false;
+                        }
+                    }
+                }
+                if all_brep_capable && breps.len() >= 2 {
+                    let lid = breps[0].0;
+                    let mut acc = breps[0].1.clone();
+                    let mut err_msg = None;
+                    for (_, b) in &breps[1..] {
+                        match brep_boolean(&acc, b, op, tol) {
+                            Ok(next) => acc = next,
+                            Err(e) => {
+                                err_msg = Some(format!("{e}"));
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(err) = err_msg {
+                        self.log(format!("B-Rep Boolean error: {err}"));
+                    } else {
+                        let vol_note = if acc.is_solid() {
+                            format!(" (solid, vol={:.3})", acc.volume_approx())
+                        } else {
+                            format!(" (open, {} naked)", acc.naked_edges().len())
+                        };
+                        let n_ops = breps.len();
+                        self.doc.remove_selected();
+                        self.doc
+                            .add_object_on_layer("BooleanBRep", lid, Geometry::BRep(acc));
+                        self.prune_points_on();
+                        self.mark_scene_dirty();
+                        self.log(format!("Completed B-Rep {cmd} on {n_ops} solids{vol_note}."));
+                    }
+                } else if meshes.len() < 2 {
                     self.log("Select 2 or more solids/surfaces for Boolean operation.");
                 } else {
                     let lid = meshes[0].0;
@@ -860,6 +987,43 @@ impl ElephantApp {
                     self.prune_points_on();
                     self.mark_scene_dirty();
                     self.log(format!("Completed {cmd} on {} solids.", meshes.len()));
+                }
+            }
+            "booleansplit" => {
+                let tol = self.doc.tolerances.absolute.max(1e-3);
+                let ops: Vec<_> = self
+                    .doc
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::BRep(b) => Some((id, o.layer_id, b.clone())),
+                            Geometry::Surface(s) => {
+                                Some((id, o.layer_id, BRep::from_surface(s.clone())))
+                            }
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                if ops.len() < 2 {
+                    self.log("Select target solid first, then cutter solid for BooleanSplit.");
+                } else {
+                    let (target_id, lid, ref a) = ops[0];
+                    match brep_boolean_split(a, &ops[1].2, tol) {
+                        Ok(pieces) => {
+                            let cnt = pieces.len();
+                            let reps = pieces
+                                .into_iter()
+                                .map(|b| (lid, Geometry::BRep(b)))
+                                .collect();
+                            self.doc
+                                .replace_object_with_many("BooleanSplit", target_id, reps);
+                            self.prune_points_on();
+                            self.mark_scene_dirty();
+                            self.log(format!("BooleanSplit created {cnt} B-Rep piece(s)."));
+                        }
+                        Err(e) => self.log(format!("BooleanSplit error: {e}")),
+                    }
                 }
             }
             "pointson" => {
@@ -941,9 +1105,9 @@ impl ElephantApp {
             "selsrf" => {
                 let n = self
                     .doc
-                    .select_by_kind(|g| matches!(g, Geometry::Surface(_)));
+                    .select_by_kind(|g| matches!(g, Geometry::Surface(_) | Geometry::BRep(_)));
                 self.mark_doc_dirty();
-                self.log(format!("Selected {n} surface(s)."));
+                self.log(format!("Selected {n} surface(s)/B-Rep(s)."));
             }
             "selmesh" => {
                 let n = self.doc.select_by_kind(|g| matches!(g, Geometry::Mesh(_)));
@@ -997,18 +1161,50 @@ impl ElephantApp {
                 }
             }
             "join" => {
+                let tol = self.doc.tolerances.absolute.max(1e-3);
+                let ordered = self.doc.selected_ids_ordered();
+                let mut breps = Vec::new();
+                let mut first_brep_layer = None;
                 let mut curves = Vec::new();
-                for obj in self.doc.objects.values() {
-                    if obj.selected {
-                        if let Geometry::Curve(c) = &obj.geometry {
-                            curves.push(c.clone());
+                for id in ordered {
+                    let Some(obj) = self.doc.objects.get(id) else {
+                        continue;
+                    };
+                    match &obj.geometry {
+                        Geometry::BRep(b) => {
+                            if first_brep_layer.is_none() {
+                                first_brep_layer = Some(obj.layer_id);
+                            }
+                            breps.push(b.clone());
                         }
+                        Geometry::Surface(s) => {
+                            if first_brep_layer.is_none() {
+                                first_brep_layer = Some(obj.layer_id);
+                            }
+                            breps.push(BRep::from_surface(s.clone()));
+                        }
+                        Geometry::Curve(c) => curves.push(c.clone()),
+                        _ => {}
                     }
                 }
-                if curves.len() < 2 {
-                    self.log("Select 2 or more curves to join.");
-                } else {
-                    let joined = NurbsCurve::join_curves(&curves, 1e-3);
+                if breps.len() >= 2 {
+                    let lid = first_brep_layer.unwrap_or(self.doc.active_layer);
+                    let joined = BRep::join_many(&breps, tol);
+                    let status = if joined.is_solid() {
+                        "closed solid".to_string()
+                    } else {
+                        format!("{} naked edge(s)", joined.naked_edges().len())
+                    };
+                    let removed = self.doc.remove_selected();
+                    self.doc
+                        .add_object_on_layer("JoinBRep", lid, Geometry::BRep(joined));
+                    self.prune_points_on();
+                    self.mark_scene_dirty();
+                    self.log(format!(
+                        "Joined {removed} surface(s)/B-Rep(s) into 1 B-Rep ({status})."
+                    ));
+                } else if curves.len() >= 2 {
+                    let joined = NurbsCurve::join_curves(&curves, tol);
                     let removed = self.doc.remove_selected();
                     let count = joined.len();
                     for c in joined {
@@ -1017,33 +1213,64 @@ impl ElephantApp {
                     self.prune_points_on();
                     self.mark_scene_dirty();
                     self.log(format!("Joined {removed} curve(s) into {count} curve(s)."));
+                } else {
+                    self.log("Select 2 or more curves, surfaces, or B-Reps to Join.");
                 }
             }
             "explode" => {
-                let mut pieces = Vec::new();
-                for obj in self.doc.objects.values() {
-                    if obj.selected {
-                        if let Geometry::Curve(c) = &obj.geometry {
+                let ids = self.doc.selected_ids_ordered();
+                let mut exploded_objs = 0usize;
+                let mut total_pieces = 0usize;
+                for id in ids {
+                    let Some(obj) = self.doc.objects.get(id) else {
+                        continue;
+                    };
+                    let lid = obj.layer_id;
+                    let reps: Option<Vec<(cad_doc::LayerId, Geometry)>> = match &obj.geometry {
+                        Geometry::BRep(b) if b.faces.len() > 1 => Some(
+                            b.explode()
+                                .into_iter()
+                                .map(|piece| {
+                                    let geom = if piece.faces.len() == 1
+                                        && !piece.faces[0].is_trimmed()
+                                    {
+                                        Geometry::Surface(piece.faces[0].surface.clone())
+                                    } else {
+                                        Geometry::BRep(piece)
+                                    };
+                                    (lid, geom)
+                                })
+                                .collect(),
+                        ),
+                        Geometry::Curve(c) => {
                             let segs = c.explode_segments();
                             if segs.len() > 1 {
-                                pieces.extend(segs.into_iter().map(|s| (obj.layer_id, s)));
+                                Some(
+                                    segs.into_iter()
+                                        .map(|s| (lid, Geometry::Curve(s)))
+                                        .collect(),
+                                )
+                            } else {
+                                None
                             }
+                        }
+                        _ => None,
+                    };
+                    if let Some(pieces) = reps {
+                        if !pieces.is_empty() {
+                            total_pieces += pieces.len();
+                            exploded_objs += 1;
+                            self.doc.replace_object_with_many("Explode", id, pieces);
                         }
                     }
                 }
-                if pieces.is_empty() {
-                    self.log("Select one or more polylines to explode.");
+                if exploded_objs == 0 {
+                    self.log("Select multi-face B-Rep(s) or polyline(s) to Explode.");
                 } else {
-                    let removed = self.doc.remove_selected();
-                    let count = pieces.len();
-                    for (lid, seg) in pieces {
-                        self.doc
-                            .add_object_on_layer("Explode", lid, Geometry::Curve(seg));
-                    }
                     self.prune_points_on();
                     self.mark_scene_dirty();
                     self.log(format!(
-                        "Exploded {removed} polyline(s) into {count} segments."
+                        "Exploded {exploded_objs} object(s) into {total_pieces} piece(s)."
                     ));
                 }
             }
@@ -1160,6 +1387,77 @@ impl ElephantApp {
                 }
             }
             "split" => {
+                let tol = self.doc.tolerances.absolute.max(1e-3);
+                let surface_targets: Vec<_> = self
+                    .doc
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::BRep(b) => Some((id, o.layer_id, b.clone())),
+                            Geometry::Surface(s) => {
+                                Some((id, o.layer_id, BRep::from_surface(s.clone())))
+                            }
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                let cutter_curves: Vec<NurbsCurve> = self
+                    .doc
+                    .objects
+                    .values()
+                    .filter(|o| o.selected)
+                    .filter_map(|o| match &o.geometry {
+                        Geometry::Curve(c) => Some(c.clone()),
+                        _ => None,
+                    })
+                    .collect();
+
+                if !surface_targets.is_empty() && !cutter_curves.is_empty() {
+                    let mut split_count = 0usize;
+                    let mut piece_total = 0usize;
+                    for (id, lid, brep) in surface_targets {
+                        let orig_len = brep.faces.len();
+                        let mut frags = brep.faces;
+                        for cutter in &cutter_curves {
+                            let mut next = Vec::new();
+                            for f in frags {
+                                let (_, uv) =
+                                    project_curve_to_surface(cutter, &f.surface, cplane.z_axis, 32)
+                                        .unwrap_or_else(|| {
+                                            pull_curve_to_surface(cutter, &f.surface, 32)
+                                        });
+                                next.extend(split_face_with_uv_curve(
+                                    &f,
+                                    &uv,
+                                    cutter.is_closed(),
+                                    tol,
+                                ));
+                            }
+                            frags = next;
+                        }
+                        if frags.len() > orig_len {
+                            split_count += 1;
+                            piece_total += frags.len();
+                            let reps = frags
+                                .into_iter()
+                                .map(|f| (lid, Geometry::BRep(BRep::from_faces(vec![f], tol))))
+                                .collect();
+                            self.doc.replace_object_with_many("Split", id, reps);
+                        }
+                    }
+                    self.prune_points_on();
+                    self.mark_scene_dirty();
+                    if split_count > 0 {
+                        self.log(format!(
+                            "Split {split_count} B-Rep/surface(s) into {piece_total} trimmed piece(s)."
+                        ));
+                    } else {
+                        self.log("Selected curve(s) did not split any selected face.");
+                    }
+                    return;
+                }
+
                 let selected: Vec<_> = self
                     .doc
                     .objects
@@ -1171,13 +1469,12 @@ impl ElephantApp {
                     })
                     .collect();
                 if selected.is_empty() {
-                    self.log("Select 1 curve (interactive split) or 2+ intersecting curves to Split.");
+                    self.log("Select 1 curve (interactive split), 2+ curves, or Surface/B-Rep + Curve to Split.");
                 } else if selected.len() == 1 {
                     if let Some(prompt) = self.session.start_tool("splitcurve", &self.doc) {
                         self.log(prompt);
                     }
                 } else {
-                    let tol = self.doc.tolerances.absolute.max(1e-3);
                     let mut split_count = 0usize;
                     let mut piece_total = 0usize;
                     for i in 0..selected.len() {
@@ -1210,6 +1507,86 @@ impl ElephantApp {
                     } else {
                         self.log("Selected curves have no mutual intersections.");
                     }
+                }
+            }
+            "trim" => {
+                let tol = self.doc.tolerances.absolute.max(1e-3);
+                let surface_targets: Vec<_> = self
+                    .doc
+                    .selected_ids_ordered()
+                    .into_iter()
+                    .filter_map(|id| {
+                        self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                            Geometry::BRep(b) => Some((id, b.clone())),
+                            Geometry::Surface(s) => Some((id, BRep::from_surface(s.clone()))),
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                let cutter_curves: Vec<NurbsCurve> = self
+                    .doc
+                    .objects
+                    .values()
+                    .filter(|o| o.selected)
+                    .filter_map(|o| match &o.geometry {
+                        Geometry::Curve(c) => Some(c.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if surface_targets.is_empty() || cutter_curves.is_empty() {
+                    self.log("Select Surface/B-Rep + cutting Curve(s) to Trim.");
+                    return;
+                }
+                let custom_discard = if args.len() >= 3 {
+                    if let (Ok(x), Ok(y), Ok(z)) = (
+                        args[0].parse::<f64>(),
+                        args[1].parse::<f64>(),
+                        args[2].parse::<f64>(),
+                    ) {
+                        Some(DVec3::new(x, y, z))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let mut trimmed_count = 0usize;
+                for (id, brep) in surface_targets {
+                    let mut new_faces = Vec::with_capacity(brep.faces.len());
+                    let mut changed = false;
+                    for face in &brep.faces {
+                        let mut cur = face.clone();
+                        for cutter in &cutter_curves {
+                            let discard_pt = custom_discard
+                                .unwrap_or_else(|| cutter.bounding_box().center());
+                            if let Some(updated) = trim_face_with_curve(
+                                &cur,
+                                cutter,
+                                discard_pt,
+                                Some(cplane.z_axis),
+                                tol,
+                            ) {
+                                cur = updated;
+                                changed = true;
+                            }
+                        }
+                        new_faces.push(cur);
+                    }
+                    if changed {
+                        let before = self.doc.objects[id].clone();
+                        self.doc.objects[id].geometry =
+                            Geometry::BRep(BRep::from_faces(new_faces, tol));
+                        self.doc.objects[id].refresh_aabb();
+                        self.doc.record_object_modified("Trim", id, before);
+                        trimmed_count += 1;
+                    }
+                }
+                if trimmed_count > 0 {
+                    self.prune_points_on();
+                    self.mark_scene_dirty();
+                    self.log(format!("Trimmed {trimmed_count} B-Rep/surface(s)."));
+                } else {
+                    self.log("Cutting curve(s) did not intersect selected surface face(s).");
                 }
             }
             "blendcrv" => {
@@ -1545,7 +1922,9 @@ impl ElephantApp {
             }
             "area" => {
                 let mut total = 0.0;
-                let mut count = 0;
+                let mut total_vol = 0.0;
+                let mut solid_count = 0usize;
+                let mut count = 0usize;
                 for obj in self.doc.objects.values() {
                     if obj.selected {
                         match &obj.geometry {
@@ -1557,12 +1936,24 @@ impl ElephantApp {
                                 total += s.area_approx();
                                 count += 1;
                             }
+                            Geometry::BRep(b) => {
+                                total += b.area_approx();
+                                if b.is_solid() {
+                                    total_vol += b.volume_approx();
+                                    solid_count += 1;
+                                }
+                                count += 1;
+                            }
                             _ => {}
                         }
                     }
                 }
                 if count == 0 {
-                    self.log("Select closed planar curve(s) or NURBS surface(s) to measure Area.");
+                    self.log("Select closed planar curve(s), NURBS surface(s), or B-Rep(s) to measure Area.");
+                } else if solid_count > 0 {
+                    self.log(format!(
+                        "Total area of {count} object(s): {total:.4} | Solid volume ({solid_count}): {total_vol:.4}"
+                    ));
                 } else {
                     self.log(format!(
                         "Total area of {count} object(s): {total:.4}"
@@ -1655,6 +2046,7 @@ impl ElephantApp {
                 self.session.cancel();
                 self.points_on_objects.clear();
                 self.selected_cps.clear();
+                self.selected_subobjects.clear();
                 self.uvn_drag = None;
                 self.uvn_prompt = None;
                 self.curvature_graph_objects.clear();
@@ -1699,8 +2091,492 @@ impl ElephantApp {
                 };
                 self.log(self.session.prompt());
             }
+            "intersect" => {
+                let tol = self.doc.tolerances.absolute.max(1e-3);
+                let ordered = self.doc.selected_ids_ordered();
+                let mut breps: Vec<(cad_doc::LayerId, BRep)> = Vec::new();
+                let mut surfs: Vec<(cad_doc::LayerId, NurbsSurface)> = Vec::new();
+                let mut curves: Vec<(cad_doc::LayerId, NurbsCurve)> = Vec::new();
+                for id in ordered {
+                    let Some(o) = self.doc.objects.get(id) else {
+                        continue;
+                    };
+                    match &o.geometry {
+                        Geometry::BRep(b) => breps.push((o.layer_id, b.clone())),
+                        Geometry::Surface(s) => surfs.push((o.layer_id, s.clone())),
+                        Geometry::Curve(c) => curves.push((o.layer_id, c.clone())),
+                        _ => {}
+                    }
+                }
+                if breps.len() + surfs.len() >= 2 {
+                    let mut all_breps = breps;
+                    for (lid, s) in surfs {
+                        all_breps.push((lid, BRep::from_surface(s)));
+                    }
+                    let mut created = 0usize;
+                    for i in 0..all_breps.len() {
+                        for j in (i + 1)..all_breps.len() {
+                            let lid = all_breps[i].0;
+                            if all_breps[i].1.faces.len() == 1
+                                && !all_breps[i].1.faces[0].is_trimmed()
+                                && all_breps[j].1.faces.len() == 1
+                                && !all_breps[j].1.faces[0].is_trimmed()
+                            {
+                                for sic in intersect_surfaces(
+                                    &all_breps[i].1.faces[0].surface,
+                                    &all_breps[j].1.faces[0].surface,
+                                    tol,
+                                ) {
+                                    self.doc.add_object_on_layer(
+                                        "IntersectCrv",
+                                        lid,
+                                        Geometry::Curve(sic.curve_3d),
+                                    );
+                                    created += 1;
+                                }
+                            } else {
+                                for c in intersect_breps(&all_breps[i].1, &all_breps[j].1, tol) {
+                                    self.doc.add_object_on_layer(
+                                        "IntersectCrv",
+                                        lid,
+                                        Geometry::Curve(c),
+                                    );
+                                    created += 1;
+                                }
+                            }
+                        }
+                    }
+                    if created > 0 {
+                        self.mark_scene_dirty();
+                        self.log(format!("Intersect created {created} SSI curve(s)."));
+                    } else {
+                        self.log("No surface/B-Rep intersections found.");
+                    }
+                } else if curves.len() >= 2 {
+                    let mut created = 0usize;
+                    for i in 0..curves.len() {
+                        for j in (i + 1)..curves.len() {
+                            for hit in intersect_curves(&curves[i].1, &curves[j].1, tol) {
+                                self.doc.add_object_on_layer(
+                                    "IntersectPt",
+                                    curves[i].0,
+                                    Geometry::Point(hit.point),
+                                );
+                                created += 1;
+                            }
+                        }
+                    }
+                    if created > 0 {
+                        self.mark_scene_dirty();
+                        self.log(format!("Intersect created {created} intersection point(s)."));
+                    } else {
+                        self.log("No curve-curve intersections found.");
+                    }
+                } else {
+                    self.log("Select 2+ surfaces/B-Reps or 2+ curves to Intersect.");
+                }
+            }
+            "cap" => {
+                let tol = self.doc.tolerances.absolute.max(1e-3);
+                let ids = self.doc.selected_ids_ordered();
+                let mut capped = 0usize;
+                for id in ids {
+                    let before = self.doc.objects[id].clone();
+                    let brep = match &before.geometry {
+                        Geometry::BRep(b) => Some(b.clone()),
+                        Geometry::Surface(s) => Some(BRep::from_surface(s.clone())),
+                        _ => None,
+                    };
+                    if let Some(b) = brep {
+                        match cap_planar_holes(&b, tol) {
+                            Ok(res) => {
+                                self.doc.objects[id].geometry = Geometry::BRep(res);
+                                self.doc.objects[id].refresh_aabb();
+                                self.doc.record_object_modified("Cap", id, before);
+                                capped += 1;
+                            }
+                            Err(e) => self.log(format!("Cap error: {e}")),
+                        }
+                    }
+                }
+                if capped > 0 {
+                    self.prune_points_on();
+                    self.mark_scene_dirty();
+                    self.log(format!("Capped planar holes on {capped} object(s)."));
+                } else if self.doc.selected_ids_ordered().is_empty() {
+                    self.log("Select open B-Rep(s) or surface(s) to Cap.");
+                }
+            }
+            "untrim" => {
+                let ids = self.doc.selected_ids_ordered();
+                let mut count = 0usize;
+                for id in ids {
+                    let before = self.doc.objects[id].clone();
+                    if let Geometry::BRep(b) = &before.geometry {
+                        let sub_faces: Vec<usize> = self
+                            .selected_subobjects
+                            .iter()
+                            .filter_map(|&(oid, sub)| match sub {
+                                SubObjectRef::Face(fi) if oid == id => Some(fi),
+                                _ => None,
+                            })
+                            .collect();
+                        let updated = untrim_brep(
+                            b,
+                            if sub_faces.is_empty() {
+                                None
+                            } else {
+                                Some(sub_faces.as_slice())
+                            },
+                        );
+                        self.doc.objects[id].geometry = Geometry::BRep(updated);
+                        self.doc.objects[id].refresh_aabb();
+                        self.doc.record_object_modified("Untrim", id, before);
+                        count += 1;
+                    }
+                }
+                if count > 0 {
+                    self.prune_points_on();
+                    self.mark_scene_dirty();
+                    self.log(format!("Untrimmed {count} B-Rep(s)."));
+                } else {
+                    self.log("Select B-Rep(s) (or sub-object faces) to Untrim.");
+                }
+            }
+            "filletsrf" => {
+                let r = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.5);
+                let tol = self.doc.tolerances.absolute.max(1e-3);
+                let sub_faces: Vec<(cad_doc::LayerId, NurbsSurface)> = self
+                    .selected_subobjects
+                    .iter()
+                    .filter_map(|&(oid, sub)| match sub {
+                        SubObjectRef::Face(fi) => self.doc.objects.get(oid).and_then(|o| {
+                            if let Geometry::BRep(b) = &o.geometry {
+                                b.faces.get(fi).map(|f| (o.layer_id, f.surface.clone()))
+                            } else {
+                                None
+                            }
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+
+                let surf_pair: Option<(cad_doc::LayerId, NurbsSurface, NurbsSurface, Option<(ObjectId, ObjectId)>)> =
+                    if sub_faces.len() >= 2 {
+                        Some((sub_faces[0].0, sub_faces[0].1.clone(), sub_faces[1].1.clone(), None))
+                    } else {
+                        let objs: Vec<_> = self
+                            .doc
+                            .selected_ids_ordered()
+                            .into_iter()
+                            .filter_map(|id| {
+                                self.doc.objects.get(id).and_then(|o| match &o.geometry {
+                                    Geometry::Surface(s) => Some((Some(id), o.layer_id, s.clone())),
+                                    Geometry::BRep(b) if !b.faces.is_empty() => {
+                                        Some((None, o.layer_id, b.faces[0].surface.clone()))
+                                    }
+                                    _ => None,
+                                })
+                            })
+                            .collect();
+                        if objs.len() >= 2 {
+                            let ids = match (objs[0].0, objs[1].0) {
+                                (Some(a), Some(b)) => Some((a, b)),
+                                _ => None,
+                            };
+                            Some((objs[0].1, objs[0].2.clone(), objs[1].2.clone(), ids))
+                        } else {
+                            None
+                        }
+                    };
+
+                if let Some((lid, srf_a, srf_b, srf_ids)) = surf_pair {
+                    match fillet_srf(&srf_a, &srf_b, r, None, None, true, tol) {
+                        Ok(res) => {
+                            self.doc
+                                .add_object_on_layer("FilletSrf", lid, Geometry::Surface(res.fillet));
+                            if let Some((id_a, id_b)) = srf_ids {
+                                if let Some(ta) = res.trimmed_a {
+                                    let before_a = self.doc.objects[id_a].clone();
+                                    self.doc.objects[id_a].geometry =
+                                        Geometry::BRep(BRep::from_faces(vec![ta], tol));
+                                    self.doc.objects[id_a].refresh_aabb();
+                                    self.doc.record_object_modified("FilletSrf", id_a, before_a);
+                                }
+                                if let Some(tb) = res.trimmed_b {
+                                    let before_b = self.doc.objects[id_b].clone();
+                                    self.doc.objects[id_b].geometry =
+                                        Geometry::BRep(BRep::from_faces(vec![tb], tol));
+                                    self.doc.objects[id_b].refresh_aabb();
+                                    self.doc.record_object_modified("FilletSrf", id_b, before_b);
+                                }
+                            }
+                            self.prune_points_on();
+                            self.mark_scene_dirty();
+                            self.log(format!("Created rolling-ball FilletSrf (r={r:.3})."));
+                        }
+                        Err(e) => self.log(format!("FilletSrf error: {e}")),
+                    }
+                } else {
+                    self.log("Select 2 surfaces (or Ctrl+Shift+Click 2 B-Rep faces) for FilletSrf.");
+                }
+            }
+            "filletedge" | "chamferedge" => {
+                let is_fillet = cmd == "filletedge";
+                let dist = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.3);
+                let tol = self.doc.tolerances.absolute.max(1e-3);
+                let ids = self.doc.selected_ids_ordered();
+                let mut done = 0usize;
+                for id in ids {
+                    let before = self.doc.objects[id].clone();
+                    if let Geometry::BRep(b) = &before.geometry {
+                        let mut edge_indices = Vec::new();
+                        for &(oid, sub) in &self.selected_subobjects {
+                            if oid == id {
+                                if let SubObjectRef::Edge(ei) = sub {
+                                    for ce in tangent_edge_chain(b, ei, 5.0_f64.to_radians()) {
+                                        if !edge_indices.contains(&ce) {
+                                            edge_indices.push(ce);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if edge_indices.is_empty() && !b.edges.is_empty() {
+                            edge_indices.push(0);
+                        }
+                        let res = if is_fillet {
+                            fillet_brep_edges(b, &edge_indices, dist, tol)
+                        } else {
+                            chamfer_brep_edges(b, &edge_indices, dist, tol)
+                        };
+                        match res {
+                            Ok(updated) => {
+                                let label = if is_fillet { "FilletEdge" } else { "ChamferEdge" };
+                                self.doc.objects[id].geometry = Geometry::BRep(updated);
+                                self.doc.objects[id].refresh_aabb();
+                                self.doc.record_object_modified(label, id, before);
+                                done += 1;
+                            }
+                            Err(e) => self.log(format!("{cmd} error: {e}")),
+                        }
+                    }
+                }
+                if done > 0 {
+                    self.prune_points_on();
+                    self.mark_scene_dirty();
+                    self.log(format!(
+                        "{} applied (d={dist:.3}) on {done} B-Rep(s).",
+                        if is_fillet { "FilletEdge" } else { "ChamferEdge" }
+                    ));
+                } else if self.doc.selected_ids_ordered().is_empty() {
+                    self.log("Select B-Rep solid (or Ctrl+Shift+Click edges) first.");
+                }
+            }
+            "shell" => {
+                let thickness = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.2);
+                let tol = self.doc.tolerances.absolute.max(1e-3);
+                let ids = self.doc.selected_ids_ordered();
+                let mut done = 0usize;
+                for id in ids {
+                    let before = self.doc.objects[id].clone();
+                    if let Geometry::BRep(b) = &before.geometry {
+                        let mut open_faces: Vec<usize> = self
+                            .selected_subobjects
+                            .iter()
+                            .filter_map(|&(oid, sub)| match sub {
+                                SubObjectRef::Face(fi) if oid == id => Some(fi),
+                                _ => None,
+                            })
+                            .collect();
+                        if open_faces.is_empty() && !b.faces.is_empty() {
+                            open_faces.push(0);
+                        }
+                        match shell_brep(b, &open_faces, thickness, tol) {
+                            Ok(shelled) => {
+                                self.doc.objects[id].geometry = Geometry::BRep(shelled);
+                                self.doc.objects[id].refresh_aabb();
+                                self.doc.record_object_modified("Shell", id, before);
+                                done += 1;
+                            }
+                            Err(e) => self.log(format!("Shell error: {e}")),
+                        }
+                    }
+                }
+                if done > 0 {
+                    self.prune_points_on();
+                    self.mark_scene_dirty();
+                    self.log(format!("Shelled {done} solid(s) (t={thickness:.3})."));
+                } else if self.doc.selected_ids_ordered().is_empty() {
+                    self.log("Select a solid (or Ctrl+Shift+Click open faces) for Shell.");
+                }
+            }
+            "pushpull" => {
+                let dist = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
+                let tol = self.doc.tolerances.absolute.max(1e-3);
+                let ids = self.doc.selected_ids_ordered();
+                let mut done = 0usize;
+                for id in ids {
+                    let before = self.doc.objects[id].clone();
+                    if let Geometry::BRep(b) = &before.geometry {
+                        let face_idx = self
+                            .selected_subobjects
+                            .iter()
+                            .find_map(|&(oid, sub)| match sub {
+                                SubObjectRef::Face(fi) if oid == id => Some(fi),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        match push_pull_face(b, face_idx, dist, tol) {
+                            Ok(updated) => {
+                                self.doc.objects[id].geometry = Geometry::BRep(updated);
+                                self.doc.objects[id].refresh_aabb();
+                                self.doc.record_object_modified("PushPull", id, before);
+                                done += 1;
+                            }
+                            Err(e) => self.log(format!("PushPull error: {e}")),
+                        }
+                    }
+                }
+                if done > 0 {
+                    self.prune_points_on();
+                    self.mark_scene_dirty();
+                    self.log(format!("PushPull offset {done} B-Rep face(s) by {dist:.3}."));
+                } else if self.doc.selected_ids_ordered().is_empty() {
+                    self.log("Select a B-Rep (or Ctrl+Shift+Click a face) for PushPull.");
+                }
+            }
+            "inset" => {
+                let dist = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.25);
+                let depth = args.get(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+                let tol = self.doc.tolerances.absolute.max(1e-3);
+                let ids = self.doc.selected_ids_ordered();
+                let mut done = 0usize;
+                for id in ids {
+                    let before = self.doc.objects[id].clone();
+                    if let Geometry::BRep(b) = &before.geometry {
+                        let face_idx = self
+                            .selected_subobjects
+                            .iter()
+                            .find_map(|&(oid, sub)| match sub {
+                                SubObjectRef::Face(fi) if oid == id => Some(fi),
+                                _ => None,
+                            })
+                            .unwrap_or(0);
+                        match inset_face(b, face_idx, dist, depth, tol) {
+                            Ok(updated) => {
+                                self.doc.objects[id].geometry = Geometry::BRep(updated);
+                                self.doc.objects[id].refresh_aabb();
+                                self.doc.record_object_modified("Inset", id, before);
+                                done += 1;
+                            }
+                            Err(e) => self.log(format!("Inset error: {e}")),
+                        }
+                    }
+                }
+                if done > 0 {
+                    self.prune_points_on();
+                    self.mark_scene_dirty();
+                    self.log(format!("Inset applied on {done} B-Rep face(s) (d={dist:.3}, depth={depth:.3})."));
+                } else if self.doc.selected_ids_ordered().is_empty() {
+                    self.log("Select a B-Rep (or Ctrl+Shift+Click a face) for Inset.");
+                }
+            }
+            "extractsrf" => {
+                let tol = self.doc.tolerances.absolute.max(1e-3);
+                let ids = self.doc.selected_ids_ordered();
+                let mut extracted_count = 0usize;
+                for id in ids {
+                    let face_indices: Vec<usize> = self
+                        .selected_subobjects
+                        .iter()
+                        .filter_map(|&(oid, sub)| match sub {
+                            SubObjectRef::Face(fi) if oid == id => Some(fi),
+                            _ => None,
+                        })
+                        .collect();
+                    if face_indices.is_empty() {
+                        continue;
+                    }
+                    let before = self.doc.objects[id].clone();
+                    if let Geometry::BRep(b) = &before.geometry {
+                        let lid = before.layer_id;
+                        let mut remaining = Vec::new();
+                        for (fi, f) in b.faces.iter().enumerate() {
+                            if face_indices.contains(&fi) {
+                                let geom = if !f.is_trimmed() {
+                                    Geometry::Surface(f.surface.clone())
+                                } else {
+                                    Geometry::BRep(BRep::from_faces(vec![f.clone()], tol))
+                                };
+                                self.doc.add_object_on_layer("ExtractSrf", lid, geom);
+                                extracted_count += 1;
+                            } else {
+                                remaining.push(f.clone());
+                            }
+                        }
+                        if remaining.is_empty() {
+                            self.doc
+                                .replace_object_with_many("ExtractSrf", id, Vec::new());
+                        } else {
+                            self.doc.objects[id].geometry =
+                                Geometry::BRep(BRep::from_faces(remaining, tol));
+                            self.doc.objects[id].refresh_aabb();
+                            self.doc.record_object_modified("ExtractSrf", id, before);
+                        }
+                    }
+                }
+                if extracted_count > 0 {
+                    self.selected_subobjects.clear();
+                    self.prune_points_on();
+                    self.mark_scene_dirty();
+                    self.log(format!("Extracted {extracted_count} B-Rep face(s)."));
+                } else {
+                    self.log("Ctrl+Shift+Click B-Rep face(s) first, then run ExtractSrf.");
+                }
+            }
+            "tobrep" => {
+                let ids = self.doc.selected_ids_ordered();
+                let mut count = 0usize;
+                for id in ids {
+                    let before = self.doc.objects[id].clone();
+                    if let Geometry::Surface(s) = &before.geometry {
+                        self.doc.objects[id].geometry =
+                            Geometry::BRep(BRep::from_surface(s.clone()));
+                        self.doc.objects[id].refresh_aabb();
+                        self.doc.record_object_modified("ToBRep", id, before);
+                        count += 1;
+                    }
+                }
+                if count > 0 {
+                    self.prune_points_on();
+                    self.mark_scene_dirty();
+                    self.log(format!("Converted {count} surface(s) to B-Rep."));
+                } else {
+                    self.log("Select NURBS surface(s) to convert with ToBRep.");
+                }
+            }
+            "showedges" => {
+                match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
+                    Some("on" | "1" | "true") => self.show_naked_edges = true,
+                    Some("off" | "0" | "false") => self.show_naked_edges = false,
+                    _ => self.show_naked_edges = !self.show_naked_edges,
+                }
+                let mut naked_total = 0usize;
+                for (_, obj) in &self.doc.objects {
+                    if obj.visible {
+                        if let Geometry::BRep(b) = &obj.geometry {
+                            naked_total += b.naked_edges().len();
+                        }
+                    }
+                }
+                self.log(format!(
+                    "ShowEdges (Naked): {} ({naked_total} naked edge(s) in visible B-Reps).",
+                    if self.show_naked_edges { "On" } else { "Off" }
+                ));
+            }
             "help" => {
-                self.log("Interactive: Line, Polyline, Curve, InterpCrv, HandleCurve, Conic, Helix, Rectangle, Arc, Circle, Polygon, Box, Cylinder, Cone, Revolve, RailRevolve, ExtractIsocurve, SplitSrf, Move, Copy, Rotate, Scale, Mirror, Offset, SplitCurve, Trim, InsertKnot, ArrayLinear, ArrayPolar, Distance, Dim, TextDot | Surfacing: Sphere, Torus, Plane, Extrude, PlanarSrf, Loft, Sweep1, Sweep2, EdgeSrf, NetworkSrf, BlendSrf, MatchSrf, OffsetSrf, ExtendSrf, Patch, RebuildSrf, DupBorder, DupEdge, Flip | NURBS Editing: PointsOn/Off, UVN, SoftTransform, Join, Explode, Split, Fillet, Chamfer, BlendCrv, Match, Rebuild, RebuildAdaptive (Elmo), Fair, TweenCurves, ChangeDegree, CurvatureGraph, Area, BooleanUnion/Difference/Intersection, Units [mm|cm|m|in|ft], ZoomExtents (ZE), Undo, Redo");
+                self.log("Interactive: Line, Polyline, Curve, InterpCrv, HandleCurve, Conic, Helix, Rectangle, Arc, Circle, Polygon, Box, Cylinder, Cone, Revolve, RailRevolve, ExtractIsocurve, SplitSrf, Move, Copy, Rotate, Scale, Mirror, Offset, SplitCurve, Trim, InsertKnot, ArrayLinear, ArrayPolar, Distance, Dim, TextDot | B-Rep Solids & Surfacing: BooleanUnion/Difference/Intersection/Split, Intersect, Cap, Untrim, FilletSrf, FilletEdge, ChamferEdge, Shell, PushPull, Inset, ExtractSrf, ToBRep, ShowEdges (Ctrl+Shift+Click sub-objects) | Surfacing: Sphere, Torus, Plane, Extrude, PlanarSrf, Loft, Sweep1, Sweep2, EdgeSrf, NetworkSrf, BlendSrf, MatchSrf, OffsetSrf, ExtendSrf, Patch, RebuildSrf, DupBorder, DupEdge, Flip | Editing: PointsOn/Off, UVN, SoftTransform, Join, Explode, Split, Fillet, Chamfer, BlendCrv, Match, Rebuild, RebuildAdaptive (Elmo), Fair, TweenCurves, ChangeDegree, CurvatureGraph, Area, Units [mm|cm|m|in|ft], ZoomExtents (ZE), Undo, Redo");
             }
             _ => {
                 self.log(format!(

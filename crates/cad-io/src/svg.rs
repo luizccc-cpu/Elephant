@@ -39,29 +39,44 @@ pub fn export_svg_string(doc: &Document) -> String {
         let col = obj.color.unwrap_or(layer.color);
         let hex = format!("#{:02x}{:02x}{:02x}", col[0], col[1], col[2]);
 
-        if let Geometry::Curve(curve) = &obj.geometry {
-            let pts: Vec<[f64; 2]> = if curve.degree == 1 {
+        let curve_to_pts = |curve: &cad_geom::NurbsCurve| -> Vec<[f64; 2]> {
+            if curve.degree == 1 {
                 curve
                     .control_points
                     .iter()
-                    .map(|c| {
-                        expand(c.position.x, c.position.y);
-                        [c.position.x, c.position.y]
-                    })
+                    .map(|c| [c.position.x, c.position.y])
                     .collect()
             } else {
                 curve
                     .sample_polyline(48)
                     .into_iter()
-                    .map(|p| {
-                        expand(p.x, p.y);
-                        [p.x, p.y]
-                    })
+                    .map(|p| [p.x, p.y])
                     .collect()
-            };
-            if pts.len() >= 2 {
-                polylines.push((hex, pts));
             }
+        };
+
+        match &obj.geometry {
+            Geometry::Curve(curve) => {
+                let pts = curve_to_pts(curve);
+                if pts.len() >= 2 {
+                    for &[x, y] in &pts {
+                        expand(x, y);
+                    }
+                    polylines.push((hex, pts));
+                }
+            }
+            Geometry::BRep(brep) => {
+                for edge in &brep.edges {
+                    let pts = curve_to_pts(&edge.curve);
+                    if pts.len() >= 2 {
+                        for &[x, y] in &pts {
+                            expand(x, y);
+                        }
+                        polylines.push((hex.clone(), pts));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
