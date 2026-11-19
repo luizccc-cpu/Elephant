@@ -4,19 +4,21 @@ use cad_doc::{
 use cad_geom::{
     BRep, BooleanOp, BoundaryLock, Continuity, DMat4, DVec3, DrawingProjection, Geometry,
     LoftStyle, Make2DLineKind, Make2DOptions, NurbsCurve, NurbsSurface, PatchBoundaryConstraint,
-    PatchOptions, Plane, SoftTransformFalloff, SubObjectRef, SurfaceEdge, UnitSystem, blend_curves,
-    blend_srf, brep_boolean, brep_boolean_split, cap_planar_holes, chamfer_brep_edges,
-    chamfer_two_curves, closest_edge_pair, edge_srf, extend_srf, fair_curve, fillet_brep_edges,
-    fillet_srf, fillet_two_curves, inset_face, intersect_breps, intersect_curves,
-    intersect_surfaces, loft_nurbs, make_2d_projection, match_curve, match_srf, mesh_boolean,
-    network_srf, offset_srf, partition_network_curves, patch_srf, project_curve_to_surface,
+    PatchOptions, Plane, ShrinkWrapOptions, SoftTransformFalloff, SubDMesh, SubObjectRef,
+    SurfaceEdge, UnitSystem, blend_curves, blend_srf, brep_boolean, brep_boolean_split,
+    cap_planar_holes, chamfer_brep_edges, chamfer_two_curves, closest_edge_pair, edge_srf,
+    extend_srf, fair_curve, fillet_brep_edges, fillet_srf, fillet_two_curves, inset_face,
+    intersect_breps, intersect_curves, intersect_surfaces, loft_nurbs, make_2d_projection,
+    match_curve, match_srf, match_subd_to_curve, match_subd_to_surface, mesh_boolean, network_srf,
+    offset_srf, partition_network_curves, patch_srf, project_curve_to_surface,
     pull_curve_to_surface, push_pull_face, rebuild_adaptive, rebuild_srf, rebuild_uniform,
-    section_geometry_with_plane, shell_brep, split_face_with_uv_curve, sweep1, sweep2,
-    tangent_edge_chain, trim_face_with_curve, tween_curves, untrim_brep,
+    section_geometry_with_plane, shell_brep, shrinkwrap_geometries, split_face_with_uv_curve,
+    subd_to_nurbs_brep, sweep1, sweep2, tangent_edge_chain, trim_face_with_curve, tween_curves,
+    untrim_brep,
 };
 use cad_render::{DisplayMode, SurfaceAnalysisConfig, SurfaceAnalysisMode};
 
-use crate::state::{ElephantApp, InspectorTab, WorkspaceViewMode};
+use crate::state::{ElephantApp, InspectorTab, ToolPanelTab, WorkspaceViewMode};
 
 impl ElephantApp {
     pub fn execute_command(&mut self, raw: &str) {
@@ -1084,7 +1086,10 @@ impl ElephantApp {
                 let mut added = 0;
                 for (id, obj) in &self.doc.objects {
                     if obj.selected
-                        && matches!(obj.geometry, Geometry::Curve(_) | Geometry::Surface(_))
+                        && matches!(
+                            obj.geometry,
+                            Geometry::Curve(_) | Geometry::Surface(_) | Geometry::SubD(_)
+                        )
                         && self.points_on_objects.insert(id)
                     {
                         added += 1;
@@ -1167,6 +1172,11 @@ impl ElephantApp {
                 let n = self.doc.select_by_kind(|g| matches!(g, Geometry::Mesh(_)));
                 self.mark_doc_dirty();
                 self.log(format!("Selected {n} mesh(es)."));
+            }
+            "selsubd" => {
+                let n = self.doc.select_by_kind(|g| matches!(g, Geometry::SubD(_)));
+                self.mark_doc_dirty();
+                self.log(format!("Selected {n} SubD object(s)."));
             }
             "selpt" => {
                 let n = self
@@ -3207,8 +3217,304 @@ impl ElephantApp {
             "exportpdf" => {
                 self.export_pdf_dialog();
             }
+            "exportstep" => {
+                self.export_format_dialog("STEP AP214 (.stp, .step)", &["stp", "step"], "model.stp");
+            }
+            "exportiges" => {
+                self.export_format_dialog("IGES 5.3 (.igs, .iges)", &["igs", "iges"], "model.igs");
+            }
+            "export3dm" => {
+                self.export_format_dialog("Rhino 3DM (.3dm)", &["3dm"], "model.3dm");
+            }
+            "export3mf" => {
+                self.export_format_dialog("3D Manufacturing (.3mf)", &["3mf"], "model.3mf");
+            }
+            "nodeeditor" => {
+                self.workspace_view = WorkspaceViewMode::NodeCanvas;
+                self.log("Switched to 2D Parametric Node Canvas.");
+            }
+            "mcpbridge" => {
+                self.tool_tab = ToolPanelTab::Mcp;
+                self.log("Opened Local AI / MCP JSON-RPC Bridge.");
+            }
+            "subdbox" => {
+                let s = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(2.5).max(0.1);
+                let center = cplane.origin + cplane.z_axis * (s * 0.5);
+                let sd = SubDMesh::from_box(center, DVec3::splat(s));
+                let id = self.doc.add_object("SubDBox", Geometry::SubD(sd));
+                self.doc.clear_selection();
+                self.doc.set_selected(id, true);
+                self.points_on_objects.insert(id);
+                self.mark_scene_dirty();
+                self.log(format!("Created SubD Box (size={s:.2}) with cage active."));
+            }
+            "subdsphere" => {
+                let r = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.5).max(0.05);
+                let sd = SubDMesh::from_sphere(cplane.origin + cplane.z_axis * r, r);
+                let id = self.doc.add_object("SubDSphere", Geometry::SubD(sd));
+                self.doc.clear_selection();
+                self.doc.set_selected(id, true);
+                self.mark_scene_dirty();
+                self.log(format!("Created SubD Sphere (r={r:.2})."));
+            }
+            "subdcylinder" => {
+                let r = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.2).max(0.05);
+                let h = args.get(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(3.0);
+                let sd = SubDMesh::from_cylinder(cplane.origin, r, h, 8);
+                let id = self.doc.add_object("SubDCylinder", Geometry::SubD(sd));
+                self.doc.clear_selection();
+                self.doc.set_selected(id, true);
+                self.mark_scene_dirty();
+                self.log(format!("Created SubD Cylinder (r={r:.2}, h={h:.2})."));
+            }
+            "subdtorus" => {
+                let maj = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(2.2).max(0.2);
+                let min = args.get(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.65).max(0.05);
+                let sd = SubDMesh::from_torus(cplane.origin + cplane.z_axis * min, maj, min, 12, 8);
+                let id = self.doc.add_object("SubDTorus", Geometry::SubD(sd));
+                self.doc.clear_selection();
+                self.doc.set_selected(id, true);
+                self.mark_scene_dirty();
+                self.log(format!("Created SubD Torus (R={maj:.2}, r={min:.2})."));
+            }
+            "tosubd" => {
+                let sel = self.doc.selected_ids_ordered();
+                let mut converted = 0usize;
+                for id in sel {
+                    let Some(obj) = self.doc.objects.get(id) else {
+                        continue;
+                    };
+                    let lid = obj.layer_id;
+                    let mesh_opt = match &obj.geometry {
+                        Geometry::Mesh(m) => Some(m.clone()),
+                        Geometry::BRep(b) => Some(b.tessellate_display()),
+                        Geometry::Surface(s) => Some(s.tessellate_display()),
+                        _ => None,
+                    };
+                    if let Some(m) = mesh_opt {
+                        let sd = SubDMesh::from_mesh(&m);
+                        self.doc.replace_object_with_many(
+                            "ToSubD",
+                            id,
+                            vec![(lid, Geometry::SubD(sd))],
+                        );
+                        converted += 1;
+                    }
+                }
+                if converted > 0 {
+                    self.mark_scene_dirty();
+                    self.log(format!("Converted {converted} object(s) to SubD cage."));
+                } else {
+                    self.log("Select a Mesh, B-Rep, or Surface to convert with ToSubD.");
+                }
+            }
+            "subdivide" => {
+                let sel = self.doc.selected_ids_ordered();
+                let mut count = 0usize;
+                for id in sel {
+                    if let Some(before) = self.doc.objects.get(id).cloned() {
+                        if let Geometry::SubD(sd) = &before.geometry {
+                            let mut next = sd.clone();
+                            next.subdivide_cage_in_place();
+                            self.doc.objects[id].geometry = Geometry::SubD(next);
+                            self.doc.objects[id].refresh_aabb();
+                            self.doc.record_object_modified("Subdivide Cage", id, before);
+                            count += 1;
+                        }
+                    }
+                }
+                if count > 0 {
+                    self.mark_scene_dirty();
+                    self.log(format!("Subdivided {count} SubD cage(s)."));
+                } else {
+                    self.log("Select one or more SubD objects to subdivide.");
+                }
+            }
+            "crease" => {
+                let sel = self.doc.selected_ids_ordered();
+                let mut touched = 0usize;
+                for id in sel {
+                    if let Some(before) = self.doc.objects.get(id).cloned() {
+                        if let Geometry::SubD(sd) = &before.geometry {
+                            let mut next = sd.clone();
+                            let n = next.toggle_boundary_creases();
+                            self.doc.objects[id].geometry = Geometry::SubD(next);
+                            self.doc.objects[id].refresh_aabb();
+                            self.doc.record_object_modified("Crease SubD", id, before);
+                            touched += n;
+                        }
+                    }
+                }
+                if touched > 0 {
+                    self.mark_scene_dirty();
+                    self.log(format!("Toggled {touched} SubD crease edge(s)."));
+                } else {
+                    self.log("Select a SubD object to toggle boundary/top-ring creases.");
+                }
+            }
+            "subdextrudeface" => {
+                let dist = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.9);
+                let face_idx = args.get(1).and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
+                let sel = self.doc.selected_ids_ordered();
+                let mut count = 0usize;
+                for id in sel {
+                    if let Some(before) = self.doc.objects.get(id).cloned() {
+                        if let Geometry::SubD(sd) = &before.geometry {
+                            let mut next = sd.clone();
+                            let fi = face_idx.min(next.faces.len().saturating_sub(1));
+                            if next.extrude_face(fi, dist).is_ok() {
+                                self.doc.objects[id].geometry = Geometry::SubD(next);
+                                self.doc.objects[id].refresh_aabb();
+                                self.doc.record_object_modified("SubD Extrude Face", id, before);
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+                if count > 0 {
+                    self.mark_scene_dirty();
+                    self.log(format!("Extruded face on {count} SubD cage(s) by {dist:.2}."));
+                } else {
+                    self.log("Select a SubD object first (optional args: distance [face_idx]).");
+                }
+            }
+            "tonurbs" => {
+                let sel = self.doc.selected_ids_ordered();
+                let mut count = 0usize;
+                for id in sel {
+                    let Some(obj) = self.doc.objects.get(id) else {
+                        continue;
+                    };
+                    let lid = obj.layer_id;
+                    if let Geometry::SubD(sd) = &obj.geometry {
+                        match subd_to_nurbs_brep(sd) {
+                            Ok(brep) => {
+                                self.doc.replace_object_with_many(
+                                    "ToNURBS",
+                                    id,
+                                    vec![(lid, Geometry::BRep(brep))],
+                                );
+                                self.points_on_objects.remove(&id);
+                                count += 1;
+                            }
+                            Err(e) => self.log(format!("ToNURBS error: {e}")),
+                        }
+                    }
+                }
+                if count > 0 {
+                    self.prune_points_on();
+                    self.mark_scene_dirty();
+                    self.log(format!("Converted {count} SubD object(s) to stitched NURBS B-Rep."));
+                } else {
+                    self.log("Select a SubD object to convert with ToNURBS.");
+                }
+            }
+            "matchsubd" => {
+                let sel = self.doc.selected_ids_ordered();
+                let mut subd_id = None;
+                let mut target_srf: Option<NurbsSurface> = None;
+                let mut target_crv: Option<NurbsCurve> = None;
+                for id in sel {
+                    if let Some(obj) = self.doc.objects.get(id) {
+                        match &obj.geometry {
+                            Geometry::SubD(_) if subd_id.is_none() => subd_id = Some(id),
+                            Geometry::Surface(s) if target_srf.is_none() => target_srf = Some(s.clone()),
+                            Geometry::Curve(c) if target_crv.is_none() => target_crv = Some(c.clone()),
+                            Geometry::BRep(b) if target_srf.is_none() => {
+                                if let Some(f) = b.faces.first() {
+                                    target_srf = Some(f.surface.clone());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if let Some(sid) = subd_id {
+                    if let Some(before) = self.doc.objects.get(sid).cloned() {
+                        if let Geometry::SubD(sd) = &before.geometry {
+                            let mut next = sd.clone();
+                            let res = if let Some(srf) = &target_srf {
+                                match_subd_to_surface(&mut next, srf, true)
+                            } else if let Some(crv) = &target_crv {
+                                match_subd_to_curve(&mut next, crv)
+                            } else {
+                                self.log("Select 1 open SubD plus 1 target Surface or Curve.");
+                                return;
+                            };
+                            match res {
+                                Ok(n) => {
+                                    self.doc.objects[sid].geometry = Geometry::SubD(next);
+                                    self.doc.objects[sid].refresh_aabb();
+                                    self.doc.record_object_modified("MatchSubD", sid, before);
+                                    self.mark_scene_dirty();
+                                    self.log(format!("MatchSubD aligned {n} boundary vertex(es) with G1 tangency."));
+                                }
+                                Err(e) => self.log(format!("MatchSubD: {e}")),
+                            }
+                        }
+                    }
+                } else {
+                    self.log("Select 1 open SubD object and 1 target Surface/BRep/Curve.");
+                }
+            }
+            "shrinkwrap" => {
+                let voxel_size = args
+                    .first()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.25)
+                    .max(0.05);
+                let offset = args.get(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+                let selected: Vec<_> = self
+                    .doc
+                    .objects
+                    .iter()
+                    .filter(|(_, o)| o.selected && o.visible)
+                    .map(|(id, _)| id)
+                    .collect();
+                let src_ids = if selected.is_empty() {
+                    self.doc
+                        .objects
+                        .iter()
+                        .filter(|(_, o)| o.visible && self.doc.is_layer_effectively_visible(o.layer_id))
+                        .map(|(id, _)| id)
+                        .collect::<Vec<_>>()
+                } else {
+                    selected
+                };
+                let geoms: Vec<&Geometry> = src_ids
+                    .iter()
+                    .filter_map(|id| self.doc.objects.get(*id).map(|o| &o.geometry))
+                    .collect();
+                if geoms.is_empty() {
+                    self.log("No visible or selected objects to ShrinkWrap.");
+                } else {
+                    match shrinkwrap_geometries(
+                        &geoms,
+                        &ShrinkWrapOptions {
+                            voxel_size,
+                            offset,
+                            smoothing_iterations: 4,
+                            fill_holes: true,
+                            max_grid_dim: 64,
+                        },
+                    ) {
+                        Ok(mesh) => {
+                            let vc = mesh.positions.len();
+                            let tc = mesh.indices.len();
+                            let id = self.doc.add_object("ShrinkWrap", Geometry::Mesh(mesh));
+                            self.doc.clear_selection();
+                            self.doc.set_selected(id, true);
+                            self.mark_scene_dirty();
+                            self.log(format!(
+                                "ShrinkWrap generated closed manifold mesh ({vc} verts, {tc} tris, voxel={voxel_size:.2}, offset={offset:.2})."
+                            ));
+                        }
+                        Err(e) => self.log(format!("ShrinkWrap failed: {e}")),
+                    }
+                }
+            }
             "help" => {
-                self.log("Interactive: Line, Polyline, Curve, InterpCrv, HandleCurve, Conic, Helix, Rectangle, Arc, Circle, Polygon, Box, Cylinder, Cone, Revolve, RailRevolve, ExtractIsocurve, SplitSrf, Move, Copy, Rotate, Scale, Mirror, Offset, SplitCurve, Trim, InsertKnot, ArrayLinear, ArrayPolar, Distance, Dim, TextDot, GdtFrame, DatumTag | B-Rep & Surfacing: BooleanUnion/Difference/Intersection/Split, Intersect, Cap, Untrim, FilletSrf, FilletEdge, ChamferEdge, Shell, PushPull, Inset, ExtractSrf, ToBRep, ShowEdges (Ctrl+Shift+Click sub-objects), Sphere, Torus, Plane, Extrude, PlanarSrf, Loft, Sweep1, Sweep2, EdgeSrf, NetworkSrf, BlendSrf, MatchSrf, OffsetSrf, ExtendSrf, Patch, RebuildSrf, DupBorder, DupEdge, Flip | Display & Analysis: Rendered, Concept, Arctic, Shaded, Wireframe, Technical, Ghosted, Zebra, EMap, GaussianCurvature, MeanCurvature, DraftAngle, AnalysisOff, GlobalEdgeContinuity, MassProperties, ClippingPlane, ClippingPlaneFlip, Section | Drafting & PDF: Make2D, Layout, ModelSpace, ExportPDF | Editing & UX: PointsOn/Off, UVN, SoftTransform, Join, Explode, Split, Fillet, Chamfer, BlendCrv, Match, Rebuild, RebuildAdaptive (Elmo), Fair, TweenCurves, ChangeDegree, CurvatureGraph, Area, AutoCPlane, SmartTrack, GumballAlign, GumballRelocate, GumballReset, History, BreakHistory, HistoryPurge, RadialMenu, Units [mm|cm|m|in|ft], ZoomExtents (ZE), Undo, Redo | Shortcuts: Q/Space=Radial Menu, Right/Left/Up=Axis Lock, T=SmartTrack point, Alt+Drag=Copy, Ctrl+Drag=Relocate Gumball");
+                self.log("Interactive: Line, Polyline, Curve, InterpCrv, HandleCurve, Conic, Helix, Rectangle, Arc, Circle, Polygon, Box, Cylinder, Cone, Revolve, RailRevolve, ExtractIsocurve, SplitSrf, Move, Copy, Rotate, Scale, Mirror, Offset, SplitCurve, Trim, InsertKnot, ArrayLinear, ArrayPolar, Distance, Dim, TextDot, GdtFrame, DatumTag | SubD & Organic: SubDBox, SubDSphere, SubDCylinder, SubDTorus, ToSubD, Subdivide, Crease, SubDExtrudeFace, ToNURBS, MatchSubD, ShrinkWrap [voxel] [offset] | B-Rep & Surfacing: BooleanUnion/Difference/Intersection/Split, Intersect, Cap, Untrim, FilletSrf, FilletEdge, ChamferEdge, Shell, PushPull, Inset, ExtractSrf, ToBRep, ShowEdges (Ctrl+Shift+Click sub-objects), Sphere, Torus, Plane, Extrude, PlanarSrf, Loft, Sweep1, Sweep2, EdgeSrf, NetworkSrf, BlendSrf, MatchSrf, OffsetSrf, ExtendSrf, Patch, RebuildSrf, DupBorder, DupEdge, Flip | Display & Analysis: Rendered, Concept, Arctic, Shaded, Wireframe, Technical, Ghosted, Zebra, EMap, GaussianCurvature, MeanCurvature, DraftAngle, AnalysisOff, GlobalEdgeContinuity, MassProperties, ClippingPlane, ClippingPlaneFlip, Section | Drafting & Interop: Make2D, Layout, ModelSpace, ExportPDF, ExportSTEP, ExportIGES, Export3DM, Export3MF, NodeEditor, McpBridge | Shortcuts: Q/Space=Radial Menu, F10/F11=PointsOn/Off, Right/Left/Up=Axis Lock, T=SmartTrack point, Alt+Drag=Copy, Ctrl+Drag=Relocate Gumball");
             }
             _ => {
                 self.log(format!(

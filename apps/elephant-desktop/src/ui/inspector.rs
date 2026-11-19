@@ -222,6 +222,7 @@ impl ElephantApp {
                         "[BRep]"
                     }
                 }
+                Geometry::SubD(_) => "[SubD]",
                 Geometry::Mesh(_) => "[Mesh]",
             };
             let hist_tag = if self.doc.history_record_for(oid).is_some() {
@@ -385,6 +386,13 @@ impl ElephantApp {
                         b.edges.len(),
                         b.vertices.len()
                     ),
+                    Geometry::SubD(sd) => format!(
+                        "Catmull-Clark SubD ({}V, {}F, {} creases, Lvl {})",
+                        sd.vertices.len(),
+                        sd.faces.len(),
+                        sd.creased_edges.len(),
+                        sd.subdivision_level
+                    ),
                     Geometry::Mesh(m) => format!(
                         "Mesh ({} verts, {} tris)",
                         m.positions.len(),
@@ -484,6 +492,38 @@ impl ElephantApp {
                                 .text("Comb Scale"),
                         );
                     }
+                } else if let Geometry::SubD(sd) = &mut obj.geometry {
+                    let mut lvl = sd.subdivision_level as usize;
+                    if ui
+                        .add(egui::Slider::new(&mut lvl, 1..=4).text("Subdiv Level"))
+                        .changed()
+                    {
+                        sd.subdivision_level = lvl as u8;
+                        obj.refresh_aabb();
+                        prop_changed = true;
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.small_button("PointsOn").clicked() {
+                            queued_cmd = Some("PointsOn");
+                        }
+                        if ui.small_button("Subdivide").clicked() {
+                            queued_cmd = Some("Subdivide");
+                        }
+                        if ui.small_button("Crease").clicked() {
+                            queued_cmd = Some("Crease");
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.small_button("ExtrudeF").clicked() {
+                            queued_cmd = Some("SubDExtrudeFace");
+                        }
+                        if ui.small_button("ToNURBS").clicked() {
+                            queued_cmd = Some("ToNURBS");
+                        }
+                        if ui.small_button("MatchSubD").clicked() {
+                            queued_cmd = Some("MatchSubD");
+                        }
+                    });
                 }
                 if let Some(gid) = obj.group_id {
                     ui.label(format!("Group: #{gid}"));

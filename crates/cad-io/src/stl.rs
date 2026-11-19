@@ -26,6 +26,10 @@ pub fn export_stl_bytes(doc: &Document) -> Vec<u8> {
                 let m = b.tessellate_display();
                 collect_mesh_tris(&m, &mut tris);
             }
+            Geometry::SubD(sd) => {
+                let m = sd.tessellate_display();
+                collect_mesh_tris(&m, &mut tris);
+            }
             _ => {}
         }
     }

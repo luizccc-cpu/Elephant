@@ -24,4 +24,6 @@ pub enum GeomError {
     },
     #[error("degenerate geometry: {0}")]
     Degenerate(&'static str),
+    #[error("{0}")]
+    InvalidInput(String),
 }

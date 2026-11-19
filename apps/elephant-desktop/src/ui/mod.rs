@@ -1,5 +1,6 @@
 pub mod inspector;
 pub mod layout_view;
+pub mod node_canvas;
 pub mod radial_menu;
 pub mod status_bar;
 pub mod tool_palette;
@@ -88,6 +89,10 @@ impl eframe::App for ElephantApp {
                     if ui.selectable_label(is_model, "Model").clicked() {
                         self.workspace_view = WorkspaceViewMode::Model;
                     }
+                    let is_nodes = matches!(self.workspace_view, WorkspaceViewMode::NodeCanvas);
+                    if ui.selectable_label(is_nodes, "Node Canvas").clicked() {
+                        self.workspace_view = WorkspaceViewMode::NodeCanvas;
+                    }
                     let layouts: Vec<(u64, String)> =
                         self.doc.layouts.iter().map(|l| (l.id, l.name.clone())).collect();
                     for (lid, lname) in layouts {
@@ -113,6 +118,9 @@ impl eframe::App for ElephantApp {
             .show(ctx, |ui| match self.workspace_view {
                 WorkspaceViewMode::Layout(lid) => {
                     self.draw_layout_view(ui, lid);
+                }
+                WorkspaceViewMode::NodeCanvas => {
+                    self.draw_node_canvas(ui);
                 }
                 WorkspaceViewMode::Model => {
                     if let Some(max_idx) = self.maximized_viewport {

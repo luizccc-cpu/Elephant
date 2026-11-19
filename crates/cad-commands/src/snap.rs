@@ -572,6 +572,35 @@ impl SnapConfig {
                         }
                     }
                 }
+                Geometry::SubD(sd) => {
+                    if self.osnap_vertex || self.osnap_end {
+                        for &pt in &sd.vertices {
+                            let d = pt.distance(raw_point);
+                            if d < best_dist {
+                                best_dist = d;
+                                best = Some((pt, SnapKind::Vertex));
+                            }
+                        }
+                    }
+                    if self.osnap_mid {
+                        for (a, b, _) in sd.control_cage_edges() {
+                            let pt = (a + b) * 0.5;
+                            let d = pt.distance(raw_point);
+                            if d < best_dist {
+                                best_dist = d;
+                                best = Some((pt, SnapKind::Mid));
+                            }
+                        }
+                    }
+                    if self.osnap_center {
+                        let pt = obj.aabb.center();
+                        let d = pt.distance(raw_point);
+                        if d < best_dist {
+                            best_dist = d;
+                            best = Some((pt, SnapKind::Center));
+                        }
+                    }
+                }
                 Geometry::Mesh(mesh) => {
                     if self.osnap_vertex {
                         let bb = obj.aabb.expanded(snap_radius);

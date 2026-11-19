@@ -474,20 +474,35 @@ pub fn compute_uvn_gumball_handles(
                 normal: n,
             }
         }
+        Geometry::SubD(sd) => {
+            let pos = *sd.vertices.get(cp_idx)?;
+            let c = obj.aabb.center();
+            let normal = (pos - c).normalize_or(DVec3::Z);
+            let ref_v = if normal.z.abs() < 0.9 { DVec3::Z } else { DVec3::X };
+            let u_dir = ref_v.cross(normal).normalize_or(DVec3::X);
+            let v_dir = normal.cross(u_dir).normalize_or(DVec3::Y);
+            SurfaceFrame {
+                origin: pos,
+                u_dir,
+                v_dir,
+                normal,
+            }
+        }
         _ => return None,
     };
 
-    let cps: &[cad_geom::ControlPoint] = match &obj.geometry {
-        Geometry::Surface(s) => &s.control_points,
-        Geometry::Curve(c) => &c.control_points,
-        _ => return None,
-    };
     let mut sum = DVec3::ZERO;
     let mut cnt = 0usize;
     for &(id, idx) in &app.selected_cps {
         if id == oid {
-            if let Some(cp) = cps.get(idx) {
-                sum += cp.position;
+            let pt_opt = match &obj.geometry {
+                Geometry::Surface(s) => s.control_points.get(idx).map(|cp| cp.position),
+                Geometry::Curve(c) => c.control_points.get(idx).map(|cp| cp.position),
+                Geometry::SubD(sd) => sd.vertices.get(idx).copied(),
+                _ => None,
+            };
+            if let Some(p) = pt_opt {
+                sum += p;
                 cnt += 1;
             }
         }
@@ -573,6 +588,7 @@ impl ElephantApp {
                 && self.doc.objects.get(oid).is_some_and(|o| match &o.geometry {
                     Geometry::Curve(c) => idx < c.control_points.len(),
                     Geometry::Surface(s) => idx < s.control_points.len(),
+                    Geometry::SubD(sd) => idx < sd.vertices.len(),
                     _ => false,
                 })
         })
@@ -608,12 +624,35 @@ impl ElephantApp {
                     self.soft_transform_falloff,
                     self.soft_transform_lock,
                 ),
+                Geometry::SubD(sd) => {
+                    let r = self.soft_transform_radius.max(1e-4);
+                    let sel_pts: Vec<DVec3> = selected
+                        .iter()
+                        .filter_map(|&si| sd.vertices.get(si).copied())
+                        .collect();
+                    sd.vertices
+                        .iter()
+                        .map(|&v| {
+                            let d = sel_pts
+                                .iter()
+                                .map(|&sp| v.distance(sp))
+                                .fold(f64::INFINITY, f64::min);
+                            if d >= r {
+                                0.0
+                            } else {
+                                let t = 1.0 - (d / r);
+                                t * t * (3.0 - 2.0 * t)
+                            }
+                        })
+                        .collect()
+                }
                 _ => Vec::new(),
             }
         } else {
             let n = match &obj.geometry {
                 Geometry::Surface(s) => s.control_points.len(),
                 Geometry::Curve(c) => c.control_points.len(),
+                Geometry::SubD(sd) => sd.vertices.len(),
                 _ => 0,
             };
             let mut weights = vec![0.0_f64; n];
@@ -642,6 +681,14 @@ impl ElephantApp {
             }
             (Geometry::Curve(c), Geometry::Curve(base)) => {
                 apply_weighted_deltas_curve(c, base, weights, total_delta);
+            }
+            (Geometry::SubD(sd), Geometry::SubD(base)) => {
+                for (i, v) in sd.vertices.iter_mut().enumerate() {
+                    let w = weights.get(i).copied().unwrap_or(0.0);
+                    if w > 0.0 {
+                        *v = base.vertices[i] + total_delta * w;
+                    }
+                }
             }
             _ => {}
         }

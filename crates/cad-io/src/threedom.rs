@@ -4,12 +4,25 @@ use std::io::Cursor;
 use cad_doc::{AnnotationItem, AnnotationKind, Document, Layer, LayerId};
 use cad_geom::{ControlPoint, DVec3, Geometry, NurbsCurve, NurbsSurface, Plane, TriangleMesh};
 use cadmpeg_codec_rhino::RhinoCodec;
+use cadmpeg_ir::codec::write::target::TargetRequest;
+use cadmpeg_ir::codec::write::{EncodeInput, Encoder};
 use cadmpeg_ir::codec::{Codec, DecodeOptions};
-use cadmpeg_ir::geometry::nurbs::{NurbsPoleGrid, NurbsPoles3};
-use cadmpeg_ir::geometry::{
-    CurveGeometry, SolvedCurveGeometry, SolvedSurfaceGeometry, SurfaceGeometry,
+use cadmpeg_ir::document::CadIr;
+use cadmpeg_ir::features::FinitePoint3;
+use cadmpeg_ir::geometry::nurbs::{
+    NurbsCurve as IrNurbsCurve, NurbsPoleGrid, NurbsPoles3, NurbsSurface as IrNurbsSurface,
+    NurbsSurfaceAxis, WeightedPole3,
 };
+use cadmpeg_ir::geometry::{
+    Curve as IrCurve, CurveGeometry, SolvedCurveGeometry, SolvedSurfaceGeometry,
+    Surface as IrSurface, SurfaceGeometry,
+};
+use cadmpeg_ir::ids::{CurveId, PointId, SurfaceId};
+use cadmpeg_ir::math::Point3;
+use cadmpeg_ir::scalar::NonZeroReal;
 use cadmpeg_ir::semantic_annotations::SemanticAnnotationKind;
+use cadmpeg_ir::tessellation::{Tessellation, TessellationId, TessellationMesh};
+use cadmpeg_ir::topology::Point as IrPoint;
 
 use crate::error::IoError;
 
@@ -284,35 +297,37 @@ pub fn import_3dm_bytes(bytes: &[u8], doc: &mut Document) -> Result<usize, IoErr
         }
     }
 
-    // 3. Import standalone NURBS surfaces when no tessellations were provided
-    if !has_tess {
-        for surf in &ir.model.surfaces {
-            let solved = match &surf.geometry {
-                SurfaceGeometry::Solved(s) => Some(s),
-                SurfaceGeometry::Procedural { cache, .. } => cache.as_ref(),
-            };
-            if let Some(g) = solved.and_then(convert_surface) {
-                let lid = resolve_layer(
-                    surf.source_object
-                        .as_ref()
-                        .and_then(|s| s.layer.as_deref()),
-                );
-                let id = doc.add_object_on_layer("Import3DM_Surface", lid, g);
-                if let Some(obj) = doc.objects.get_mut(id) {
-                    obj.color = surf.source_object.as_ref().and_then(|s| {
-                        let rgb = s.color.map(|c| {
-                            [
-                                (c.r() * 255.0).round().clamp(0.0, 255.0) as u8,
-                                (c.g() * 255.0).round().clamp(0.0, 255.0) as u8,
-                                (c.b() * 255.0).round().clamp(0.0, 255.0) as u8,
-                                255,
-                            ]
-                        });
-                        resolve_color(s.object_id.as_str(), rgb)
+    // 3. Import standalone NURBS surfaces not owned by an imported B-Rep face
+    let face_surface_ids: HashSet<_> = ir.model.faces.iter().map(|f| f.surface.clone()).collect();
+    for surf in &ir.model.surfaces {
+        if has_tess && face_surface_ids.contains(&surf.id) {
+            continue;
+        }
+        let solved = match &surf.geometry {
+            SurfaceGeometry::Solved(s) => Some(s),
+            SurfaceGeometry::Procedural { cache, .. } => cache.as_ref(),
+        };
+        if let Some(g) = solved.and_then(convert_surface) {
+            let lid = resolve_layer(
+                surf.source_object
+                    .as_ref()
+                    .and_then(|s| s.layer.as_deref()),
+            );
+            let id = doc.add_object_on_layer("Import3DM_Surface", lid, g);
+            if let Some(obj) = doc.objects.get_mut(id) {
+                obj.color = surf.source_object.as_ref().and_then(|s| {
+                    let rgb = s.color.map(|c| {
+                        [
+                            (c.r() * 255.0).round().clamp(0.0, 255.0) as u8,
+                            (c.g() * 255.0).round().clamp(0.0, 255.0) as u8,
+                            (c.b() * 255.0).round().clamp(0.0, 255.0) as u8,
+                            255,
+                        ]
                     });
-                }
-                added += 1;
+                    resolve_color(s.object_id.as_str(), rgb)
+                });
             }
+            added += 1;
         }
     }
 
@@ -465,6 +480,142 @@ fn convert_surface(solved: &SolvedSurfaceGeometry) -> Option<Geometry> {
     }
 }
 
+/// Export visible NURBS curves, NURBS surfaces, points, B-Rep/SubD display meshes, and meshes to Rhino `.3dm` (V8) bytes.
+pub fn export_3dm_bytes(doc: &Document) -> Result<Vec<u8>, IoError> {
+    let mut ir = CadIr::empty();
+    let mut idx = 0usize;
+
+    let push_mesh = |ir: &mut CadIr, idx: usize, m: &TriangleMesh| -> Result<(), IoError> {
+        if m.positions.is_empty() || m.indices.is_empty() {
+            return Ok(());
+        }
+        let vertices: Vec<Point3> = m
+            .positions
+            .iter()
+            .map(|p| Point3::new(p[0], p[1], p[2]))
+            .collect();
+        let tid = TessellationId::try_from(format!("elephant:model:mesh#{idx}"))
+            .map_err(|e| IoError::InvalidFormat(format!("3DM tessellation id error: {e}")))?;
+        let tess = Tessellation::new(
+            tid,
+            TessellationMesh::List {
+                vertices,
+                triangles: m.indices.clone(),
+            },
+            Vec::new(),
+        )
+        .map_err(|e| IoError::InvalidFormat(format!("3DM tessellation build failed: {e}")))?;
+        ir.model.tessellations.push(tess);
+        Ok(())
+    };
+
+    for (_, obj) in &doc.objects {
+        if !obj.visible || !doc.is_layer_effectively_visible(obj.layer_id) {
+            continue;
+        }
+        idx += 1;
+        match &obj.geometry {
+            Geometry::Point(p) => {
+                let fp = FinitePoint3::new(Point3::new(p.x, p.y, p.z))
+                    .ok_or_else(|| IoError::InvalidFormat("non-finite point coordinate".to_string()))?;
+                let pid = PointId::try_from(format!("elephant:model:point#{idx}"))
+                    .map_err(|e| IoError::InvalidFormat(format!("3DM point id error: {e}")))?;
+                ir.model.points.push(IrPoint::new(pid, fp, None));
+            }
+            Geometry::Curve(c) => {
+                let rational = c.control_points.iter().any(|cp| (cp.weight - 1.0).abs() > 1e-7);
+                let poles = if rational {
+                    let pts = c
+                        .control_points
+                        .iter()
+                        .map(|cp| {
+                            Ok(WeightedPole3 {
+                                point: Point3::new(cp.position.x, cp.position.y, cp.position.z),
+                                weight: NonZeroReal::new(cp.weight)
+                                    .ok_or_else(|| IoError::InvalidFormat("invalid zero weight".to_string()))?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, IoError>>()?;
+                    NurbsPoles3::Rational { points: pts }
+                } else {
+                    let pts = c
+                        .control_points
+                        .iter()
+                        .map(|cp| Point3::new(cp.position.x, cp.position.y, cp.position.z))
+                        .collect();
+                    NurbsPoles3::Polynomial { points: pts }
+                };
+                let ir_curve = IrNurbsCurve::new(c.degree as u32, c.knots.clone(), poles, false)
+                    .map_err(|e| IoError::InvalidFormat(format!("3DM curve error: {e}")))?;
+                let cid = CurveId::try_from(format!("elephant:model:curve#{idx}"))
+                    .map_err(|e| IoError::InvalidFormat(format!("3DM curve id error: {e}")))?;
+                ir.model.curves.push(IrCurve {
+                    id: cid,
+                    geometry: CurveGeometry::Solved(SolvedCurveGeometry::Nurbs(ir_curve)),
+                    parameter_range: None,
+                    source_object: None,
+                });
+            }
+            Geometry::Surface(s) => {
+                let rational = s.control_points.iter().any(|cp| (cp.weight - 1.0).abs() > 1e-7);
+                let grid = if rational {
+                    let mut rows = Vec::with_capacity(s.count_u);
+                    for u in 0..s.count_u {
+                        let mut row = Vec::with_capacity(s.count_v);
+                        for v in 0..s.count_v {
+                            let cp = s.control_points[u * s.count_v + v];
+                            row.push(WeightedPole3 {
+                                point: Point3::new(cp.position.x, cp.position.y, cp.position.z),
+                                weight: NonZeroReal::new(cp.weight)
+                                    .ok_or_else(|| IoError::InvalidFormat("invalid zero weight".to_string()))?,
+                            });
+                        }
+                        rows.push(row);
+                    }
+                    NurbsPoleGrid::Rational { rows }
+                } else {
+                    let mut rows = Vec::with_capacity(s.count_u);
+                    for u in 0..s.count_u {
+                        let mut row = Vec::with_capacity(s.count_v);
+                        for v in 0..s.count_v {
+                            let p = s.control_points[u * s.count_v + v].position;
+                            row.push(Point3::new(p.x, p.y, p.z));
+                        }
+                        rows.push(row);
+                    }
+                    NurbsPoleGrid::Polynomial { rows }
+                };
+                let ir_srf = IrNurbsSurface::new(
+                    NurbsSurfaceAxis::new(s.degree_u as u32, s.knots_u.clone(), false),
+                    NurbsSurfaceAxis::new(s.degree_v as u32, s.knots_v.clone(), false),
+                    grid,
+                    false,
+                )
+                .map_err(|e| IoError::InvalidFormat(format!("3DM surface error: {e}")))?;
+                let sid = SurfaceId::try_from(format!("elephant:model:surface#{idx}"))
+                    .map_err(|e| IoError::InvalidFormat(format!("3DM surface id error: {e}")))?;
+                ir.model.surfaces.push(IrSurface {
+                    id: sid,
+                    geometry: SurfaceGeometry::Solved(SolvedSurfaceGeometry::Nurbs(ir_srf)),
+                    source_object: None,
+                });
+            }
+            Geometry::BRep(b) => push_mesh(&mut ir, idx, &b.tessellate_display())?,
+            Geometry::SubD(sd) => push_mesh(&mut ir, idx, &sd.tessellate_display())?,
+            Geometry::Mesh(m) => push_mesh(&mut ir, idx, m)?,
+        }
+    }
+
+    ir.finalize();
+    let plan = RhinoCodec
+        .plan(EncodeInput::new(&ir, None), TargetRequest::Explicit("80"))
+        .map_err(|e| IoError::InvalidFormat(format!("3DM encode plan failed: {e}")))?;
+    let mut bytes = Vec::new();
+    plan.write_to(&mut bytes)
+        .map_err(|e| IoError::InvalidFormat(format!("3DM write failed: {e}")))?;
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,5 +631,34 @@ mod tests {
     fn parses_rhino_hex_rgba_colors() {
         assert_eq!(parse_rhino_hex_rgba("0000ff00"), Some([0, 0, 255, 255]));
         assert_eq!(parse_rhino_hex_rgba("b4e2de00"), Some([180, 226, 222, 255]));
+    }
+
+    #[test]
+    fn threedom_roundtrip_export_and_import() {
+        let mut doc = Document::new();
+        doc.add_object(
+            "Circle",
+            Geometry::Curve(NurbsCurve::circle(&Plane::world_xy(), 3.0).unwrap()),
+        );
+        doc.add_object(
+            "Surface",
+            Geometry::Surface(NurbsSurface::plane_rect(&Plane::world_xy(), 4.0, 2.0)),
+        );
+        doc.add_object(
+            "Mesh",
+            Geometry::Mesh(TriangleMesh::from_box(DVec3::new(6.0, 0.0, 1.0), DVec3::splat(2.0))),
+        );
+
+        let bytes = export_3dm_bytes(&doc).expect("export 3DM");
+        assert!(bytes.starts_with(b"3D Geometry File Format"));
+
+        let mut doc2 = Document::new();
+        let imported = import_3dm_bytes(&bytes, &mut doc2).expect("import 3DM");
+        assert!(imported >= 3, "expected >=3 imported items, got {imported}");
+
+        let bb1 = doc.visible_bounding_box();
+        let bb2 = doc2.visible_bounding_box();
+        assert!(bb1.min.distance(bb2.min) < 1e-3);
+        assert!(bb1.max.distance(bb2.max) < 1e-3);
     }
 }

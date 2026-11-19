@@ -372,6 +372,53 @@ impl RenderScene {
                         }
                     }
                 }
+                Geometry::SubD(sd) => {
+                    let mesh = sd.tessellate_display();
+                    let curv = if compute_curvature && mode != DisplayMode::Wireframe {
+                        Some(compute_mesh_discrete_curvature(&mesh))
+                    } else {
+                        None
+                    };
+                    let curv_ref = curv
+                        .as_ref()
+                        .map(|(g, m)| (g.as_slice(), m.as_slice()));
+                    if mode != DisplayMode::Wireframe {
+                        scene.push_mesh_triangles_with_data(
+                            &mesh.positions,
+                            &mesh.normals,
+                            &mesh.indices,
+                            shaded_color,
+                            curv_ref,
+                            mat_pair,
+                        );
+                    }
+                    if !suppress_edges && (mode == DisplayMode::Wireframe || mode == DisplayMode::Technical || obj.selected) {
+                        for (a, b, is_creased) in sd.control_cage_edges() {
+                            let col = if is_creased {
+                                [1.0, 0.55, 0.15, 0.95]
+                            } else if obj.selected {
+                                SELECTION_COLOR
+                            } else {
+                                base_color
+                            };
+                            scene.push_line(
+                                [a.x as f32, a.y as f32, a.z as f32],
+                                [b.x as f32, b.y as f32, b.z as f32],
+                                col,
+                            );
+                        }
+                    } else if mode == DisplayMode::Shaded || mode == DisplayMode::Ghosted || mode == DisplayMode::Concept {
+                        for (a, b, is_creased) in sd.control_cage_edges() {
+                            if is_creased {
+                                scene.push_line(
+                                    [a.x as f32, a.y as f32, a.z as f32],
+                                    [b.x as f32, b.y as f32, b.z as f32],
+                                    [0.14, 0.16, 0.20, 0.90],
+                                );
+                            }
+                        }
+                    }
+                }
                 Geometry::Mesh(mesh) => {
                     let curv = if compute_curvature && mode != DisplayMode::Wireframe {
                         Some(compute_mesh_discrete_curvature(mesh))
@@ -541,6 +588,18 @@ impl RenderScene {
                 }
                 Geometry::BRep(brep) => {
                     let mesh = brep.tessellate_display();
+                    self.push_mesh(
+                        &mesh.positions,
+                        &mesh.normals,
+                        &mesh.indices,
+                        shaded_preview,
+                        preview_color,
+                        DisplayMode::Ghosted,
+                        false,
+                    );
+                }
+                Geometry::SubD(sd) => {
+                    let mesh = sd.tessellate_display();
                     self.push_mesh(
                         &mesh.positions,
                         &mesh.normals,

@@ -1,22 +1,29 @@
-//! File format importers and exporters (.elephant, .3dm, .dxf, .obj, .stl, .svg, .glb) for Elephant.
+//! File format importers and exporters (.elephant, .3dm, .step, .iges, .3mf, .dxf, .obj, .stl, .svg, .pdf, .glb) for Elephant.
 
 pub mod dxf;
 pub mod error;
 pub mod gltf;
+pub mod iges;
 pub mod obj;
 pub mod pdf;
 pub mod project;
+pub mod step;
 pub mod stl;
 pub mod svg;
 pub mod threedom;
+pub mod threemf;
 
 use std::path::Path;
 
 use cad_doc::Document;
 pub use error::IoError;
+pub use iges::{export_iges_string, import_iges_str};
 pub use pdf::{export_layout_pdf_bytes, export_pdf_bytes};
 pub use project::ProjectMetadata;
+pub use step::{export_step_string, import_step_str};
 pub use svg::export_layout_svg_string;
+pub use threedom::{export_3dm_bytes, import_3dm_bytes};
+pub use threemf::{export_3mf_bytes, import_3mf_bytes};
 
 pub fn import_into_document(path: &Path, doc: &mut Document) -> Result<usize, IoError> {
     let ext = path
@@ -37,6 +44,18 @@ pub fn import_into_document(path: &Path, doc: &mut Document) -> Result<usize, Io
         "3dm" => {
             let bytes = std::fs::read(path)?;
             threedom::import_3dm_bytes(&bytes, doc)
+        }
+        "step" | "stp" => {
+            let text = std::fs::read_to_string(path)?;
+            step::import_step_str(&text, doc)
+        }
+        "iges" | "igs" => {
+            let text = std::fs::read_to_string(path)?;
+            iges::import_iges_str(&text, doc)
+        }
+        "3mf" => {
+            let bytes = std::fs::read(path)?;
+            threemf::import_3mf_bytes(&bytes, doc)
         }
         "dxf" => {
             let text = std::fs::read_to_string(path)?;
@@ -80,6 +99,26 @@ pub fn export_from_document(path: &Path, doc: &Document) -> Result<(), IoError> 
         }
         "glb" => {
             let bytes = gltf::export_glb_bytes(doc);
+            std::fs::write(path, bytes)?;
+            Ok(())
+        }
+        "step" | "stp" => {
+            let text = step::export_step_string(doc);
+            std::fs::write(path, text)?;
+            Ok(())
+        }
+        "iges" | "igs" => {
+            let text = iges::export_iges_string(doc);
+            std::fs::write(path, text)?;
+            Ok(())
+        }
+        "3mf" => {
+            let bytes = threemf::export_3mf_bytes(doc);
+            std::fs::write(path, bytes)?;
+            Ok(())
+        }
+        "3dm" => {
+            let bytes = threedom::export_3dm_bytes(doc)?;
             std::fs::write(path, bytes)?;
             Ok(())
         }

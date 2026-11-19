@@ -612,6 +612,13 @@ impl Document {
                         }
                     }
                 }
+                Geometry::SubD(sd) => {
+                    if let Some(t) = sd.ray_intersect(ray) {
+                        if best_surf.is_none_or(|b| t < b.0) {
+                            best_surf = Some((t, id));
+                        }
+                    }
+                }
                 Geometry::Mesh(m) => {
                     if let Some(t) = m.ray_intersect(ray) {
                         if best_surf.is_none_or(|b| t < b.0) {

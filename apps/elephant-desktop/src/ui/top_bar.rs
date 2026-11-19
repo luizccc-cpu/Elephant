@@ -2,7 +2,7 @@ use cad_commands::{AxisLockMode, CommandOptionKind};
 use cad_render::DisplayMode;
 use eframe::egui;
 
-use crate::state::{ElephantApp, KNOWN_COMMANDS, NamedView, ToolPanelTab};
+use crate::state::{ElephantApp, KNOWN_COMMANDS, NamedView, ToolPanelTab, WorkspaceViewMode};
 
 impl ElephantApp {
     pub fn draw_top_bar(&mut self, ctx: &egui::Context) {
@@ -22,11 +22,11 @@ impl ElephantApp {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Import (.3dm / .dxf / .obj / .stl)...").clicked() {
+                    if ui.button("Import (.step / .iges / .3dm / .3mf / .dxf / .obj / .stl)...").clicked() {
                         self.import_mesh_dialog();
                         ui.close_menu();
                     }
-                    if ui.button("Export (.obj / .stl / .glb / .dxf / .svg)...").clicked() {
+                    if ui.button("Export (.stp / .igs / .3dm / .3mf / .obj / .stl / .glb / .dxf / .svg / .pdf)...").clicked() {
                         self.export_mesh_dialog();
                         ui.close_menu();
                     }
@@ -161,8 +161,31 @@ impl ElephantApp {
                         "PushPull",
                         "Inset",
                         "ShowEdges",
+                        "ShrinkWrap",
                         "PointsOn",
                         "PointsOff",
+                    ] {
+                        if ui.button(cmd).clicked() {
+                            self.execute_command(cmd);
+                            ui.close_menu();
+                        }
+                    }
+                });
+                ui.menu_button("SubD", |ui| {
+                    for cmd in [
+                        "SubDBox",
+                        "SubDSphere",
+                        "SubDCylinder",
+                        "SubDTorus",
+                        "ToSubD",
+                        "Subdivide",
+                        "Crease",
+                        "SubDExtrudeFace",
+                        "ToNURBS",
+                        "MatchSubD",
+                        "ShrinkWrap",
+                        "SelSubD",
+                        "PointsOn",
                     ] {
                         if ui.button(cmd).clicked() {
                             self.execute_command(cmd);
@@ -344,7 +367,11 @@ impl ElephantApp {
                     });
                 });
                 ui.menu_button("Tools", |ui| {
-                    if ui.button("Parametric Graph (Grasshopper-style)").clicked() {
+                    if ui.button("2D Parametric Node Canvas").clicked() {
+                        self.workspace_view = WorkspaceViewMode::NodeCanvas;
+                        ui.close_menu();
+                    }
+                    if ui.button("Parametric Panel (Sliders)").clicked() {
                         self.tool_tab = if self.tool_tab == ToolPanelTab::Parametric {
                             ToolPanelTab::None
                         } else {
@@ -357,6 +384,14 @@ impl ElephantApp {
                             ToolPanelTab::None
                         } else {
                             ToolPanelTab::Script
+                        };
+                        ui.close_menu();
+                    }
+                    if ui.button("Local AI / MCP Bridge").clicked() {
+                        self.tool_tab = if self.tool_tab == ToolPanelTab::Mcp {
+                            ToolPanelTab::None
+                        } else {
+                            ToolPanelTab::Mcp
                         };
                         ui.close_menu();
                     }

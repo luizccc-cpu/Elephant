@@ -10,6 +10,8 @@ pub mod error;
 pub mod mesh;
 pub mod nurbs_curve;
 pub mod nurbs_surface;
+pub mod shrinkwrap;
+pub mod subd;
 pub mod surface_ops;
 
 pub use analysis::{
@@ -44,6 +46,8 @@ pub use nurbs_curve::{ControlPoint, CurvatureSample, NurbsCurve};
 pub use nurbs_surface::{
     NurbsSurface, SurfaceCurvature, SurfaceDerivatives, SurfaceEdge, SurfaceFrame,
 };
+pub use shrinkwrap::{ShrinkWrapOptions, shrinkwrap_geometries};
+pub use subd::{SubDMesh, match_subd_to_curve, match_subd_to_surface, normalize_edge, subd_to_nurbs_brep};
 pub use surface_ops::{
     BoundaryLock, LoftStyle, PatchBoundaryConstraint, PatchOptions, PatchReport,
     SoftTransformFalloff, SurfaceRebuildReport, apply_soft_transform_surface,
@@ -61,6 +65,7 @@ pub enum Geometry {
     Curve(NurbsCurve),
     Surface(NurbsSurface),
     BRep(BRep),
+    SubD(SubDMesh),
     Mesh(TriangleMesh),
 }
 
@@ -71,6 +76,7 @@ impl Geometry {
             Self::Curve(c) => c.bounding_box(),
             Self::Surface(s) => s.bounding_box(),
             Self::BRep(b) => b.bounding_box(),
+            Self::SubD(sd) => sd.bounding_box(),
             Self::Mesh(m) => m.bounding_box(),
         }
     }
@@ -81,6 +87,7 @@ impl Geometry {
             Self::Curve(c) => c.transform(mat),
             Self::Surface(s) => s.transform(mat),
             Self::BRep(b) => b.transform(mat),
+            Self::SubD(sd) => sd.transform(mat),
             Self::Mesh(m) => m.transform(mat),
         }
     }
@@ -104,6 +111,7 @@ impl Geometry {
                 ]
             }
             Self::BRep(b) => b.snap_points(),
+            Self::SubD(sd) => sd.snap_points(),
             Self::Mesh(m) => m.positions.iter().map(|&p| DVec3::from_array(p)).collect(),
         }
     }

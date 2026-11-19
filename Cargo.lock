@@ -638,9 +638,11 @@ version = "0.1.0"
 dependencies = [
  "cad-doc",
  "cad-geom",
+ "cad-io",
  "cad-math",
  "rhai",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 

@@ -244,6 +244,7 @@ impl ElephantApp {
                 let mut cp_grips: Vec<CpGrip> = Vec::new();
                 let mut cp_polygons: Vec<Vec<egui::Pos2>> = Vec::new();
                 let mut cp_net_segments: Vec<(egui::Pos2, egui::Pos2)> = Vec::new();
+                let mut subd_cage_segments: Vec<(egui::Pos2, egui::Pos2, bool)> = Vec::new();
                 if !self.points_on_objects.is_empty() && !self.session.is_active() {
                     for &oid in &self.points_on_objects {
                         let Some(obj) = self.doc.objects.get(oid) else {
@@ -252,34 +253,61 @@ impl ElephantApp {
                         if !obj.visible {
                             continue;
                         }
-                        let cps: &[cad_geom::ControlPoint] = match &obj.geometry {
-                            Geometry::Curve(c) => &c.control_points,
-                            Geometry::Surface(s) => &s.control_points,
-                            _ => &[],
-                        };
-                        let mut poly = Vec::with_capacity(cps.len());
-                        for (ci, cp) in cps.iter().enumerate() {
-                            if let Some(sp) = world_to_screen(cp.position, &vp_cols, rect) {
-                                poly.push(sp);
-                                cp_grips.push(CpGrip {
-                                    object_id: oid,
-                                    cp_index: ci,
-                                    screen: sp,
-                                    world: cp.position,
-                                });
-                            }
-                        }
                         match &obj.geometry {
-                            Geometry::Curve(_) if poly.len() >= 2 => {
-                                cp_polygons.push(poly);
+                            Geometry::Curve(c) => {
+                                let mut poly = Vec::with_capacity(c.control_points.len());
+                                for (ci, cp) in c.control_points.iter().enumerate() {
+                                    if let Some(sp) = world_to_screen(cp.position, &vp_cols, rect) {
+                                        poly.push(sp);
+                                        cp_grips.push(CpGrip {
+                                            object_id: oid,
+                                            cp_index: ci,
+                                            screen: sp,
+                                            world: cp.position,
+                                        });
+                                    }
+                                }
+                                if poly.len() >= 2 {
+                                    cp_polygons.push(poly);
+                                }
                             }
                             Geometry::Surface(s) => {
+                                for (ci, cp) in s.control_points.iter().enumerate() {
+                                    if let Some(sp) = world_to_screen(cp.position, &vp_cols, rect) {
+                                        cp_grips.push(CpGrip {
+                                            object_id: oid,
+                                            cp_index: ci,
+                                            screen: sp,
+                                            world: cp.position,
+                                        });
+                                    }
+                                }
                                 for (a, b) in s.control_net_segments() {
                                     if let (Some(sa), Some(sb)) = (
                                         world_to_screen(a, &vp_cols, rect),
                                         world_to_screen(b, &vp_cols, rect),
                                     ) {
                                         cp_net_segments.push((sa, sb));
+                                    }
+                                }
+                            }
+                            Geometry::SubD(sd) => {
+                                for (ci, &v) in sd.vertices.iter().enumerate() {
+                                    if let Some(sp) = world_to_screen(v, &vp_cols, rect) {
+                                        cp_grips.push(CpGrip {
+                                            object_id: oid,
+                                            cp_index: ci,
+                                            screen: sp,
+                                            world: v,
+                                        });
+                                    }
+                                }
+                                for (a, b, is_creased) in sd.control_cage_edges() {
+                                    if let (Some(sa), Some(sb)) = (
+                                        world_to_screen(a, &vp_cols, rect),
+                                        world_to_screen(b, &vp_cols, rect),
+                                    ) {
+                                        subd_cage_segments.push((sa, sb, is_creased));
                                     }
                                 }
                             }
@@ -927,6 +955,14 @@ impl ElephantApp {
                             [sa, sb],
                             egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(135, 142, 155)),
                         );
+                    }
+                    for &(sa, sb, is_creased) in &subd_cage_segments {
+                        let stroke = if is_creased {
+                            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 145, 45))
+                        } else {
+                            egui::Stroke::new(1.1_f32, egui::Color32::from_rgb(95, 210, 245))
+                        };
+                        painter.line_segment([sa, sb], stroke);
                     }
                     let mut weight_cache: HashMap<ObjectId, Vec<f64>> = HashMap::new();
                     if self.soft_transform_enabled && !self.selected_cps.is_empty() {

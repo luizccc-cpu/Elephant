@@ -176,6 +176,16 @@ impl ElephantApp {
                 RadialSector { label: "SplitSrf", cmd: "SplitSrf", color: col_amber },
                 RadialSector { label: "UVN", cmd: "UVN", color: col_purple },
             ],
+            Some(Geometry::SubD(_)) => [
+                RadialSector { label: "Subdivide", cmd: "Subdivide", color: col_blue },
+                RadialSector { label: "Crease", cmd: "Crease", color: col_amber },
+                RadialSector { label: "ExtrudeF", cmd: "SubDExtrudeFace", color: col_teal },
+                RadialSector { label: "ToNURBS", cmd: "ToNURBS", color: col_purple },
+                RadialSector { label: "PointsOn", cmd: "PointsOn", color: col_blue },
+                RadialSector { label: "MatchSubD", cmd: "MatchSubD", color: col_amber },
+                RadialSector { label: "ShrinkWrap", cmd: "ShrinkWrap", color: col_teal },
+                RadialSector { label: "Move", cmd: "Move", color: col_purple },
+            ],
             _ => [
                 RadialSector { label: "Line", cmd: "Line", color: col_blue },
                 RadialSector { label: "Circle", cmd: "Circle", color: col_teal },

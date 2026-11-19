@@ -8,6 +8,8 @@ license.workspace = true
 cad-math = { path = "../cad-math" }
 cad-geom = { path = "../cad-geom" }
 cad-doc = { path = "../cad-doc" }
+cad-io = { path = "../cad-io" }
 rhai.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true

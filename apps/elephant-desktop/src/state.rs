@@ -17,7 +17,7 @@ use cad_render::{
     DisplayMode, RenderScene, SurfaceAnalysisConfig, SurfaceAnalysisMode, ViewportCamera,
     ViewportKind,
 };
-use cad_script::{DEFAULT_SAMPLE_SCRIPT, ParametricGraph};
+use cad_script::{DEFAULT_MCP_REQUEST, DEFAULT_SAMPLE_SCRIPT, ParametricGraph};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
@@ -164,6 +164,24 @@ pub const KNOWN_COMMANDS: &[&str] = &[
     "BreakHistory",
     "HistoryPurge",
     "RadialMenu",
+    "SubDBox",
+    "SubDSphere",
+    "SubDCylinder",
+    "SubDTorus",
+    "ToSubD",
+    "Subdivide",
+    "Crease",
+    "SubDExtrudeFace",
+    "ToNURBS",
+    "MatchSubD",
+    "ShrinkWrap",
+    "SelSubD",
+    "NodeEditor",
+    "McpBridge",
+    "ExportSTEP",
+    "ExportIGES",
+    "Export3DM",
+    "Export3MF",
     "New",
     "Help",
 ];
@@ -173,6 +191,7 @@ pub enum ToolPanelTab {
     None,
     Parametric,
     Script,
+    Mcp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,17 +231,19 @@ pub enum ToolPaletteTab {
     Curves,
     Surfaces,
     Solids,
+    SubD,
     Transform,
     Analysis,
     Drafting,
 }
 
 impl ToolPaletteTab {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Standard,
         Self::Curves,
         Self::Surfaces,
         Self::Solids,
+        Self::SubD,
         Self::Transform,
         Self::Analysis,
         Self::Drafting,
@@ -234,6 +255,7 @@ impl ToolPaletteTab {
             Self::Curves => "Crv",
             Self::Surfaces => "Srf",
             Self::Solids => "Sol",
+            Self::SubD => "SubD",
             Self::Transform => "Xfm",
             Self::Analysis => "Ana",
             Self::Drafting => "Dft",
@@ -246,6 +268,7 @@ impl ToolPaletteTab {
             Self::Curves => "Curves",
             Self::Surfaces => "Surfaces",
             Self::Solids => "Solids & B-Rep",
+            Self::SubD => "SubD & ShrinkWrap",
             Self::Transform => "Transform",
             Self::Analysis => "Analysis",
             Self::Drafting => "Drafting",
@@ -264,6 +287,7 @@ pub enum InspectorTab {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceViewMode {
     Model,
+    NodeCanvas,
     Layout(u64),
 }
 
@@ -401,7 +425,13 @@ pub struct ElephantApp {
     pub layout_zoom: f32,
     pub cached_layout_projections: HashMap<(u64, u64), Make2DResult>,
     pub parametric_graph: ParametricGraph,
+    pub node_canvas_pan: egui::Vec2,
+    pub node_canvas_zoom: f32,
+    pub node_canvas_wire_from: Option<usize>,
+    pub node_canvas_selected: Option<usize>,
     pub script_source: String,
+    pub mcp_request_input: String,
+    pub mcp_response_log: String,
     pub rescale_on_unit_change: bool,
     pub cached_doc_scenes: HashMap<DisplayMode, Arc<RenderScene>>,
     pub doc_version: u64,
@@ -485,7 +515,13 @@ impl ElephantApp {
             layout_zoom: 1.0,
             cached_layout_projections: HashMap::new(),
             parametric_graph: ParametricGraph::default(),
+            node_canvas_pan: egui::Vec2::ZERO,
+            node_canvas_zoom: 1.0,
+            node_canvas_wire_from: None,
+            node_canvas_selected: None,
             script_source: DEFAULT_SAMPLE_SCRIPT.to_string(),
+            mcp_request_input: DEFAULT_MCP_REQUEST.to_string(),
+            mcp_response_log: String::new(),
             rescale_on_unit_change: true,
             cached_doc_scenes: HashMap::new(),
             doc_version: 1,
@@ -724,6 +760,7 @@ impl ElephantApp {
                         .parametric_graph
                         .and_then(|v| serde_json::from_value(v).ok())
                         .unwrap_or_default();
+                    self.parametric_graph.ensure_valid_positions();
                     self.script_source = meta
                         .script_source
                         .unwrap_or_else(|| DEFAULT_SAMPLE_SCRIPT.to_string());
@@ -761,8 +798,8 @@ impl ElephantApp {
     pub fn import_mesh_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter(
-                "CAD / 3D Files (.3dm, .dxf, .obj, .stl)",
-                &["3dm", "dxf", "obj", "stl"],
+                "CAD / 3D Files (.3dm, .step, .iges, .3mf, .dxf, .obj, .stl)",
+                &["3dm", "step", "stp", "iges", "igs", "3mf", "dxf", "obj", "stl"],
             )
             .pick_file()
         {
@@ -779,17 +816,34 @@ impl ElephantApp {
 
     pub fn export_mesh_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
+            .add_filter("STEP AP214 (.stp, .step)", &["stp", "step"])
+            .add_filter("IGES 5.3 (.igs, .iges)", &["igs", "iges"])
+            .add_filter("Rhino 3DM (.3dm)", &["3dm"])
+            .add_filter("3D Manufacturing (.3mf)", &["3mf"])
             .add_filter("Wavefront OBJ", &["obj"])
             .add_filter("Binary STL", &["stl"])
             .add_filter("glTF Binary (.glb)", &["glb"])
             .add_filter("AutoCAD DXF (.dxf)", &["dxf"])
             .add_filter("Scalable Vector Graphics (.svg)", &["svg"])
             .add_filter("Vector PDF 1.4 (.pdf)", &["pdf"])
-            .set_file_name("export.obj")
+            .set_file_name("export.stp")
             .save_file()
         {
             match export_from_document(&path, &self.doc) {
                 Ok(()) => self.log(format!("Exported {}", path.display())),
+                Err(e) => self.log(format!("Export failed: {e}")),
+            }
+        }
+    }
+
+    pub fn export_format_dialog(&mut self, label: &str, exts: &[&str], default_name: &str) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter(label, exts)
+            .set_file_name(default_name)
+            .save_file()
+        {
+            match export_from_document(&path, &self.doc) {
+                Ok(()) => self.log(format!("Exported {label}: {}", path.display())),
                 Err(e) => self.log(format!("Export failed: {e}")),
             }
         }
@@ -809,7 +863,9 @@ impl ElephantApp {
                         export_pdf_bytes(&self.doc)
                     }
                 }
-                WorkspaceViewMode::Model => export_pdf_bytes(&self.doc),
+                WorkspaceViewMode::Model | WorkspaceViewMode::NodeCanvas => {
+                    export_pdf_bytes(&self.doc)
+                }
             };
             match std::fs::write(&path, bytes) {
                 Ok(()) => self.log(format!("Exported Vector PDF {}", path.display())),

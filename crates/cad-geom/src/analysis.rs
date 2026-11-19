@@ -222,6 +222,10 @@ pub fn compute_geometry_mass_properties(geom: &Geometry) -> Option<MassPropertie
             let m = b.tessellate_display();
             Some(compute_mesh_mass_properties(&m, b.is_solid()))
         }
+        Geometry::SubD(sd) => {
+            let m = sd.tessellate_display();
+            Some(compute_mesh_mass_properties(&m, is_mesh_closed_manifold(&m)))
+        }
         Geometry::Surface(s) => {
             let m = s.tessellate_display();
             Some(compute_mesh_mass_properties(&m, false))
@@ -643,6 +647,7 @@ pub fn section_geometry_with_plane(geom: &Geometry, plane: &Plane) -> Vec<Vec<DV
     match geom {
         Geometry::BRep(b) => section_mesh_with_plane(&b.tessellate_display(), plane),
         Geometry::Surface(s) => section_mesh_with_plane(&s.tessellate_display(), plane),
+        Geometry::SubD(sd) => section_mesh_with_plane(&sd.tessellate_display(), plane),
         Geometry::Mesh(m) => section_mesh_with_plane(m, plane),
         Geometry::Point(_) | Geometry::Curve(_) => Vec::new(),
     }

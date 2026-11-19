@@ -388,6 +388,31 @@ pub fn make_2d_projection(
                     );
                 }
             }
+            Geometry::SubD(sd) => {
+                let mesh = sd.tessellate_display();
+                push_mesh_occluders(&mesh, &proj, &mut occluders);
+                for (a, b, is_creased) in sd.control_cage_edges() {
+                    if is_creased {
+                        candidates.push(CandidateEdgePoly {
+                            points_3d: vec![a, b],
+                            is_silhouette: false,
+                            color: *col,
+                        });
+                    }
+                }
+                if opts.include_silhouettes || opts.include_creases {
+                    extract_mesh_feature_edges(
+                        &mesh,
+                        view_dir,
+                        crease_cos,
+                        opts.include_silhouettes,
+                        opts.include_creases,
+                        false,
+                        *col,
+                        &mut candidates,
+                    );
+                }
+            }
             Geometry::Mesh(m) => {
                 push_mesh_occluders(m, &proj, &mut occluders);
                 extract_mesh_feature_edges(
