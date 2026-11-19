@@ -1,5 +1,5 @@
 use cad_doc::Document;
-use cad_geom::Geometry;
+use cad_geom::{Geometry, NurbsCurve, intersect_curves};
 use cad_math::{DVec3, Plane};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8,6 +8,8 @@ pub enum SnapKind {
     Mid,
     Center,
     Quad,
+    Int,
+    Perp,
     Near,
     Grid,
     Ortho,
@@ -20,6 +22,8 @@ impl SnapKind {
             Self::Mid => "Mid",
             Self::Center => "Cen",
             Self::Quad => "Quad",
+            Self::Int => "Int",
+            Self::Perp => "Perp",
             Self::Near => "Near",
             Self::Grid => "Grid",
             Self::Ortho => "Ortho",
@@ -37,6 +41,8 @@ pub struct SnapConfig {
     pub osnap_mid: bool,
     pub osnap_center: bool,
     pub osnap_quad: bool,
+    pub osnap_int: bool,
+    pub osnap_perp: bool,
     pub osnap_near: bool,
     pub snap_radius: f64,
     pub snap_radius_px: f64,
@@ -53,6 +59,8 @@ impl Default for SnapConfig {
             osnap_mid: true,
             osnap_center: true,
             osnap_quad: true,
+            osnap_int: true,
+            osnap_perp: false,
             osnap_near: false,
             snap_radius: 0.6,
             snap_radius_px: 14.0,
@@ -86,7 +94,8 @@ impl SnapConfig {
         world_snap_radius: f64,
     ) -> SnapResult {
         if self.osnap_enabled {
-            if let Some((pt, kind)) = self.find_osnap(raw_point, doc, world_snap_radius) {
+            if let Some((pt, kind)) = self.find_osnap(raw_point, base_point, doc, world_snap_radius)
+            {
                 return SnapResult {
                     point: pt,
                     kind: Some(kind),
@@ -125,11 +134,13 @@ impl SnapConfig {
     fn find_osnap(
         &self,
         raw_point: DVec3,
+        base_point: Option<DVec3>,
         doc: &Document,
         snap_radius: f64,
     ) -> Option<(DVec3, SnapKind)> {
         let mut best_dist = snap_radius.max(1e-6);
         let mut best: Option<(DVec3, SnapKind)> = None;
+        let mut nearby_curves: Vec<&NurbsCurve> = Vec::new();
 
         for (_, obj) in &doc.objects {
             if !obj.visible {
@@ -151,6 +162,18 @@ impl SnapConfig {
                     }
                 }
                 Geometry::Curve(curve) => {
+                    if self.osnap_int || self.osnap_perp {
+                        let bb = obj.aabb.expanded(snap_radius);
+                        if raw_point.x >= bb.min.x
+                            && raw_point.x <= bb.max.x
+                            && raw_point.y >= bb.min.y
+                            && raw_point.y <= bb.max.y
+                            && raw_point.z >= bb.min.z
+                            && raw_point.z <= bb.max.z
+                        {
+                            nearby_curves.push(curve);
+                        }
+                    }
                     let (u0, u1) = curve.domain();
                     if self.osnap_end {
                         if curve.degree == 1 {
@@ -233,6 +256,36 @@ impl SnapConfig {
                             best_dist = d;
                             best = Some((pt, SnapKind::Center));
                         }
+                    }
+                }
+            }
+        }
+
+        if self.osnap_int && nearby_curves.len() >= 2 {
+            let tol = (snap_radius * 0.5).max(1e-3);
+            for i in 0..nearby_curves.len() {
+                for j in (i + 1)..nearby_curves.len() {
+                    for hit in intersect_curves(nearby_curves[i], nearby_curves[j], tol) {
+                        let d = hit.point.distance(raw_point);
+                        let wins_tie = (d - best_dist).abs() <= 1e-6
+                            && !matches!(best.map(|b| b.1), Some(SnapKind::End));
+                        if d < best_dist || wins_tie {
+                            best_dist = d;
+                            best = Some((hit.point, SnapKind::Int));
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.osnap_perp {
+            if let Some(base) = base_point {
+                for curve in &nearby_curves {
+                    let (_, foot, _) = curve.closest_point(base);
+                    let d = foot.distance(raw_point);
+                    if d < best_dist {
+                        best_dist = d;
+                        best = Some((foot, SnapKind::Perp));
                     }
                 }
             }
@@ -369,5 +422,47 @@ mod tests {
         let res_srf = cfg.resolve_with_radius(DVec3::new(2.9, 1.9, 0.0), None, &doc_srf, &Plane::world_xy(), 0.5);
         assert_eq!(res_srf.kind, Some(SnapKind::End));
         assert!((res_srf.point - DVec3::new(3.0, 2.0, 0.0)).length() < 1e-9);
+    }
+
+    #[test]
+    fn osnap_intersection_and_perpendicular() {
+        let mut doc = Document::new();
+        doc.add_object(
+            "LineH",
+            Geometry::Curve(NurbsCurve::line(
+                DVec3::new(-5.0, 0.0, 0.0),
+                DVec3::new(5.0, 0.0, 0.0),
+            )),
+        );
+        doc.add_object(
+            "LineV",
+            Geometry::Curve(NurbsCurve::line(
+                DVec3::new(1.0, -3.0, 0.0),
+                DVec3::new(1.0, 7.0, 0.0),
+            )),
+        );
+
+        let cfg_int = SnapConfig::default();
+        let res_int = cfg_int.resolve(DVec3::new(1.15, 0.1, 0.0), None, &doc, &Plane::world_xy());
+        assert_eq!(res_int.kind, Some(SnapKind::Int));
+        assert!((res_int.point - DVec3::new(1.0, 0.0, 0.0)).length() < 1e-6);
+
+        let cfg_perp = SnapConfig {
+            osnap_end: false,
+            osnap_mid: false,
+            osnap_center: false,
+            osnap_quad: false,
+            osnap_int: false,
+            osnap_perp: true,
+            ..Default::default()
+        };
+        let res_perp = cfg_perp.resolve(
+            DVec3::new(-2.1, 0.1, 0.0),
+            Some(DVec3::new(-2.0, 4.0, 0.0)),
+            &doc,
+            &Plane::world_xy(),
+        );
+        assert_eq!(res_perp.kind, Some(SnapKind::Perp));
+        assert!((res_perp.point - DVec3::new(-2.0, 0.0, 0.0)).length() < 1e-6);
     }
 }

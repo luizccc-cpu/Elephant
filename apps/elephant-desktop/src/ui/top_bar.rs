@@ -76,6 +76,11 @@ impl ElephantApp {
                     for cmd in [
                         "Line",
                         "Polyline",
+                        "Curve",
+                        "InterpCrv",
+                        "HandleCurve",
+                        "Conic",
+                        "Helix",
                         "Rectangle",
                         "Arc",
                         "Circle",
@@ -114,7 +119,26 @@ impl ElephantApp {
                 });
                 ui.menu_button("Curve", |ui| {
                     for cmd in [
-                        "Join", "Explode", "Offset", "Fillet", "Distance", "Length", "Area",
+                        "Join",
+                        "Explode",
+                        "Offset",
+                        "Split",
+                        "Trim",
+                        "Fillet",
+                        "Chamfer",
+                        "BlendCrv",
+                        "Match",
+                        "Rebuild",
+                        "RebuildAdaptive",
+                        "Fair",
+                        "TweenCurves",
+                        "InsertKnot",
+                        "ChangeDegree",
+                        "CurvatureGraph",
+                        "CurvatureGraphOff",
+                        "Distance",
+                        "Length",
+                        "Area",
                     ] {
                         if ui.button(cmd).clicked() {
                             self.execute_command(cmd);

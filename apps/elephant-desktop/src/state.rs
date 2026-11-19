@@ -16,6 +16,11 @@ use serde::{Deserialize, Serialize};
 pub const KNOWN_COMMANDS: &[&str] = &[
     "Line",
     "Polyline",
+    "Curve",
+    "InterpCrv",
+    "HandleCurve",
+    "Conic",
+    "Helix",
     "Rectangle",
     "Arc",
     "Circle",
@@ -39,7 +44,22 @@ pub const KNOWN_COMMANDS: &[&str] = &[
     "Join",
     "Explode",
     "Offset",
+    "Split",
+    "SplitCurve",
+    "Trim",
     "Fillet",
+    "Chamfer",
+    "BlendCrv",
+    "Match",
+    "Rebuild",
+    "RebuildAdaptive",
+    "Elmo",
+    "Fair",
+    "TweenCurves",
+    "InsertKnot",
+    "ChangeDegree",
+    "CurvatureGraph",
+    "CurvatureGraphOff",
     "Move",
     "Copy",
     "Rotate",
@@ -150,6 +170,8 @@ pub struct ElephantApp {
     pub gumball_prompt: Option<GumballNumericPrompt>,
     pub marquee: Option<MarqueeDrag>,
     pub points_on_objects: HashSet<ObjectId>,
+    pub curvature_graph_objects: HashSet<ObjectId>,
+    pub curvature_graph_scale: f64,
     pub grip_drag: Option<GripDrag>,
     pub command_input: String,
     pub command_log: Vec<String>,
@@ -194,6 +216,8 @@ impl ElephantApp {
             gumball_prompt: None,
             marquee: None,
             points_on_objects: HashSet::new(),
+            curvature_graph_objects: HashSet::new(),
+            curvature_graph_scale: 1.0,
             grip_drag: None,
             command_input: String::new(),
             command_log: vec![
@@ -276,6 +300,8 @@ impl ElephantApp {
     pub fn prune_points_on(&mut self) {
         self.points_on_objects
             .retain(|id| self.doc.objects.get(*id).is_some_and(|o| o.visible));
+        self.curvature_graph_objects
+            .retain(|id| self.doc.objects.get(*id).is_some_and(|o| o.visible));
     }
 
     pub fn active_display_mode(&self) -> DisplayMode {
@@ -336,6 +362,7 @@ impl ElephantApp {
                 Ok((doc, meta)) => {
                     self.session.cancel();
                     self.points_on_objects.clear();
+                    self.curvature_graph_objects.clear();
                     self.grip_drag = None;
                     self.gumball_drag = None;
                     self.gumball_prompt = None;

@@ -169,9 +169,11 @@ impl ElephantApp {
                         let kind_detail = match &obj.geometry {
                             Geometry::Point(_) => "Point".to_string(),
                             Geometry::Curve(c) => format!(
-                                "NURBS Curve ({}, len={:.3})",
+                                "NURBS Curve (deg {}, {} CPs, {}, len={:.3})",
+                                c.degree,
+                                c.control_points.len(),
                                 if c.is_closed() { "Closed" } else { "Open" },
-                                c.length_approx(48)
+                                c.arc_length()
                             ),
                             Geometry::Surface(s) => format!(
                                 "NURBS Surface ({}x{}, deg {}x{})",
@@ -184,6 +186,29 @@ impl ElephantApp {
                             ),
                         };
                         ui.label(format!("Type: {kind_detail}"));
+                        if let Geometry::Curve(c) = &obj.geometry {
+                            ui.small(format!(
+                                "Rational: {}",
+                                if c.is_rational() { "Yes" } else { "No" }
+                            ));
+                            let mut graph_on = self.curvature_graph_objects.contains(&oid);
+                            if ui.checkbox(&mut graph_on, "CurvatureGraph").changed() {
+                                if graph_on {
+                                    self.curvature_graph_objects.insert(oid);
+                                } else {
+                                    self.curvature_graph_objects.remove(&oid);
+                                }
+                            }
+                            if graph_on {
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.curvature_graph_scale,
+                                        0.1..=5.0,
+                                    )
+                                    .text("Comb Scale"),
+                                );
+                            }
+                        }
                         if let Some(gid) = obj.group_id {
                             ui.label(format!("Group: #{gid}"));
                         }

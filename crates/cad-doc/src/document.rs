@@ -194,6 +194,34 @@ impl Document {
         }
     }
 
+    /// Atomically replace `target_id` with `replacements` in a single Undo transaction.
+    pub fn replace_object_with_many(
+        &mut self,
+        label: impl Into<String>,
+        target_id: ObjectId,
+        replacements: Vec<(LayerId, Geometry)>,
+    ) -> Vec<ObjectId> {
+        let mut actions = Vec::with_capacity(1 + replacements.len());
+        let mut created_ids = Vec::with_capacity(replacements.len());
+        if let Some(removed) = self.objects.remove(target_id) {
+            actions.push(UndoAction::Removed(target_id, removed));
+        }
+        for (lid, geom) in replacements {
+            let new_id = self.objects.insert_new(CadObject::new(lid, geom));
+            actions.push(UndoAction::Added(new_id));
+            created_ids.push(new_id);
+        }
+        if !created_ids.is_empty() {
+            self.last_created = created_ids.clone();
+        }
+        self.history.push(UndoTransaction {
+            label: label.into(),
+            actions,
+        });
+        self.rebuild_spatial_index();
+        created_ids
+    }
+
     pub fn set_selected(&mut self, id: ObjectId, selected: bool) {
         let gid = self.objects.get(id).and_then(|o| o.group_id);
         if let Some(gid) = gid {

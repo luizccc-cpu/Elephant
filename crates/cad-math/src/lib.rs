@@ -1,7 +1,29 @@
 //! Double-precision math, geometric tolerances, rays, planes, and bounding boxes for Elephant.
 
+pub mod linalg;
+
 pub use glam::{DMat4, DQuat, DVec2, DVec3, DVec4, Mat4, Vec2, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
+
+/// Geometric continuity order for curves and surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Continuity {
+    G0,
+    G1,
+    G2,
+    G3,
+}
+
+impl Continuity {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::G0 => "G0 (Position)",
+            Self::G1 => "G1 (Tangent)",
+            Self::G2 => "G2 (Curvature)",
+            Self::G3 => "G3 (Acceleration)",
+        }
+    }
+}
 
 /// Default absolute model-space tolerance (similar to standard CAD millimeter precision).
 pub const DEFAULT_ABSOLUTE_TOLERANCE: f64 = 1.0e-3;

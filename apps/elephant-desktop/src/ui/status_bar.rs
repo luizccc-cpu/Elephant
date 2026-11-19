@@ -50,6 +50,8 @@ impl ElephantApp {
                     ui.checkbox(&mut self.snap.osnap_mid, "Mid");
                     ui.checkbox(&mut self.snap.osnap_center, "Cen");
                     ui.checkbox(&mut self.snap.osnap_quad, "Quad");
+                    ui.checkbox(&mut self.snap.osnap_int, "Int");
+                    ui.checkbox(&mut self.snap.osnap_perp, "Perp");
                     ui.checkbox(&mut self.snap.osnap_near, "Near");
                 }
                 ui.separator();

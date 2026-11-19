@@ -1,11 +1,19 @@
-use cad_doc::{AnnotationItem, AnnotationKind, Document};
-use cad_geom::{DMat4, DVec3, Geometry, NurbsCurve, Plane, TriangleMesh};
+use cad_doc::{AnnotationItem, AnnotationKind, Document, ObjectId};
+use cad_geom::{
+    DMat4, DVec3, Geometry, NurbsCurve, OffsetCornerStyle, Plane, TriangleMesh,
+    trim_curve_with_cutters,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActiveTool {
     Idle,
     Line { start: Option<DVec3> },
     Polyline { points: Vec<DVec3> },
+    Curve { points: Vec<DVec3>, degree: usize, closed: bool },
+    InterpCrv { points: Vec<DVec3>, degree: usize, closed: bool },
+    HandleCurve { anchors: Vec<(DVec3, DVec3, DVec3)>, pending_anchor: Option<DVec3> },
+    Conic { p0: Option<DVec3>, p2: Option<DVec3>, apex: Option<DVec3> },
+    Helix { axis_start: Option<DVec3>, axis_end: Option<DVec3>, turns: f64 },
     Rectangle { corner1: Option<DVec3> },
     Arc { p0: Option<DVec3>, p1: Option<DVec3> },
     Circle { center: Option<DVec3> },
@@ -20,6 +28,9 @@ pub enum ActiveTool {
     Scale { origin: Option<DVec3>, ref_dist: Option<f64> },
     Mirror { start: Option<DVec3> },
     Offset { distance: f64 },
+    SplitCurve,
+    Trim { cutter_ids: Vec<ObjectId> },
+    InsertKnot,
     ArrayLinear { count: usize, base: Option<DVec3> },
     ArrayPolar { count: usize },
     Distance { first: Option<DVec3> },
@@ -71,7 +82,19 @@ impl CommandSession {
     pub fn base_point(&self) -> Option<DVec3> {
         match &self.tool {
             ActiveTool::Line { start } => *start,
-            ActiveTool::Polyline { points } => points.last().copied(),
+            ActiveTool::Polyline { points }
+            | ActiveTool::Curve { points, .. }
+            | ActiveTool::InterpCrv { points, .. } => points.last().copied(),
+            ActiveTool::HandleCurve {
+                anchors,
+                pending_anchor,
+            } => pending_anchor.or_else(|| anchors.last().map(|a| a.0)),
+            ActiveTool::Conic { p0, p2, apex } => apex.or(*p2).or(*p0),
+            ActiveTool::Helix {
+                axis_start,
+                axis_end,
+                ..
+            } => axis_end.or(*axis_start),
             ActiveTool::Rectangle { corner1 } => *corner1,
             ActiveTool::Arc { p0, p1 } => p1.or(*p0),
             ActiveTool::Circle { center } => *center,
@@ -86,7 +109,13 @@ impl CommandSession {
             ActiveTool::ArrayLinear { base, .. } => *base,
             ActiveTool::Distance { first } => *first,
             ActiveTool::Dim { p1, p2 } => p2.or(*p1),
-            ActiveTool::Offset { .. } | ActiveTool::ArrayPolar { .. } | ActiveTool::TextDot { .. } | ActiveTool::Idle => None,
+            ActiveTool::Offset { .. }
+            | ActiveTool::SplitCurve
+            | ActiveTool::Trim { .. }
+            | ActiveTool::InsertKnot
+            | ActiveTool::ArrayPolar { .. }
+            | ActiveTool::TextDot { .. }
+            | ActiveTool::Idle => None,
         }
     }
 
@@ -97,6 +126,37 @@ impl CommandSession {
             ActiveTool::Line { start: Some(_) } => "End of line (click, x,y,z, or distance)",
             ActiveTool::Polyline { points } if points.is_empty() => "Start of polyline",
             ActiveTool::Polyline { .. } => "Next point of polyline (Right-click or Enter to finish)",
+            ActiveTool::Curve { points, .. } if points.is_empty() => {
+                "Start of NURBS curve (or enter d=3, close)"
+            }
+            ActiveTool::Curve { .. } => {
+                "Next control point (d=degree, close, or Enter/Right-click to finish)"
+            }
+            ActiveTool::InterpCrv { points, .. } if points.is_empty() => {
+                "Start of interpolated curve (or enter d=3, close)"
+            }
+            ActiveTool::InterpCrv { .. } => {
+                "Next curve point (d=degree, close, or Enter/Right-click to finish)"
+            }
+            ActiveTool::HandleCurve {
+                pending_anchor: Some(_),
+                ..
+            } => "Outgoing handle point for anchor",
+            ActiveTool::HandleCurve { anchors, .. } if anchors.is_empty() => {
+                "First anchor point of handle curve"
+            }
+            ActiveTool::HandleCurve { .. } => {
+                "Next anchor point of handle curve (Enter or Right-click to finish)"
+            }
+            ActiveTool::Conic { p0: None, .. } => "Start of conic curve",
+            ActiveTool::Conic { p2: None, .. } => "End of conic curve",
+            ActiveTool::Conic { apex: None, .. } => "Apex of conic curve",
+            ActiveTool::Conic { .. } => "Curvature point or rho (0.05..0.95)",
+            ActiveTool::Helix {
+                axis_start: None, ..
+            } => "Start of helix axis (or turns=3)",
+            ActiveTool::Helix { axis_end: None, .. } => "End of helix axis",
+            ActiveTool::Helix { .. } => "Radius / start point of helix (click or enter radius)",
             ActiveTool::Rectangle { corner1: None } => "First corner of rectangle",
             ActiveTool::Rectangle { corner1: Some(_) } => "Other corner of rectangle",
             ActiveTool::Arc { p0: None, .. } => "Start of 3-point arc",
@@ -130,6 +190,9 @@ impl CommandSession {
             ActiveTool::Mirror { start: None } => "Start of mirror plane",
             ActiveTool::Mirror { start: Some(_) } => "End of mirror plane",
             ActiveTool::Offset { .. } => "Side to offset (click side, or enter distance)",
+            ActiveTool::SplitCurve => "Click point on selected curve to split",
+            ActiveTool::Trim { .. } => "Click curve segment to trim away (Enter/Esc to finish)",
+            ActiveTool::InsertKnot => "Click point on selected curve to insert knot",
             ActiveTool::ArrayLinear { base: None, .. } => "Base point for linear array (or enter count)",
             ActiveTool::ArrayLinear { base: Some(_), .. } => "Second reference point (step spacing)",
             ActiveTool::ArrayPolar { .. } => "Center of polar array (or enter count)",
@@ -151,6 +214,45 @@ impl CommandSession {
             }
             "polyline" => {
                 self.tool = ActiveTool::Polyline { points: Vec::new() };
+                Some(self.prompt().to_string())
+            }
+            "curve" => {
+                self.tool = ActiveTool::Curve {
+                    points: Vec::new(),
+                    degree: 3,
+                    closed: false,
+                };
+                Some(self.prompt().to_string())
+            }
+            "interpcrv" => {
+                self.tool = ActiveTool::InterpCrv {
+                    points: Vec::new(),
+                    degree: 3,
+                    closed: false,
+                };
+                Some(self.prompt().to_string())
+            }
+            "handlecurve" => {
+                self.tool = ActiveTool::HandleCurve {
+                    anchors: Vec::new(),
+                    pending_anchor: None,
+                };
+                Some(self.prompt().to_string())
+            }
+            "conic" => {
+                self.tool = ActiveTool::Conic {
+                    p0: None,
+                    p2: None,
+                    apex: None,
+                };
+                Some(self.prompt().to_string())
+            }
+            "helix" => {
+                self.tool = ActiveTool::Helix {
+                    axis_start: None,
+                    axis_end: None,
+                    turns: 3.0,
+                };
                 Some(self.prompt().to_string())
             }
             "rectangle" | "rect" => {
@@ -256,6 +358,41 @@ impl CommandSession {
                 self.tool = ActiveTool::Offset { distance: 1.0 };
                 Some(self.prompt().to_string())
             }
+            "splitcurve" => {
+                let has_curve = doc
+                    .objects
+                    .values()
+                    .any(|o| o.selected && matches!(o.geometry, Geometry::Curve(_)));
+                if !has_curve {
+                    return Some("Select a curve to split first.".to_string());
+                }
+                self.tool = ActiveTool::SplitCurve;
+                Some(self.prompt().to_string())
+            }
+            "trim" => {
+                let cutter_ids: Vec<ObjectId> = doc
+                    .objects
+                    .iter()
+                    .filter(|(_, o)| o.selected && matches!(o.geometry, Geometry::Curve(_)))
+                    .map(|(id, _)| id)
+                    .collect();
+                if cutter_ids.is_empty() {
+                    return Some("Select one or more cutting curves first.".to_string());
+                }
+                self.tool = ActiveTool::Trim { cutter_ids };
+                Some(self.prompt().to_string())
+            }
+            "insertknot" => {
+                let has_curve = doc
+                    .objects
+                    .values()
+                    .any(|o| o.selected && matches!(o.geometry, Geometry::Curve(_)));
+                if !has_curve {
+                    return Some("Select a curve to insert a knot into first.".to_string());
+                }
+                self.tool = ActiveTool::InsertKnot;
+                Some(self.prompt().to_string())
+            }
             "arraylinear" | "array" => {
                 if !has_selection {
                     return Some("Select objects to array first.".to_string());
@@ -297,15 +434,81 @@ impl CommandSession {
     }
 
     pub fn finish_or_cancel(&mut self, doc: &mut Document) -> CommandOutcome {
-        if let ActiveTool::Polyline { points } = &self.tool {
-            if points.len() >= 2 {
-                if let Ok(poly) = NurbsCurve::polyline(points) {
-                    doc.add_object("Polyline", Geometry::Curve(poly));
-                    let count = points.len();
-                    self.tool = ActiveTool::Idle;
-                    return CommandOutcome::done(format!("Created Polyline with {count} points."));
+        match &self.tool {
+            ActiveTool::Polyline { points } => {
+                if points.len() >= 2 {
+                    if let Ok(poly) = NurbsCurve::polyline(points) {
+                        doc.add_object("Polyline", Geometry::Curve(poly));
+                        let count = points.len();
+                        self.tool = ActiveTool::Idle;
+                        return CommandOutcome::done(format!(
+                            "Created Polyline with {count} points."
+                        ));
+                    }
                 }
             }
+            ActiveTool::Curve {
+                points,
+                degree,
+                closed,
+            } => {
+                if points.len() >= 2 {
+                    if let Ok(curve) = NurbsCurve::from_control_points(points, *degree, *closed) {
+                        let d = curve.degree;
+                        let n = curve.control_points.len();
+                        doc.add_object("Curve", Geometry::Curve(curve));
+                        self.tool = ActiveTool::Idle;
+                        return CommandOutcome::done(format!(
+                            "Created NURBS Curve (deg {d}, {n} CPs)."
+                        ));
+                    }
+                }
+            }
+            ActiveTool::InterpCrv {
+                points,
+                degree,
+                closed,
+            } => {
+                if points.len() >= 2 {
+                    if let Ok(curve) = NurbsCurve::interpolate(points, *degree, *closed) {
+                        let d = curve.degree;
+                        let n = points.len();
+                        doc.add_object("InterpCrv", Geometry::Curve(curve));
+                        self.tool = ActiveTool::Idle;
+                        return CommandOutcome::done(format!(
+                            "Created Interpolated Curve (deg {d}, {n} pts)."
+                        ));
+                    }
+                }
+            }
+            ActiveTool::HandleCurve {
+                anchors,
+                pending_anchor,
+            } => {
+                let mut all = anchors.clone();
+                if let Some(pa) = *pending_anchor {
+                    all.push((pa, pa, pa));
+                }
+                if all.len() >= 2 {
+                    let segs: Vec<_> = all
+                        .windows(2)
+                        .map(|w| (w[0].0, w[0].2, w[1].1, w[1].0))
+                        .collect();
+                    if let Ok(curve) = NurbsCurve::handle_curve(&segs) {
+                        let seg_count = segs.len();
+                        doc.add_object("HandleCurve", Geometry::Curve(curve));
+                        self.tool = ActiveTool::Idle;
+                        return CommandOutcome::done(format!(
+                            "Created HandleCurve ({seg_count} cubic span(s))."
+                        ));
+                    }
+                }
+            }
+            ActiveTool::Trim { .. } => {
+                self.tool = ActiveTool::Idle;
+                return CommandOutcome::done("Finished Trim.");
+            }
+            _ => {}
         }
         self.tool = ActiveTool::Idle;
         CommandOutcome::done("Command cancelled.")
@@ -333,6 +536,79 @@ impl CommandSession {
             ActiveTool::Polyline { points } => {
                 points.push(pt);
                 CommandOutcome::msg(self.prompt())
+            }
+            ActiveTool::Curve { points, .. } | ActiveTool::InterpCrv { points, .. } => {
+                points.push(pt);
+                CommandOutcome::msg(self.prompt())
+            }
+            ActiveTool::HandleCurve {
+                anchors,
+                pending_anchor,
+            } => {
+                if let Some(a) = pending_anchor.take() {
+                    let h_out = pt;
+                    let h_in = a * 2.0 - h_out;
+                    anchors.push((a, h_in, h_out));
+                } else {
+                    *pending_anchor = Some(pt);
+                }
+                CommandOutcome::msg(self.prompt())
+            }
+            ActiveTool::Conic { p0, p2, apex } => {
+                if p0.is_none() {
+                    *p0 = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                } else if p2.is_none() {
+                    *p2 = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                } else if apex.is_none() {
+                    *apex = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                } else {
+                    let a = p0.unwrap();
+                    let b = p2.unwrap();
+                    let ap = apex.unwrap();
+                    let mid = (a + b) * 0.5;
+                    let leg = ap - mid;
+                    let rho = if leg.length_squared() > 1e-10 {
+                        ((pt - mid).dot(leg) / leg.length_squared()).clamp(0.05, 0.95)
+                    } else {
+                        0.5
+                    };
+                    self.tool = ActiveTool::Idle;
+                    match NurbsCurve::conic(a, ap, b, rho) {
+                        Ok(conic) => {
+                            doc.add_object("Conic", Geometry::Curve(conic));
+                            CommandOutcome::done(format!("Created Conic (rho = {rho:.3})."))
+                        }
+                        Err(e) => CommandOutcome::done(format!("Conic error: {e}")),
+                    }
+                }
+            }
+            ActiveTool::Helix {
+                axis_start,
+                axis_end,
+                turns,
+            } => {
+                if axis_start.is_none() {
+                    *axis_start = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                } else if axis_end.is_none() {
+                    *axis_end = Some(pt);
+                    CommandOutcome::msg(self.prompt())
+                } else {
+                    let a0 = axis_start.unwrap();
+                    let a1 = axis_end.unwrap();
+                    let t = *turns;
+                    self.tool = ActiveTool::Idle;
+                    match NurbsCurve::helix(a0, a1, pt, t, None) {
+                        Ok(helix) => {
+                            doc.add_object("Helix", Geometry::Curve(helix));
+                            CommandOutcome::done(format!("Created Helix ({t:.2} turns)."))
+                        }
+                        Err(e) => CommandOutcome::done(format!("Helix error: {e}")),
+                    }
+                }
             }
             ActiveTool::Circle { center } => {
                 if let Some(c) = *center {
@@ -653,13 +929,128 @@ impl CommandSession {
                     .collect();
                 let mut created = 0;
                 for (lid, c) in &curves {
-                    if let Ok(off) = c.offset_in_plane(cplane, d, pt) {
+                    if let Ok(off) =
+                        c.offset_nurbs_in_plane(cplane, d, pt, OffsetCornerStyle::Sharp)
+                    {
                         doc.add_object_on_layer("Offset", *lid, Geometry::Curve(off));
                         created += 1;
                     }
                 }
                 self.tool = ActiveTool::Idle;
                 CommandOutcome::done(format!("Offset {created} curve(s) by {d:.3}."))
+            }
+            ActiveTool::SplitCurve => {
+                let mut best: Option<(ObjectId, cad_doc::LayerId, NurbsCurve, f64, f64)> = None;
+                for (id, obj) in &doc.objects {
+                    if obj.selected {
+                        if let Geometry::Curve(c) = &obj.geometry {
+                            let (u, _, d) = c.closest_point(pt);
+                            if best.as_ref().is_none_or(|b| d < b.4) {
+                                best = Some((id, obj.layer_id, c.clone(), u, d));
+                            }
+                        }
+                    }
+                }
+                self.tool = ActiveTool::Idle;
+                if let Some((id, lid, curve, u, _)) = best {
+                    if let Some((left, right)) = curve.split_at(u) {
+                        doc.replace_object_with_many(
+                            "SplitCurve",
+                            id,
+                            vec![(lid, Geometry::Curve(left)), (lid, Geometry::Curve(right))],
+                        );
+                        CommandOutcome::done("Split curve into 2 segments.")
+                    } else {
+                        CommandOutcome::done("Click an interior point on the curve to split.")
+                    }
+                } else {
+                    CommandOutcome::done("No selected curve to split.")
+                }
+            }
+            ActiveTool::Trim { cutter_ids } => {
+                let mut best_target: Option<(ObjectId, cad_doc::LayerId, NurbsCurve, f64)> = None;
+                for (id, obj) in &doc.objects {
+                    if !obj.visible {
+                        continue;
+                    }
+                    let unlocked = doc
+                        .layers
+                        .get(obj.layer_id)
+                        .map(|l| l.visible && !l.locked)
+                        .unwrap_or(true);
+                    if !unlocked {
+                        continue;
+                    }
+                    if let Geometry::Curve(c) = &obj.geometry {
+                        let (_, _, d) = c.closest_point(pt);
+                        if best_target.as_ref().is_none_or(|b| d < b.3) {
+                            best_target = Some((id, obj.layer_id, c.clone(), d));
+                        }
+                    }
+                }
+                let Some((target_id, lid, target_curve, _)) = best_target else {
+                    return CommandOutcome::msg("No curve found near click point.");
+                };
+                let cutters: Vec<NurbsCurve> = cutter_ids
+                    .iter()
+                    .filter(|&&cid| cid != target_id)
+                    .filter_map(|&cid| {
+                        doc.objects.get(cid).and_then(|o| match &o.geometry {
+                            Geometry::Curve(c) => Some(c.clone()),
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                if cutters.is_empty() {
+                    return CommandOutcome::msg(
+                        "Clicked the only cutting curve; click another intersecting curve.",
+                    );
+                }
+                let tol = doc.tolerances.absolute.max(1e-3);
+                if let Some(kept) = trim_curve_with_cutters(&target_curve, &cutters, pt, tol) {
+                    let replacements: Vec<_> =
+                        kept.into_iter().map(|c| (lid, Geometry::Curve(c))).collect();
+                    let kept_count = replacements.len();
+                    let new_ids = doc.replace_object_with_many("Trim", target_id, replacements);
+                    if let Some(pos) = cutter_ids.iter().position(|&cid| cid == target_id) {
+                        cutter_ids.remove(pos);
+                        cutter_ids.extend(new_ids);
+                    }
+                    CommandOutcome::msg(format!(
+                        "Trimmed curve ({kept_count} segment(s) kept). Click another segment or press Enter."
+                    ))
+                } else {
+                    CommandOutcome::msg("No intersection with cutting curves on that curve.")
+                }
+            }
+            ActiveTool::InsertKnot => {
+                let mut best: Option<(ObjectId, f64, f64)> = None;
+                for (id, obj) in &doc.objects {
+                    if obj.selected {
+                        if let Geometry::Curve(c) = &obj.geometry {
+                            let (u, _, d) = c.closest_point(pt);
+                            if best.as_ref().is_none_or(|b| d < b.2) {
+                                best = Some((id, u, d));
+                            }
+                        }
+                    }
+                }
+                self.tool = ActiveTool::Idle;
+                if let Some((id, u, _)) = best {
+                    let before = doc.objects[id].clone();
+                    if let Geometry::Curve(c) = &before.geometry {
+                        if let Ok(updated) = c.insert_knot(u, 1) {
+                            let count = updated.control_points.len();
+                            doc.objects[id].geometry = Geometry::Curve(updated);
+                            doc.objects[id].refresh_aabb();
+                            doc.record_object_modified("InsertKnot", id, before);
+                            return CommandOutcome::done(format!(
+                                "Inserted knot at u={u:.4} ({count} CPs)."
+                            ));
+                        }
+                    }
+                }
+                CommandOutcome::done("No selected curve for knot insertion.")
             }
             ActiveTool::ArrayLinear { count, base } => {
                 if let Some(b) = *base {
@@ -792,8 +1183,96 @@ impl CommandSession {
             return Some(self.on_point(pt, doc, cplane));
         }
 
+        let lower = trimmed.to_ascii_lowercase();
+        match &mut self.tool {
+            ActiveTool::Curve { degree, closed, .. }
+            | ActiveTool::InterpCrv { degree, closed, .. } => {
+                if lower == "close" || lower == "closed" {
+                    *closed = !*closed;
+                    return Some(CommandOutcome::msg(format!(
+                        "Curve closed = {closed}. Next point (or Enter to finish)"
+                    )));
+                }
+                if let Some(d_str) = lower
+                    .strip_prefix("d=")
+                    .or_else(|| lower.strip_prefix("degree="))
+                {
+                    if let Ok(d) = d_str.trim().parse::<usize>() {
+                        *degree = d.clamp(1, 7);
+                        return Some(CommandOutcome::msg(format!(
+                            "Curve degree = {degree}. Next point"
+                        )));
+                    }
+                }
+            }
+            ActiveTool::Helix { turns, .. } => {
+                if let Some(t_str) = lower
+                    .strip_prefix("t=")
+                    .or_else(|| lower.strip_prefix("turns="))
+                {
+                    if let Ok(t) = t_str.trim().parse::<f64>() {
+                        if t.abs() >= 0.05 {
+                            let new_turns = t.clamp(-100.0, 100.0);
+                            *turns = new_turns;
+                            return Some(CommandOutcome::msg(format!(
+                                "Helix turns = {new_turns}. {}",
+                                self.prompt()
+                            )));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
         if let Ok(val) = trimmed.parse::<f64>() {
             match &self.tool {
+                ActiveTool::Conic {
+                    p0: Some(a),
+                    p2: Some(b),
+                    apex: Some(ap),
+                } if val > 0.01 && val < 0.99 => {
+                    let a = *a;
+                    let b = *b;
+                    let ap = *ap;
+                    self.tool = ActiveTool::Idle;
+                    return Some(match NurbsCurve::conic(a, ap, b, val) {
+                        Ok(conic) => {
+                            doc.add_object("Conic", Geometry::Curve(conic));
+                            CommandOutcome::done(format!("Created Conic (rho = {val:.3})."))
+                        }
+                        Err(e) => CommandOutcome::done(format!("Conic error: {e}")),
+                    });
+                }
+                ActiveTool::Helix {
+                    axis_start: _,
+                    axis_end: None,
+                    ..
+                } if val.abs() >= 0.05 => {
+                    if let ActiveTool::Helix { turns, .. } = &mut self.tool {
+                        *turns = val.clamp(-100.0, 100.0);
+                    }
+                    return Some(CommandOutcome::msg(format!(
+                        "Helix turns = {val}. {}",
+                        self.prompt()
+                    )));
+                }
+                ActiveTool::Helix {
+                    axis_start: Some(a0),
+                    axis_end: Some(a1),
+                    turns,
+                } if val > 1e-4 => {
+                    let axis = (*a1 - *a0).normalize_or_zero();
+                    let ref_v = if axis.z.abs() < 0.9 {
+                        DVec3::Z
+                    } else {
+                        DVec3::X
+                    };
+                    let radial = ref_v.cross(axis).normalize_or_zero();
+                    let pt = *a0 + radial * val;
+                    let _ = turns;
+                    return Some(self.on_point(pt, doc, cplane));
+                }
                 ActiveTool::Circle { center: Some(c) }
             | ActiveTool::Cylinder {
                 center: Some(c),
@@ -921,6 +1400,93 @@ impl CommandSession {
                     .map(|c| vec![Geometry::Curve(c)])
                     .unwrap_or_default()
             }
+            ActiveTool::Curve {
+                points,
+                degree,
+                closed,
+            } if !points.is_empty() => {
+                let mut pts = points.clone();
+                pts.push(cur);
+                let mut out = Vec::new();
+                if let Ok(poly) = NurbsCurve::polyline(&pts) {
+                    out.push(Geometry::Curve(poly));
+                }
+                if let Ok(c) = NurbsCurve::from_control_points(&pts, *degree, *closed) {
+                    out.push(Geometry::Curve(c));
+                }
+                out
+            }
+            ActiveTool::InterpCrv {
+                points,
+                degree,
+                closed,
+            } if !points.is_empty() => {
+                let mut pts = points.clone();
+                pts.push(cur);
+                NurbsCurve::interpolate(&pts, *degree, *closed)
+                    .map(|c| vec![Geometry::Curve(c)])
+                    .unwrap_or_default()
+            }
+            ActiveTool::HandleCurve {
+                anchors,
+                pending_anchor,
+            } => {
+                let mut preview_anchors = anchors.clone();
+                let mut guides = Vec::new();
+                if let Some(a) = *pending_anchor {
+                    let h_out = cur;
+                    let h_in = a * 2.0 - h_out;
+                    guides.push(Geometry::Curve(NurbsCurve::line(h_in, h_out)));
+                    preview_anchors.push((a, h_in, h_out));
+                } else if !anchors.is_empty() {
+                    preview_anchors.push((cur, cur, cur));
+                }
+                if preview_anchors.len() >= 2 {
+                    let segs: Vec<_> = preview_anchors
+                        .windows(2)
+                        .map(|w| (w[0].0, w[0].2, w[1].1, w[1].0))
+                        .collect();
+                    if let Ok(c) = NurbsCurve::handle_curve(&segs) {
+                        guides.push(Geometry::Curve(c));
+                    }
+                }
+                guides
+            }
+            ActiveTool::Conic { p0, p2, apex } => match (p0, p2, apex) {
+                (Some(a), None, None) => vec![Geometry::Curve(NurbsCurve::line(*a, cur))],
+                (Some(a), Some(b), None) => vec![
+                    Geometry::Curve(NurbsCurve::line(*a, cur)),
+                    Geometry::Curve(NurbsCurve::line(cur, *b)),
+                ],
+                (Some(a), Some(b), Some(ap)) => {
+                    let mid = (*a + *b) * 0.5;
+                    let leg = *ap - mid;
+                    let rho = if leg.length_squared() > 1e-10 {
+                        ((cur - mid).dot(leg) / leg.length_squared()).clamp(0.05, 0.95)
+                    } else {
+                        0.5
+                    };
+                    NurbsCurve::conic(*a, *ap, *b, rho)
+                        .map(|c| vec![Geometry::Curve(c)])
+                        .unwrap_or_default()
+                }
+                _ => Vec::new(),
+            },
+            ActiveTool::Helix {
+                axis_start,
+                axis_end,
+                turns,
+            } => match (axis_start, axis_end) {
+                (Some(a0), None) => vec![Geometry::Curve(NurbsCurve::line(*a0, cur))],
+                (Some(a0), Some(a1)) => {
+                    let mut out = vec![Geometry::Curve(NurbsCurve::line(*a0, *a1))];
+                    if let Ok(h) = NurbsCurve::helix(*a0, *a1, cur, *turns, None) {
+                        out.push(Geometry::Curve(h));
+                    }
+                    out
+                }
+                _ => Vec::new(),
+            },
             ActiveTool::Rectangle { corner1: Some(c1) } => {
                 NurbsCurve::rectangle(cplane, *c1, cur)
                     .map(|c| vec![Geometry::Curve(c)])
@@ -1025,5 +1591,89 @@ mod tests {
             parse_point_input("@4, 0", Some(DVec3::new(1.0, 2.0, 0.0))),
             Some(DVec3::new(5.0, 2.0, 0.0))
         );
+    }
+
+    #[test]
+    fn interactive_freeform_curve_interp_conic_helix_split_and_trim() {
+        let mut doc = Document::new();
+        let mut session = CommandSession::default();
+        let plane = Plane::world_xy();
+
+        // Curve with degree option
+        session.start_tool("curve", &doc);
+        session.on_text_input("d=2", &mut doc, &plane);
+        for pt in [
+            DVec3::ZERO,
+            DVec3::new(2.0, 3.0, 0.0),
+            DVec3::new(5.0, 0.0, 0.0),
+        ] {
+            session.on_point(pt, &mut doc, &plane);
+        }
+        let out = session.finish_or_cancel(&mut doc);
+        assert!(out.finished);
+        assert_eq!(doc.objects.len(), 1);
+        let Geometry::Curve(c) = &doc.objects.values().next().unwrap().geometry else {
+            panic!("expected curve");
+        };
+        assert_eq!(c.degree, 2);
+
+        // InterpCrv
+        session.start_tool("interpcrv", &doc);
+        for pt in [
+            DVec3::new(0.0, 0.0, 0.0),
+            DVec3::new(3.0, 2.0, 0.0),
+            DVec3::new(6.0, 0.0, 0.0),
+        ] {
+            session.on_point(pt, &mut doc, &plane);
+        }
+        session.finish_or_cancel(&mut doc);
+        assert_eq!(doc.objects.len(), 2);
+
+        // Conic
+        session.start_tool("conic", &doc);
+        session.on_point(DVec3::new(-2.0, 0.0, 0.0), &mut doc, &plane);
+        session.on_point(DVec3::new(2.0, 0.0, 0.0), &mut doc, &plane);
+        session.on_point(DVec3::new(0.0, 4.0, 0.0), &mut doc, &plane);
+        let conic_out = session.on_text_input("0.5", &mut doc, &plane).unwrap();
+        assert!(conic_out.finished);
+        assert_eq!(doc.objects.len(), 3);
+
+        // Helix
+        session.start_tool("helix", &doc);
+        session.on_point(DVec3::ZERO, &mut doc, &plane);
+        session.on_point(DVec3::new(0.0, 0.0, 5.0), &mut doc, &plane);
+        let helix_out = session.on_point(DVec3::new(2.0, 0.0, 0.0), &mut doc, &plane);
+        assert!(helix_out.finished);
+        assert_eq!(doc.objects.len(), 4);
+
+        // SplitCurve & Trim
+        let mut doc2 = Document::new();
+        let line_a = doc2.add_object(
+            "LineA",
+            Geometry::Curve(NurbsCurve::line(
+                DVec3::new(-5.0, 0.0, 0.0),
+                DVec3::new(5.0, 0.0, 0.0),
+            )),
+        );
+        let line_b = doc2.add_object(
+            "LineB",
+            Geometry::Curve(NurbsCurve::line(
+                DVec3::new(0.0, -5.0, 0.0),
+                DVec3::new(0.0, 5.0, 0.0),
+            )),
+        );
+        doc2.set_selected(line_b, true);
+        session.start_tool("trim", &doc2);
+        let trim_out = session.on_point(DVec3::new(3.0, 0.0, 0.0), &mut doc2, &plane);
+        assert!(!trim_out.finished);
+        session.finish_or_cancel(&mut doc2);
+        assert!(doc2.objects.get(line_a).is_none());
+        assert_eq!(doc2.objects.len(), 2);
+
+        doc2.select_all();
+        session.start_tool("splitcurve", &doc2);
+        let split_out = session.on_point(DVec3::new(-2.5, 0.0, 0.0), &mut doc2, &plane);
+        assert!(split_out.finished);
+        assert_eq!(doc2.objects.len(), 3);
     }
 }

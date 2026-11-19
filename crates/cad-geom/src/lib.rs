@@ -1,16 +1,22 @@
 //! Clean-room NURBS curves/surfaces, meshes, and geometric primitives for Elephant.
 
 pub mod csg;
+pub mod curve_ops;
 pub mod error;
 pub mod mesh;
 pub mod nurbs_curve;
 pub mod nurbs_surface;
 
-pub use cad_math::{Aabb, DMat4, DVec3, Plane, Ray, Tolerances, UnitSystem};
+pub use cad_math::{Aabb, Continuity, DMat4, DVec3, Plane, Ray, Tolerances, UnitSystem};
 pub use csg::{BooleanOp, mesh_boolean};
+pub use curve_ops::{
+    CurveIntersection, OffsetCornerStyle, RebuildReport, blend_curves, chamfer_two_curves,
+    fair_curve, fillet_two_curves, intersect_curves, match_curve, rebuild_adaptive,
+    rebuild_uniform, trim_curve_with_cutters, tween_curves,
+};
 pub use error::GeomError;
 pub use mesh::TriangleMesh;
-pub use nurbs_curve::{ControlPoint, NurbsCurve};
+pub use nurbs_curve::{ControlPoint, CurvatureSample, NurbsCurve};
 pub use nurbs_surface::NurbsSurface;
 use serde::{Deserialize, Serialize};
 

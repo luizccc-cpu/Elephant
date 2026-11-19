@@ -1,7 +1,8 @@
 use cad_doc::{AnnotationItem, AnnotationKind, Document};
 use cad_geom::{
-    BooleanOp, DMat4, DVec3, Geometry, NurbsCurve, NurbsSurface, Plane, TriangleMesh, UnitSystem,
-    mesh_boolean,
+    BooleanOp, Continuity, DMat4, DVec3, Geometry, NurbsCurve, NurbsSurface, Plane, TriangleMesh,
+    UnitSystem, blend_curves, chamfer_two_curves, fair_curve, fillet_two_curves,
+    intersect_curves, match_curve, mesh_boolean, rebuild_adaptive, rebuild_uniform, tween_curves,
 };
 use cad_render::DisplayMode;
 
@@ -433,41 +434,432 @@ impl ElephantApp {
             }
             "fillet" => {
                 let radius = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
-                let lines: Vec<_> = self
+                let curves: Vec<_> = self
                     .doc
                     .objects
                     .values()
                     .filter(|o| o.selected)
                     .filter_map(|o| match &o.geometry {
-                        Geometry::Curve(c) if c.degree == 1 && c.control_points.len() == 2 => {
-                            Some((
-                                o.layer_id,
-                                c.control_points[0].position,
-                                c.control_points[1].position,
-                            ))
-                        }
+                        Geometry::Curve(c) => Some((o.layer_id, c.clone())),
                         _ => None,
                     })
                     .collect();
-                if lines.len() != 2 {
-                    self.log("Select exactly 2 line segments to fillet, then run Fillet [radius].");
-                } else if let Some((la, lb, arc)) = NurbsCurve::fillet_two_lines(
-                    lines[0].1, lines[0].2, lines[1].1, lines[1].2, radius,
-                ) {
-                    let lid = lines[0].0;
-                    self.doc.remove_selected();
-                    self.doc
-                        .add_object_on_layer("FilletLine", lid, Geometry::Curve(la));
-                    self.doc
-                        .add_object_on_layer("FilletLine", lid, Geometry::Curve(lb));
-                    self.doc
-                        .add_object_on_layer("FilletArc", lid, Geometry::Curve(arc));
+                if curves.len() != 2 {
+                    self.log("Select exactly 2 curves to fillet, then run Fillet [radius].");
+                } else {
+                    let (lid_a, ref ca) = curves[0];
+                    let (_, ref cb) = curves[1];
+                    let tol = self.doc.tolerances.absolute.max(1e-3);
+                    let hits = intersect_curves(ca, cb, tol);
+                    let far_end = |c: &NurbsCurve, ref_pt: DVec3| -> DVec3 {
+                        let (u0, u1) = c.domain();
+                        let p0 = c.evaluate(u0);
+                        let p1 = c.evaluate(u1);
+                        if p0.distance(ref_pt) >= p1.distance(ref_pt) {
+                            p0
+                        } else {
+                            p1
+                        }
+                    };
+                    let (pick_a, pick_b) = if let Some(h) = hits.first() {
+                        (far_end(ca, h.point), far_end(cb, h.point))
+                    } else {
+                        let (ua0, ua1) = ca.domain();
+                        let (ub0, ub1) = cb.domain();
+                        (
+                            ca.evaluate(0.5 * (ua0 + ua1)),
+                            cb.evaluate(0.5 * (ub0 + ub1)),
+                        )
+                    };
+                    if let Some((ta, tb, arc)) =
+                        fillet_two_curves(ca, cb, pick_a, pick_b, radius, &cplane, tol)
+                    {
+                        self.doc.remove_selected();
+                        self.doc
+                            .add_object_on_layer("FilletCurve", lid_a, Geometry::Curve(ta));
+                        self.doc
+                            .add_object_on_layer("FilletCurve", lid_a, Geometry::Curve(tb));
+                        self.doc
+                            .add_object_on_layer("FilletArc", lid_a, Geometry::Curve(arc));
+                        self.prune_points_on();
+                        self.mark_scene_dirty();
+                        self.log(format!("Filleted 2 curves with radius {radius:.3}."));
+                    } else {
+                        self.log(
+                            "Could not fillet the selected curves (parallel, non-coplanar, or radius too large).",
+                        );
+                    }
+                }
+            }
+            "chamfer" => {
+                let d1 = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
+                let d2 = args.get(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(d1);
+                let curves: Vec<_> = self
+                    .doc
+                    .objects
+                    .values()
+                    .filter(|o| o.selected)
+                    .filter_map(|o| match &o.geometry {
+                        Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                if curves.len() != 2 {
+                    self.log("Select exactly 2 curves to chamfer, then run Chamfer [d1] [d2].");
+                } else {
+                    let (lid_a, ref ca) = curves[0];
+                    let (_, ref cb) = curves[1];
+                    let tol = self.doc.tolerances.absolute.max(1e-3);
+                    let hits = intersect_curves(ca, cb, tol);
+                    let far_end = |c: &NurbsCurve, ref_pt: DVec3| -> DVec3 {
+                        let (u0, u1) = c.domain();
+                        let p0 = c.evaluate(u0);
+                        let p1 = c.evaluate(u1);
+                        if p0.distance(ref_pt) >= p1.distance(ref_pt) {
+                            p0
+                        } else {
+                            p1
+                        }
+                    };
+                    let (pick_a, pick_b) = if let Some(h) = hits.first() {
+                        (far_end(ca, h.point), far_end(cb, h.point))
+                    } else {
+                        (ca.evaluate(ca.domain().0), cb.evaluate(cb.domain().0))
+                    };
+                    if let Some((ta, tb, line)) =
+                        chamfer_two_curves(ca, cb, pick_a, pick_b, d1, d2, tol)
+                    {
+                        self.doc.remove_selected();
+                        self.doc
+                            .add_object_on_layer("ChamferCurve", lid_a, Geometry::Curve(ta));
+                        self.doc
+                            .add_object_on_layer("ChamferCurve", lid_a, Geometry::Curve(tb));
+                        self.doc
+                            .add_object_on_layer("ChamferLine", lid_a, Geometry::Curve(line));
+                        self.prune_points_on();
+                        self.mark_scene_dirty();
+                        self.log(format!("Chamfered 2 curves ({d1:.3}, {d2:.3})."));
+                    } else {
+                        self.log("Could not chamfer selected curves.");
+                    }
+                }
+            }
+            "split" => {
+                let selected: Vec<_> = self
+                    .doc
+                    .objects
+                    .iter()
+                    .filter(|(_, o)| o.selected)
+                    .filter_map(|(id, o)| match &o.geometry {
+                        Geometry::Curve(c) => Some((id, o.layer_id, c.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                if selected.is_empty() {
+                    self.log("Select 1 curve (interactive split) or 2+ intersecting curves to Split.");
+                } else if selected.len() == 1 {
+                    if let Some(prompt) = self.session.start_tool("splitcurve", &self.doc) {
+                        self.log(prompt);
+                    }
+                } else {
+                    let tol = self.doc.tolerances.absolute.max(1e-3);
+                    let mut split_count = 0usize;
+                    let mut piece_total = 0usize;
+                    for i in 0..selected.len() {
+                        let (id, lid, ref ci) = selected[i];
+                        let mut params = Vec::new();
+                        for (j, (_, _, cj)) in selected.iter().enumerate() {
+                            if i != j {
+                                for hit in intersect_curves(ci, cj, tol) {
+                                    params.push(hit.u_a);
+                                }
+                            }
+                        }
+                        if !params.is_empty() {
+                            let pieces = ci.split_at_params(&params);
+                            if pieces.len() > 1 {
+                                piece_total += pieces.len();
+                                split_count += 1;
+                                let reps = pieces
+                                    .into_iter()
+                                    .map(|p| (lid, Geometry::Curve(p)))
+                                    .collect();
+                                self.doc.replace_object_with_many("Split", id, reps);
+                            }
+                        }
+                    }
                     self.prune_points_on();
                     self.mark_scene_dirty();
-                    self.log(format!("Filleted 2 lines with radius {radius:.3}."));
-                } else {
-                    self.log("Could not fillet the selected lines (parallel, non-coplanar, or radius too large).");
+                    if split_count > 0 {
+                        self.log(format!("Split {split_count} curve(s) into {piece_total} pieces."));
+                    } else {
+                        self.log("Selected curves have no mutual intersections.");
+                    }
                 }
+            }
+            "blendcrv" => {
+                let mut cont = Continuity::G2;
+                let mut bulge = 1.0_f64;
+                for arg in &args {
+                    match arg.to_ascii_lowercase().as_str() {
+                        "g0" => cont = Continuity::G0,
+                        "g1" => cont = Continuity::G1,
+                        "g2" => cont = Continuity::G2,
+                        "g3" => cont = Continuity::G3,
+                        _ => {
+                            if let Ok(v) = arg.parse::<f64>() {
+                                bulge = v.clamp(0.05, 5.0);
+                            }
+                        }
+                    }
+                }
+                let curves: Vec<_> = self
+                    .doc
+                    .objects
+                    .values()
+                    .filter(|o| o.selected)
+                    .filter_map(|o| match &o.geometry {
+                        Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                if curves.len() != 2 {
+                    self.log("Select exactly 2 curves to BlendCrv [g0|g1|g2|g3] [bulge].");
+                } else {
+                    let (lid, ref ca) = curves[0];
+                    let (_, ref cb) = curves[1];
+                    let (at_end_a, at_end_b) = closest_endpoint_pair(ca, cb);
+                    match blend_curves(ca, at_end_a, cb, at_end_b, cont, bulge, bulge) {
+                        Ok(blended) => {
+                            self.doc
+                                .add_object_on_layer("BlendCrv", lid, Geometry::Curve(blended));
+                            self.mark_scene_dirty();
+                            self.log(format!("Created {} blend curve.", cont.label()));
+                        }
+                        Err(e) => self.log(format!("BlendCrv error: {e}")),
+                    }
+                }
+            }
+            "match" => {
+                let cont = match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+                    Some("g0") => Continuity::G0,
+                    Some("g1") => Continuity::G1,
+                    Some("g3") => Continuity::G3,
+                    _ => Continuity::G2,
+                };
+                let curves: Vec<_> = self
+                    .doc
+                    .objects
+                    .iter()
+                    .filter(|(_, o)| o.selected)
+                    .filter_map(|(id, o)| match &o.geometry {
+                        Geometry::Curve(c) => Some((id, c.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                if curves.len() != 2 {
+                    self.log("Select 2 curves (1st is matched to 2nd): Match [g0|g1|g2].");
+                } else {
+                    let (id_a, ref ca) = curves[0];
+                    let (_, ref cb) = curves[1];
+                    let (at_end_a, at_end_b) = closest_endpoint_pair(ca, cb);
+                    match match_curve(ca, at_end_a, cb, at_end_b, cont) {
+                        Ok(matched) => {
+                            let before = self.doc.objects[id_a].clone();
+                            self.doc.objects[id_a].geometry = Geometry::Curve(matched);
+                            self.doc.objects[id_a].refresh_aabb();
+                            self.doc.record_object_modified("Match", id_a, before);
+                            self.mark_scene_dirty();
+                            self.log(format!("Matched curve with {}.", cont.label()));
+                        }
+                        Err(e) => self.log(format!("Match error: {e}")),
+                    }
+                }
+            }
+            "rebuild" => {
+                let cp_count = args.first().and_then(|v| v.parse::<usize>().ok()).unwrap_or(10);
+                let degree = args.get(1).and_then(|v| v.parse::<usize>().ok()).unwrap_or(3);
+                let ids: Vec<_> = self
+                    .doc
+                    .objects
+                    .iter()
+                    .filter(|(_, o)| o.selected && matches!(o.geometry, Geometry::Curve(_)))
+                    .map(|(id, _)| id)
+                    .collect();
+                if ids.is_empty() {
+                    self.log("Select curve(s) to Rebuild [cp_count] [degree].");
+                } else {
+                    for id in ids {
+                        let before = self.doc.objects[id].clone();
+                        if let Geometry::Curve(c) = &before.geometry {
+                            match rebuild_uniform(c, cp_count, degree) {
+                                Ok(rep) => {
+                                    self.doc.objects[id].geometry = Geometry::Curve(rep.curve);
+                                    self.doc.objects[id].refresh_aabb();
+                                    self.doc.record_object_modified("Rebuild", id, before);
+                                    self.log(format!(
+                                        "Rebuilt curve: {} -> {} CPs (deg {}, max dev {:.5}).",
+                                        rep.old_cp_count,
+                                        rep.new_cp_count,
+                                        degree,
+                                        rep.max_deviation
+                                    ));
+                                }
+                                Err(e) => self.log(format!("Rebuild error: {e}")),
+                            }
+                        }
+                    }
+                    self.mark_scene_dirty();
+                }
+            }
+            "rebuildadaptive" | "elmo" => {
+                let tol = args
+                    .first()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or_else(|| self.doc.tolerances.absolute.max(0.01));
+                let degree = args.get(1).and_then(|v| v.parse::<usize>().ok()).unwrap_or(3);
+                let ids: Vec<_> = self
+                    .doc
+                    .objects
+                    .iter()
+                    .filter(|(_, o)| o.selected && matches!(o.geometry, Geometry::Curve(_)))
+                    .map(|(id, _)| id)
+                    .collect();
+                if ids.is_empty() {
+                    self.log("Select curve(s) to run RebuildAdaptive / Elmo [max_tol] [degree].");
+                } else {
+                    for id in ids {
+                        let before = self.doc.objects[id].clone();
+                        if let Geometry::Curve(c) = &before.geometry {
+                            match rebuild_adaptive(c, degree, tol, true, true) {
+                                Ok(rep) => {
+                                    self.doc.objects[id].geometry = Geometry::Curve(rep.curve);
+                                    self.doc.objects[id].refresh_aabb();
+                                    self.doc.record_object_modified("RebuildAdaptive", id, before);
+                                    self.log(format!(
+                                        "Elmo adaptive rebuild: {} -> {} CPs (max dev {:.5}).",
+                                        rep.old_cp_count, rep.new_cp_count, rep.max_deviation
+                                    ));
+                                }
+                                Err(e) => self.log(format!("RebuildAdaptive error: {e}")),
+                            }
+                        }
+                    }
+                    self.mark_scene_dirty();
+                }
+            }
+            "fair" => {
+                let strength = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.35);
+                let ids: Vec<_> = self
+                    .doc
+                    .objects
+                    .iter()
+                    .filter(|(_, o)| o.selected && matches!(o.geometry, Geometry::Curve(_)))
+                    .map(|(id, _)| id)
+                    .collect();
+                if ids.is_empty() {
+                    self.log("Select curve(s) to Fair [strength].");
+                } else {
+                    let count = ids.len();
+                    for id in ids {
+                        let before = self.doc.objects[id].clone();
+                        if let Geometry::Curve(c) = &before.geometry {
+                            let faired = fair_curve(c, strength, 4);
+                            self.doc.objects[id].geometry = Geometry::Curve(faired);
+                            self.doc.objects[id].refresh_aabb();
+                            self.doc.record_object_modified("Fair", id, before);
+                        }
+                    }
+                    self.mark_scene_dirty();
+                    self.log(format!("Faired {count} curve(s)."));
+                }
+            }
+            "tweencurves" => {
+                let count = args.first().and_then(|v| v.parse::<usize>().ok()).unwrap_or(3);
+                let curves: Vec<_> = self
+                    .doc
+                    .objects
+                    .values()
+                    .filter(|o| o.selected)
+                    .filter_map(|o| match &o.geometry {
+                        Geometry::Curve(c) => Some((o.layer_id, c.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                if curves.len() != 2 {
+                    self.log("Select 2 curves to run TweenCurves [count].");
+                } else {
+                    let tweens = tween_curves(&curves[0].1, &curves[1].1, count);
+                    let n = tweens.len();
+                    for tw in tweens {
+                        self.doc
+                            .add_object_on_layer("TweenCurve", curves[0].0, Geometry::Curve(tw));
+                    }
+                    self.mark_scene_dirty();
+                    self.log(format!("Created {n} tweened curve(s)."));
+                }
+            }
+            "changedegree" => {
+                let target_deg = args
+                    .first()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(3)
+                    .clamp(1, 7);
+                let ids: Vec<_> = self
+                    .doc
+                    .objects
+                    .iter()
+                    .filter(|(_, o)| o.selected && matches!(o.geometry, Geometry::Curve(_)))
+                    .map(|(id, _)| id)
+                    .collect();
+                if ids.is_empty() {
+                    self.log("Select curve(s) to ChangeDegree [degree].");
+                } else {
+                    for id in ids {
+                        let before = self.doc.objects[id].clone();
+                        if let Geometry::Curve(c) = &before.geometry {
+                            if target_deg > c.degree {
+                                if let Ok(elevated) = c.elevate_degree(target_deg - c.degree) {
+                                    self.doc.objects[id].geometry = Geometry::Curve(elevated);
+                                    self.doc.objects[id].refresh_aabb();
+                                    self.doc.record_object_modified("ChangeDegree", id, before);
+                                    self.log(format!("Elevated curve to degree {target_deg}."));
+                                }
+                            } else if target_deg < c.degree {
+                                if let Ok(rep) = rebuild_uniform(c, c.control_points.len(), target_deg)
+                                {
+                                    self.doc.objects[id].geometry = Geometry::Curve(rep.curve);
+                                    self.doc.objects[id].refresh_aabb();
+                                    self.doc.record_object_modified("ChangeDegree", id, before);
+                                    self.log(format!(
+                                        "Rebuilt curve to degree {target_deg} (max dev {:.5}).",
+                                        rep.max_deviation
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    self.mark_scene_dirty();
+                }
+            }
+            "curvaturegraph" => {
+                let mut added = 0;
+                for (id, obj) in &self.doc.objects {
+                    if obj.selected
+                        && matches!(obj.geometry, Geometry::Curve(_))
+                        && self.curvature_graph_objects.insert(id)
+                    {
+                        added += 1;
+                    }
+                }
+                self.log(format!(
+                    "CurvatureGraph on ({added} added, {} active).",
+                    self.curvature_graph_objects.len()
+                ));
+            }
+            "curvaturegraphoff" => {
+                self.curvature_graph_objects.clear();
+                self.log("CurvatureGraph turned off.");
             }
             "length" => {
                 let mut total = 0.0;
@@ -592,6 +984,7 @@ impl ElephantApp {
             "new" => {
                 self.session.cancel();
                 self.points_on_objects.clear();
+                self.curvature_graph_objects.clear();
                 self.grip_drag = None;
                 self.gumball_drag = None;
                 self.gumball_prompt = None;
@@ -604,8 +997,37 @@ impl ElephantApp {
             "save" => self.save_project_dialog(),
             "import" => self.import_mesh_dialog(),
             "export" => self.export_mesh_dialog(),
+            "curve" => {
+                let deg = args.first().and_then(|v| v.parse::<usize>().ok()).unwrap_or(3).clamp(1, 7);
+                let closed = args.iter().any(|a| a.eq_ignore_ascii_case("close") || a.eq_ignore_ascii_case("closed"));
+                self.session.tool = cad_commands::ActiveTool::Curve {
+                    points: Vec::new(),
+                    degree: deg,
+                    closed,
+                };
+                self.log(self.session.prompt());
+            }
+            "interpcrv" => {
+                let deg = args.first().and_then(|v| v.parse::<usize>().ok()).unwrap_or(3).clamp(1, 7);
+                let closed = args.iter().any(|a| a.eq_ignore_ascii_case("close") || a.eq_ignore_ascii_case("closed"));
+                self.session.tool = cad_commands::ActiveTool::InterpCrv {
+                    points: Vec::new(),
+                    degree: deg,
+                    closed,
+                };
+                self.log(self.session.prompt());
+            }
+            "helix" => {
+                let turns = args.first().and_then(|v| v.parse::<f64>().ok()).unwrap_or(3.0).clamp(-100.0, 100.0);
+                self.session.tool = cad_commands::ActiveTool::Helix {
+                    axis_start: None,
+                    axis_end: None,
+                    turns,
+                };
+                self.log(self.session.prompt());
+            }
             "help" => {
-                self.log("Interactive: Line, Polyline, Rectangle, Arc, Circle, Polygon, Box, Cylinder, Cone, Revolve, Move, Copy, Rotate, Scale, Mirror, Offset, ArrayLinear, ArrayPolar, Distance, Dim, TextDot | Quick: Sphere, Torus, Plane, Extrude, PlanarSrf, Loft, BooleanUnion/Difference/Intersection, Join, Explode, Fillet, PointsOn/Off, Units [mm|cm|m|in|ft], Wireframe/Shaded/Ghosted/Technical/Arctic, ZoomExtents (ZE), Undo, Redo, New");
+                self.log("Interactive: Line, Polyline, Curve, InterpCrv, HandleCurve, Conic, Helix, Rectangle, Arc, Circle, Polygon, Box, Cylinder, Cone, Revolve, Move, Copy, Rotate, Scale, Mirror, Offset, SplitCurve, Trim, InsertKnot, ArrayLinear, ArrayPolar, Distance, Dim, TextDot | Quick: Sphere, Torus, Plane, Extrude, PlanarSrf, Loft, BooleanUnion/Difference/Intersection, Join, Explode, Split, Fillet, Chamfer, BlendCrv, Match, Rebuild, RebuildAdaptive (Elmo), Fair, TweenCurves, ChangeDegree, CurvatureGraph, CurvatureGraphOff, PointsOn/Off, Units [mm|cm|m|in|ft], Wireframe/Shaded/Ghosted/Technical/Arctic, ZoomExtents (ZE), Undo, Redo, New");
             }
             _ => {
                 self.log(format!(
@@ -614,4 +1036,23 @@ impl ElephantApp {
             }
         }
     }
+}
+
+fn closest_endpoint_pair(a: &NurbsCurve, b: &NurbsCurve) -> (bool, bool) {
+    let (ua0, ua1) = a.domain();
+    let (ub0, ub1) = b.domain();
+    let ea = [a.evaluate(ua0), a.evaluate(ua1)];
+    let eb = [b.evaluate(ub0), b.evaluate(ub1)];
+    let mut best = (true, false);
+    let mut best_d = f64::INFINITY;
+    for (ia, &pa) in ea.iter().enumerate() {
+        for (ib, &pb) in eb.iter().enumerate() {
+            let d = pa.distance(pb);
+            if d < best_d {
+                best_d = d;
+                best = (ia == 1, ib == 1);
+            }
+        }
+    }
+    best
 }

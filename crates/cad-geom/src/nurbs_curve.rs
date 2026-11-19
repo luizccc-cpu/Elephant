@@ -1,7 +1,19 @@
+use cad_math::linalg::solve_linear_system_vec3;
 use cad_math::{Aabb, DMat4, DVec3, DVec4, PARAM_EPSILON, Plane, Ray};
 use serde::{Deserialize, Serialize};
 
+use crate::curve_ops::{OffsetCornerStyle, join_two_exact, offset_nurbs_curve_in_plane};
 use crate::error::GeomError;
+
+/// Curvature sample along a NURBS curve for analysis and CurvatureGraph display.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CurvatureSample {
+    pub u: f64,
+    pub point: DVec3,
+    pub tangent: DVec3,
+    pub curvature_vec: DVec3,
+    pub curvature: f64,
+}
 
 /// Homogeneous-ready NURBS control point in 3D space.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -187,6 +199,568 @@ impl NurbsCurve {
         let point = cw0.truncate() / w;
         let deriv = (cw1.truncate() - point * cw1.w) / w;
         (point, deriv)
+    }
+
+    /// Evaluate rational derivatives `C(u), C'(u), ..., C^(max_order)(u)` via Leibniz rule (A4.2).
+    pub fn evaluate_derivatives(&self, u: f64, max_order: usize) -> Vec<DVec3> {
+        let (u_min, u_max) = self.domain();
+        let u = u.clamp(u_min, u_max);
+        let d = max_order.min(self.degree);
+        let span = find_span(self.control_points.len() - 1, self.degree, u, &self.knots);
+        let ders = basis_function_derivatives(span, u, self.degree, d, &self.knots);
+
+        let mut aders = vec![DVec3::ZERO; d + 1];
+        let mut wders = vec![0.0_f64; d + 1];
+        for k in 0..=d {
+            let mut cw = DVec4::ZERO;
+            for i in 0..=self.degree {
+                let h = self.control_points[span - self.degree + i].to_homogeneous();
+                cw += h * ders[k][i];
+            }
+            aders[k] = cw.truncate();
+            wders[k] = cw.w;
+        }
+
+        let mut ck = vec![DVec3::ZERO; max_order + 1];
+        if wders[0].abs() < PARAM_EPSILON {
+            return ck;
+        }
+        for k in 0..=d {
+            let mut v = aders[k];
+            for i in 1..=k {
+                let b = binomial_coeff(k, i);
+                v -= ck[k - i] * (b * wders[i]);
+            }
+            ck[k] = v / wders[0];
+        }
+        ck
+    }
+
+    /// Evaluate `(curvature_vector, scalar_curvature)` at parameter `u`.
+    pub fn curvature_at(&self, u: f64) -> (DVec3, f64) {
+        let ders = self.evaluate_derivatives(u, 2);
+        let c1 = ders[1];
+        let c2 = ders[2];
+        let s1 = c1.length();
+        if s1 < 1e-12 {
+            return (DVec3::ZERO, 0.0);
+        }
+        let t_hat = c1 / s1;
+        let k_vec = (c2 - t_hat * c2.dot(t_hat)) / (s1 * s1);
+        (k_vec, k_vec.length())
+    }
+
+    /// Orthonormal Frenet-like frame `(point, tangent, normal, binormal)` at parameter `u`.
+    pub fn frenet_frame(&self, u: f64) -> (DVec3, DVec3, DVec3, DVec3) {
+        let ders = self.evaluate_derivatives(u, 2);
+        let p = ders[0];
+        let t = ders[1].normalize_or_zero();
+        if t.length_squared() < 1e-12 {
+            return (p, DVec3::X, DVec3::Y, DVec3::Z);
+        }
+        let (k_vec, k) = self.curvature_at(u);
+        let (n, b) = if k > 1e-9 {
+            let n_raw = k_vec / k;
+            let b = t.cross(n_raw).normalize_or_zero();
+            if b.length_squared() > 1e-12 {
+                (b.cross(t).normalize(), b)
+            } else {
+                fallback_frame_axes(t)
+            }
+        } else {
+            fallback_frame_axes(t)
+        };
+        (p, t, n, b)
+    }
+
+    /// Sample curvature along the curve for analysis and CurvatureGraph rendering.
+    pub fn curvature_samples(&self, samples: usize) -> Vec<CurvatureSample> {
+        let n = samples.max(4);
+        let (u0, u1) = self.domain();
+        (0..=n)
+            .map(|i| {
+                let u = u0 + (u1 - u0) * (i as f64 / n as f64);
+                let ders = self.evaluate_derivatives(u, 2);
+                let c1 = ders[1];
+                let c2 = ders[2];
+                let s1 = c1.length();
+                let tangent = if s1 > 1e-12 { c1 / s1 } else { DVec3::X };
+                let curvature_vec = if s1 > 1e-12 {
+                    (c2 - tangent * c2.dot(tangent)) / (s1 * s1)
+                } else {
+                    DVec3::ZERO
+                };
+                CurvatureSample {
+                    u,
+                    point: ders[0],
+                    tangent,
+                    curvature_vec,
+                    curvature: curvature_vec.length(),
+                }
+            })
+            .collect()
+    }
+
+    /// Arc length integrated over `[u_a, u_b]` via composite 5-point Gauss-Legendre quadrature.
+    pub fn arc_length_between(&self, u_a: f64, u_b: f64) -> f64 {
+        let (u0, u1) = self.domain();
+        let a = u_a.clamp(u0, u1);
+        let b = u_b.clamp(u0, u1);
+        if b <= a + 1e-14 {
+            return 0.0;
+        }
+        const GL_NODES: [f64; 5] = [
+            -0.906179845938664,
+            -0.5384693101056831,
+            0.0,
+            0.5384693101056831,
+            0.906179845938664,
+        ];
+        const GL_WEIGHTS: [f64; 5] = [
+            0.2369268850561891,
+            0.4786286704993665,
+            0.5688888888888889,
+            0.4786286704993665,
+            0.2369268850561891,
+        ];
+
+        let mut breaks = vec![a];
+        for &k in &self.knots {
+            if k > a + 1e-12 && k < b - 1e-12 && k - *breaks.last().unwrap() > 1e-12 {
+                breaks.push(k);
+            }
+        }
+        breaks.push(b);
+
+        let sub_per_span = if self.degree == 1 { 1 } else { 4 };
+        let mut total = 0.0;
+        for w in breaks.windows(2) {
+            let span_len = w[1] - w[0];
+            for s in 0..sub_per_span {
+                let s0 = w[0] + span_len * (s as f64 / sub_per_span as f64);
+                let s1 = w[0] + span_len * ((s + 1) as f64 / sub_per_span as f64);
+                let mid = 0.5 * (s0 + s1);
+                let half = 0.5 * (s1 - s0);
+                let mut sum = 0.0;
+                for (&xi, &wi) in GL_NODES.iter().zip(GL_WEIGHTS.iter()) {
+                    let (_, deriv) = self.evaluate_derivative(mid + half * xi);
+                    sum += wi * deriv.length();
+                }
+                total += half * sum;
+            }
+        }
+        total
+    }
+
+    pub fn arc_length(&self) -> f64 {
+        let (u0, u1) = self.domain();
+        self.arc_length_between(u0, u1)
+    }
+
+    /// Parameter `u` at `target_len` distance from `u0`.
+    pub fn parameter_at_arc_length(&self, target_len: f64) -> f64 {
+        let (u0, u1) = self.domain();
+        let total = self.arc_length();
+        if target_len <= 0.0 || total <= 1e-12 {
+            return u0;
+        }
+        if target_len >= total {
+            return u1;
+        }
+        let mut lo = u0;
+        let mut hi = u1;
+        for _ in 0..48 {
+            let mid = 0.5 * (lo + hi);
+            let len = self.arc_length_between(u0, mid);
+            if (len - target_len).abs() < 1e-10 {
+                return mid;
+            }
+            if len < target_len {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    }
+
+    /// Closest point on the curve to `query`, returning `(u, point_on_curve, distance)`.
+    pub fn closest_point(&self, query: DVec3) -> (f64, DVec3, f64) {
+        let (u0, u1) = self.domain();
+        let seed_steps = (self.control_points.len() * 8).clamp(48, 256);
+        let mut candidates = Vec::with_capacity(seed_steps + self.knots.len() + 2);
+        for i in 0..=seed_steps {
+            candidates.push(u0 + (u1 - u0) * (i as f64 / seed_steps as f64));
+        }
+        for &k in &self.knots {
+            if k > u0 && k < u1 {
+                candidates.push(k);
+            }
+        }
+        candidates.sort_by(|a, b| a.total_cmp(b));
+        candidates.dedup_by(|a, b| (*a - *b).abs() < 1e-11);
+
+        let dists: Vec<(f64, f64)> = candidates
+            .iter()
+            .map(|&u| (u, self.evaluate(u).distance_squared(query)))
+            .collect();
+
+        let mut best_u = u0;
+        let mut best_pt = self.evaluate(u0);
+        let mut best_d2 = best_pt.distance_squared(query);
+
+        let p_end = self.evaluate(u1);
+        let d2_end = p_end.distance_squared(query);
+        if d2_end < best_d2 {
+            best_d2 = d2_end;
+            best_u = u1;
+            best_pt = p_end;
+        }
+
+        // Collect local minima + global best seeds
+        let mut seeds: Vec<(f64, f64)> = Vec::new();
+        for i in 0..dists.len() {
+            let left_ok = i == 0 || dists[i].1 <= dists[i - 1].1;
+            let right_ok = i + 1 == dists.len() || dists[i].1 <= dists[i + 1].1;
+            if left_ok && right_ok {
+                seeds.push(dists[i]);
+            }
+        }
+        seeds.sort_by(|a, b| a.1.total_cmp(&b.1));
+        seeds.truncate(4);
+
+        for (mut u, _) in seeds {
+            let mut cur_pt = self.evaluate(u);
+            let mut cur_d2 = cur_pt.distance_squared(query);
+            for _ in 0..16 {
+                let ders = self.evaluate_derivatives(u, 2);
+                let diff = ders[0] - query;
+                let f = diff.dot(ders[1]);
+                let fp = ders[1].length_squared() + diff.dot(ders[2]);
+                if f.abs() < 1e-12 || fp.abs() < 1e-14 {
+                    break;
+                }
+                let mut step = -f / fp;
+                let max_step = (u1 - u0) * 0.25;
+                if step.abs() > max_step {
+                    step = step.signum() * max_step;
+                }
+                let mut accepted = false;
+                for _ in 0..6 {
+                    let next_u = (u + step).clamp(u0, u1);
+                    let next_pt = self.evaluate(next_u);
+                    let next_d2 = next_pt.distance_squared(query);
+                    if next_d2 <= cur_d2 + 1e-15 {
+                        let moved = (next_u - u).abs();
+                        u = next_u;
+                        cur_pt = next_pt;
+                        cur_d2 = next_d2;
+                        accepted = true;
+                        if moved < 1e-12 {
+                            break;
+                        }
+                        break;
+                    }
+                    step *= 0.5;
+                }
+                if !accepted || step.abs() < 1e-12 {
+                    break;
+                }
+            }
+            if cur_d2 < best_d2 {
+                best_d2 = cur_d2;
+                best_u = u;
+                best_pt = cur_pt;
+            }
+        }
+
+        (best_u, best_pt, best_d2.sqrt())
+    }
+
+    pub fn is_rational(&self) -> bool {
+        self.control_points
+            .iter()
+            .any(|cp| (cp.weight - 1.0).abs() > 1e-9)
+    }
+
+    pub fn reverse(&self) -> Self {
+        let (u0, u1) = self.domain();
+        let control_points: Vec<ControlPoint> = self.control_points.iter().copied().rev().collect();
+        let knots: Vec<f64> = self.knots.iter().rev().map(|&k| u0 + u1 - k).collect();
+        Self {
+            degree: self.degree,
+            knots,
+            control_points,
+        }
+    }
+
+    pub fn reparameterize(&self, new_u0: f64, new_u1: f64) -> Self {
+        let (u0, u1) = self.domain();
+        let span = u1 - u0;
+        let new_span = new_u1 - new_u0;
+        if span.abs() < PARAM_EPSILON || new_span <= PARAM_EPSILON {
+            return self.clone();
+        }
+        let scale = new_span / span;
+        let knots = self
+            .knots
+            .iter()
+            .map(|&k| new_u0 + (k - u0) * scale)
+            .collect();
+        Self {
+            degree: self.degree,
+            knots,
+            control_points: self.control_points.clone(),
+        }
+    }
+
+    /// Insert knot `u` `times` times using Boehm's algorithm (A5.1) in 4D homogeneous space.
+    pub fn insert_knot(&self, mut u: f64, times: usize) -> Result<Self, GeomError> {
+        if times == 0 {
+            return Ok(self.clone());
+        }
+        let (u0, u1) = self.domain();
+        if u <= u0 + 1e-11 || u >= u1 - 1e-11 {
+            return Ok(self.clone());
+        }
+        for &k in &self.knots {
+            if (k - u).abs() <= 1e-11 {
+                u = k;
+                break;
+            }
+        }
+
+        let p = self.degree;
+        let n = self.control_points.len() - 1;
+        let s = self.knots.iter().filter(|&&k| (k - u).abs() <= 1e-11).count();
+        let r = times.min(p.saturating_sub(s));
+        if r == 0 {
+            return Ok(self.clone());
+        }
+
+        let k = self
+            .knots
+            .iter()
+            .enumerate()
+            .take(n + 1)
+            .filter(|&(_, &kv)| kv <= u + 1e-11)
+            .map(|(idx, _)| idx)
+            .last()
+            .unwrap_or(p)
+            .max(p);
+
+        let mut uq = Vec::with_capacity(self.knots.len() + r);
+        uq.extend_from_slice(&self.knots[..=k]);
+        uq.extend(std::iter::repeat_n(u, r));
+        uq.extend_from_slice(&self.knots[(k + 1)..]);
+
+        let pw: Vec<DVec4> = self
+            .control_points
+            .iter()
+            .map(|cp| cp.to_homogeneous())
+            .collect();
+        let mut qw = vec![DVec4::ZERO; n + 1 + r];
+        let mut rw = vec![DVec4::ZERO; p - s + 1];
+
+        for i in 0..=(k - p) {
+            qw[i] = pw[i];
+        }
+        for i in (k - s)..=n {
+            qw[i + r] = pw[i];
+        }
+        for i in 0..=(p - s) {
+            rw[i] = pw[k - p + i];
+        }
+
+        let mut l_last = 0;
+        for j in 1..=r {
+            let l = k - p + j;
+            l_last = l;
+            for i in 0..=(p - j - s) {
+                let denom = self.knots[i + k + 1] - self.knots[l + i];
+                let alpha = if denom.abs() < PARAM_EPSILON {
+                    0.0
+                } else {
+                    (u - self.knots[l + i]) / denom
+                };
+                rw[i] = rw[i + 1] * alpha + rw[i] * (1.0 - alpha);
+            }
+            qw[l] = rw[0];
+            qw[k + r - j - s] = rw[p - j - s];
+        }
+        for i in (l_last + 1)..(k - s) {
+            qw[i] = rw[i - l_last];
+        }
+
+        let cps = qw
+            .into_iter()
+            .map(|h| {
+                let w = h.w;
+                let pos = if w.abs() > PARAM_EPSILON {
+                    h.truncate() / w
+                } else {
+                    h.truncate()
+                };
+                ControlPoint::new(pos, w.max(1e-12))
+            })
+            .collect();
+
+        Self::new(p, uq, cps)
+    }
+
+    pub fn refine_knots(&self, knots_to_insert: &[f64]) -> Result<Self, GeomError> {
+        let mut cur = self.clone();
+        for &u in knots_to_insert {
+            cur = cur.insert_knot(u, 1)?;
+        }
+        Ok(cur)
+    }
+
+    /// Split the curve at interior parameter `u`, returning `Some((left, right))`.
+    pub fn split_at(&self, mut u: f64) -> Option<(Self, Self)> {
+        let (u0, u1) = self.domain();
+        if u <= u0 + 1e-9 || u >= u1 - 1e-9 {
+            return None;
+        }
+        for &k in &self.knots {
+            if (k - u).abs() <= 1e-11 {
+                u = k;
+                break;
+            }
+        }
+        let p = self.degree;
+        let s = self.knots.iter().filter(|&&k| (k - u).abs() <= 1e-11).count();
+        let refined = self.insert_knot(u, p.saturating_sub(s)).ok()?;
+
+        let first_k = refined
+            .knots
+            .iter()
+            .enumerate()
+            .skip(p)
+            .find(|&(_, &kv)| (kv - u).abs() <= 1e-11)
+            .map(|(idx, _)| idx)?;
+
+        if first_k == 0 || first_k > refined.control_points.len() {
+            return None;
+        }
+
+        let left_cps = refined.control_points[..first_k].to_vec();
+        let mut left_knots = refined.knots[..(first_k + p)].to_vec();
+        left_knots.push(u);
+        let left = Self::new(p, left_knots, left_cps).ok()?;
+
+        let right_cps = refined.control_points[(first_k - 1)..].to_vec();
+        let mut right_knots = Vec::with_capacity(1 + refined.knots.len() - first_k);
+        right_knots.push(u);
+        right_knots.extend_from_slice(&refined.knots[first_k..]);
+        let right = Self::new(p, right_knots, right_cps).ok()?;
+
+        Some((left, right))
+    }
+
+    /// Split the curve into exact single-span rational Bézier segments (`p + 1` control points each).
+    pub fn decompose_to_bezier_spans(&self) -> Vec<Self> {
+        let (u0, u1) = self.domain();
+        let mut interior = Vec::new();
+        for &k in &self.knots {
+            if k > u0 + 1e-9 && k < u1 - 1e-9 {
+                if interior.last().is_none_or(|&prev: &f64| (k - prev).abs() > 1e-9) {
+                    interior.push(k);
+                }
+            }
+        }
+        let mut spans = Vec::with_capacity(interior.len() + 1);
+        let mut cur = self.clone();
+        for u in interior {
+            if let Some((left, right)) = cur.split_at(u) {
+                spans.push(left);
+                cur = right;
+            }
+        }
+        spans.push(cur);
+        spans
+    }
+
+    /// Elevate curve degree by `delta` while preserving exact geometry and parameterization.
+    pub fn elevate_degree(&self, delta: usize) -> Result<Self, GeomError> {
+        if delta == 0 {
+            return Ok(self.clone());
+        }
+        let mut spans = self.decompose_to_bezier_spans();
+        for span in &mut spans {
+            for _ in 0..delta {
+                let p = span.degree;
+                let pw: Vec<DVec4> = span.control_points.iter().map(|cp| cp.to_homogeneous()).collect();
+                let mut qw = Vec::with_capacity(p + 2);
+                qw.push(pw[0]);
+                for i in 1..=p {
+                    let alpha = i as f64 / (p + 1) as f64;
+                    qw.push(pw[i - 1] * alpha + pw[i] * (1.0 - alpha));
+                }
+                qw.push(pw[p]);
+                let cps = qw
+                    .into_iter()
+                    .map(|h| {
+                        let w = h.w;
+                        ControlPoint::new(h.truncate() / w, w)
+                    })
+                    .collect();
+                let (s0, s1) = span.domain();
+                let mut knots = Vec::with_capacity(2 * (p + 2));
+                knots.extend(std::iter::repeat_n(s0, p + 2));
+                knots.extend(std::iter::repeat_n(s1, p + 2));
+                *span = Self::new(p + 1, knots, cps)?;
+            }
+        }
+
+        let new_p = self.degree + delta;
+        let (u0, u1) = self.domain();
+        let mut cps = Vec::new();
+        let mut knots = Vec::new();
+        knots.extend(std::iter::repeat_n(u0, new_p + 1));
+        for (idx, span) in spans.iter().enumerate() {
+            if idx == 0 {
+                cps.extend_from_slice(&span.control_points);
+            } else {
+                let (s0, _) = span.domain();
+                knots.extend(std::iter::repeat_n(s0, new_p));
+                cps.extend_from_slice(&span.control_points[1..]);
+            }
+        }
+        knots.extend(std::iter::repeat_n(u1, new_p + 1));
+        Self::new(new_p, knots, cps)
+    }
+
+    /// Collect parameter values of kinks (multiplicity >= degree interior knots or tangent jumps > `angle_tol_rad`).
+    pub fn kink_parameters(&self, angle_tol_rad: f64) -> Vec<f64> {
+        let (u0, u1) = self.domain();
+        let mut kinks = Vec::new();
+        let mut i = self.degree + 1;
+        while i < self.control_points.len() {
+            let u = self.knots[i];
+            let mut mult = 1;
+            while i + mult < self.control_points.len()
+                && (self.knots[i + mult] - u).abs() <= 1e-11
+            {
+                mult += 1;
+            }
+            if u > u0 + 1e-9 && u < u1 - 1e-9 && mult >= self.degree {
+                let eps = ((u1 - u0) * 1e-6).max(1e-8);
+                let (_, t_left) = self.evaluate_derivative((u - eps).max(u0));
+                let (_, t_right) = self.evaluate_derivative((u + eps).min(u1));
+                let tl = t_left.normalize_or_zero();
+                let tr = t_right.normalize_or_zero();
+                if tl.length_squared() < 1e-12
+                    || tr.length_squared() < 1e-12
+                    || tl.angle_between(tr) > angle_tol_rad
+                    || self.degree == 1
+                {
+                    kinks.push(u);
+                }
+            }
+            i += mult;
+        }
+        kinks
     }
 
     /// Uniformly sample `segments` intervals into `segments + 1` points.
@@ -396,6 +970,220 @@ impl NurbsCurve {
         Self::arc_from_center(&plane, center, radius, 0.0, sweep)
     }
 
+    /// Build a NURBS control-point curve (`degree` clamped to `[1, points.len() - 1]`).
+    pub fn from_control_points(
+        points: &[DVec3],
+        degree: usize,
+        closed: bool,
+    ) -> Result<Self, GeomError> {
+        if points.len() < 2 {
+            return Err(GeomError::InsufficientControlPoints {
+                degree: 1,
+                found: points.len(),
+                needed: 2,
+            });
+        }
+        if closed && points.len() >= 3 && degree >= 2 {
+            let mut clean: Vec<DVec3> = Vec::with_capacity(points.len());
+            for &p in points {
+                if clean.last().is_none_or(|prev| prev.distance(p) > 1e-9) {
+                    clean.push(p);
+                }
+            }
+            if clean.len() >= 3 && clean.first().unwrap().distance(*clean.last().unwrap()) < 1e-9 {
+                clean.pop();
+            }
+            if clean.len() >= 3 {
+                let m = clean.len();
+                let p = degree.clamp(2, m);
+                // Uniform periodic unclamped spline over [-pad .. m + pad], then clamped to [0, 1]
+                let n_ext = m + p + 2;
+                let mut cps = Vec::with_capacity(n_ext);
+                for i in 0..n_ext {
+                    cps.push(ControlPoint::unweighted(clean[i % m]));
+                }
+                let knot_len = n_ext + p + 1;
+                let mut knots = Vec::with_capacity(knot_len);
+                let step = 1.0 / m as f64;
+                for j in 0..knot_len {
+                    knots.push((j as isize - p as isize - 1) as f64 * step);
+                }
+                let unclamped = Self::new(p, knots, cps)?;
+                let (_, rest) = unclamped.split_at(0.0).unwrap_or((unclamped.clone(), unclamped));
+                let (closed_curve, _) = rest.split_at(1.0).unwrap_or((rest.clone(), rest));
+                return Ok(closed_curve);
+            }
+        }
+
+        let mut pts = points.to_vec();
+        if closed && pts.first().unwrap().distance(*pts.last().unwrap()) > 1e-9 {
+            pts.push(pts[0]);
+        }
+        let n = pts.len();
+        let p = degree.clamp(1, n - 1);
+        let knots = uniform_clamped_knots(n, p);
+        let cps = pts.into_iter().map(ControlPoint::unweighted).collect();
+        Self::new(p, knots, cps)
+    }
+
+    /// Global NURBS interpolation through `points` (Piegl & Tiller A9.1, centripetal parameterization).
+    pub fn interpolate(points: &[DVec3], degree: usize, closed: bool) -> Result<Self, GeomError> {
+        if points.len() < 2 {
+            return Err(GeomError::InsufficientControlPoints {
+                degree: 1,
+                found: points.len(),
+                needed: 2,
+            });
+        }
+        let mut pts = Vec::with_capacity(points.len());
+        for &p in points {
+            if pts.last().is_none_or(|prev: &DVec3| prev.distance(p) > 1e-9) {
+                pts.push(p);
+            }
+        }
+        if closed && pts.len() >= 3 && pts.first().unwrap().distance(*pts.last().unwrap()) < 1e-9 {
+            pts.pop();
+        }
+        if pts.len() < 2 {
+            return Err(GeomError::Degenerate("interpolation points must be distinct"));
+        }
+
+        if closed && pts.len() >= 3 {
+            let p = degree.clamp(1, pts.len());
+            if p == 1 {
+                pts.push(pts[0]);
+                return Self::polyline(&pts);
+            }
+            return interpolate_closed_periodic(&pts, p);
+        }
+
+        let mut open_pts = pts;
+        if closed {
+            open_pts.push(open_pts[0]);
+        }
+        let m = open_pts.len() - 1;
+        let p = degree.clamp(1, m);
+        if p == 1 {
+            return Self::polyline(&open_pts);
+        }
+
+        let mut params = vec![0.0_f64; m + 1];
+        let mut total = 0.0;
+        for i in 0..m {
+            let d = open_pts[i].distance(open_pts[i + 1]).sqrt();
+            total += d;
+            params[i + 1] = total;
+        }
+        if total < 1e-12 {
+            return Err(GeomError::Degenerate("interpolation points are coincident"));
+        }
+        for t in &mut params {
+            *t /= total;
+        }
+        params[m] = 1.0;
+
+        let mut knots = Vec::with_capacity(m + p + 2);
+        knots.extend(std::iter::repeat_n(0.0, p + 1));
+        for j in 1..=(m - p) {
+            let sum: f64 = params[j..(j + p)].iter().sum();
+            knots.push(sum / p as f64);
+        }
+        knots.extend(std::iter::repeat_n(1.0, p + 1));
+
+        let n_cp = m + 1;
+        let mut mat = vec![vec![0.0; n_cp]; n_cp];
+        for (k, &uk) in params.iter().enumerate() {
+            let span = find_span(m, p, uk, &knots);
+            let basis = basis_functions(span, uk, p, &knots);
+            for (i, &b) in basis.iter().enumerate() {
+                mat[k][span - p + i] = b;
+            }
+        }
+
+        let solved = solve_linear_system_vec3(&mat, &open_pts)
+            .ok_or(GeomError::Degenerate("singular interpolation matrix"))?;
+        let cps = solved.into_iter().map(ControlPoint::unweighted).collect();
+        Self::new(p, knots, cps)
+    }
+
+    /// Composite cubic NURBS curve built from Bézier handle segments `(p0, h_out, h_in, p1)`.
+    pub fn handle_curve(segments: &[(DVec3, DVec3, DVec3, DVec3)]) -> Result<Self, GeomError> {
+        if segments.is_empty() {
+            return Err(GeomError::Degenerate("handle curve requires at least 1 segment"));
+        }
+        let mut curves = Vec::with_capacity(segments.len());
+        for &(p0, h0, h1, p1) in segments {
+            let cps = vec![
+                ControlPoint::unweighted(p0),
+                ControlPoint::unweighted(h0),
+                ControlPoint::unweighted(h1),
+                ControlPoint::unweighted(p1),
+            ];
+            let knots = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+            curves.push(Self::new(3, knots, cps)?);
+        }
+        let mut acc = curves.remove(0);
+        for seg in curves {
+            acc = join_two_exact(&acc, &seg)?;
+        }
+        Ok(acc)
+    }
+
+    /// Exact rational quadratic conic section from `p0` to `p2` with shoulder parameter `rho in (0.01, 0.99)`.
+    pub fn conic(p0: DVec3, apex: DVec3, p2: DVec3, rho: f64) -> Result<Self, GeomError> {
+        if !rho.is_finite() || rho <= 0.01 || rho >= 0.99 {
+            return Err(GeomError::Degenerate("conic rho must lie in (0.01, 0.99)"));
+        }
+        if (apex - p0).cross(p2 - apex).length() < 1e-8 {
+            return Err(GeomError::Degenerate("conic control points are collinear"));
+        }
+        let w1 = rho / (1.0 - rho);
+        let cps = vec![
+            ControlPoint::new(p0, 1.0),
+            ControlPoint::new(apex, w1),
+            ControlPoint::new(p2, 1.0),
+        ];
+        Self::new(2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], cps)
+    }
+
+    /// Interpolated cubic NURBS helix or spiral around `(axis_start, axis_end)`.
+    pub fn helix(
+        axis_start: DVec3,
+        axis_end: DVec3,
+        start_pt: DVec3,
+        turns: f64,
+        end_radius: Option<f64>,
+    ) -> Result<Self, GeomError> {
+        let axis = axis_end - axis_start;
+        let height = axis.length();
+        if height < 1e-6 || !turns.is_finite() || turns.abs() < 0.05 {
+            return Err(GeomError::Degenerate("helix requires non-zero axis and turns"));
+        }
+        let z_dir = axis / height;
+        let radial_vec = start_pt - axis_start;
+        let rad_proj = radial_vec - z_dir * radial_vec.dot(z_dir);
+        let r0 = rad_proj.length();
+        if r0 < 1e-6 {
+            return Err(GeomError::Degenerate("helix start point lies on axis"));
+        }
+        let x_dir = rad_proj / r0;
+        let y_dir = z_dir.cross(x_dir).normalize();
+        let r1 = end_radius.unwrap_or(r0).max(1e-4);
+
+        let samples = ((turns.abs() * 16.0).ceil() as usize).max(16);
+        let mut pts = Vec::with_capacity(samples + 1);
+        for i in 0..=samples {
+            let t = i as f64 / samples as f64;
+            let angle = std::f64::consts::TAU * turns * t;
+            let r = r0 + (r1 - r0) * t;
+            let p = axis_start
+                + z_dir * (height * t)
+                + (x_dir * angle.cos() + y_dir * angle.sin()) * r;
+            pts.push(p);
+        }
+        Self::interpolate(&pts, 3, false)
+    }
+
     pub fn is_closed(&self) -> bool {
         let (u0, u1) = self.domain();
         self.evaluate(u0).distance(self.evaluate(u1)) < 1e-4
@@ -429,17 +1217,56 @@ impl NurbsCurve {
         0.5 * area2.abs()
     }
 
-    /// Explode a degree-1 polyline into individual line segments.
+    /// Explode a polyline into segments, or a multi-segment NURBS curve at tangent/curvature discontinuities.
     pub fn explode_segments(&self) -> Vec<NurbsCurve> {
         if self.degree == 1 && self.control_points.len() > 2 {
-            self.control_points
+            return self
+                .control_points
                 .windows(2)
                 .filter(|w| w[0].position.distance(w[1].position) > 1e-9)
                 .map(|w| Self::line(w[0].position, w[1].position))
-                .collect()
-        } else {
-            vec![self.clone()]
+                .collect();
         }
+        let (u0, u1) = self.domain();
+        let eps = ((u1 - u0) * 1e-5).max(1e-7);
+        let mut splits = Vec::new();
+        let mut i = self.degree + 1;
+        while i < self.control_points.len() {
+            let u = self.knots[i];
+            let mut mult = 1;
+            while i + mult < self.control_points.len()
+                && (self.knots[i + mult] - u).abs() <= 1e-11
+            {
+                mult += 1;
+            }
+            if u > u0 + 1e-9 && u < u1 - 1e-9 && mult >= self.degree {
+                let ul = (u - eps).max(u0);
+                let ur = (u + eps).min(u1);
+                let (_, tl) = self.evaluate_derivative(ul);
+                let (_, tr) = self.evaluate_derivative(ur);
+                let (kl, _) = self.curvature_at(ul);
+                let (kr, _) = self.curvature_at(ur);
+                let tangent_jump = tl.normalize_or_zero().angle_between(tr.normalize_or_zero()) > 1e-3;
+                let curv_jump = kl.distance(kr) > 1e-3;
+                if tangent_jump || curv_jump {
+                    splits.push(u);
+                }
+            }
+            i += mult;
+        }
+        if splits.is_empty() {
+            return vec![self.clone()];
+        }
+        let mut out = Vec::with_capacity(splits.len() + 1);
+        let mut cur = self.clone();
+        for u in splits {
+            if let Some((left, right)) = cur.split_at(u) {
+                out.push(left);
+                cur = right;
+            }
+        }
+        out.push(cur);
+        out
     }
 
     /// Offset this curve in `plane` by `distance` toward the side of `side_pt`.
@@ -449,154 +1276,68 @@ impl NurbsCurve {
         distance: f64,
         side_pt: DVec3,
     ) -> Result<Self, GeomError> {
-        if !distance.is_finite() || distance.abs() < 1e-6 {
-            return Err(GeomError::Degenerate("offset distance must be non-zero"));
-        }
-        let mut pts: Vec<DVec3> = if self.degree == 1 {
-            self.control_points.iter().map(|c| c.position).collect()
-        } else {
-            self.sample_polyline(48)
-        };
-        if pts.len() < 2 {
-            return Err(GeomError::Degenerate("curve too short to offset"));
-        }
-        let closed = pts.first().unwrap().distance(*pts.last().unwrap()) < 1e-4;
-        if closed {
-            pts.pop();
-        }
-        if pts.len() < 2 {
-            return Err(GeomError::Degenerate("curve too short to offset"));
-        }
-
-        // Find closest segment to `side_pt` to choose offset side sign
-        let mut best_d = f64::INFINITY;
-        let mut sign = 1.0_f64;
-        let seg_count = if closed { pts.len() } else { pts.len() - 1 };
-        for i in 0..seg_count {
-            let a = pts[i];
-            let b = pts[(i + 1) % pts.len()];
-            let ab = b - a;
-            let len_sq = ab.length_squared();
-            if len_sq < 1e-12 {
-                continue;
-            }
-            let t = ((side_pt - a).dot(ab) / len_sq).clamp(0.0, 1.0);
-            let proj = a + ab * t;
-            let d = side_pt.distance(proj);
-            if d < best_d {
-                best_d = d;
-                let left = plane.z_axis.cross(ab).normalize_or_zero();
-                sign = if (side_pt - proj).dot(left) >= 0.0 { 1.0 } else { -1.0 };
-            }
-        }
-        let off = distance.abs() * sign;
-
-        let seg_normal = |a: DVec3, b: DVec3| -> DVec3 {
-            plane.z_axis.cross(b - a).normalize_or_zero()
-        };
-
-        let mut out = Vec::with_capacity(pts.len() + 1);
-        for i in 0..pts.len() {
-            let p = pts[i];
-            let n = if closed {
-                let prev = pts[(i + pts.len() - 1) % pts.len()];
-                let next = pts[(i + 1) % pts.len()];
-                let n0 = seg_normal(prev, p);
-                let n1 = seg_normal(p, next);
-                let bis = (n0 + n1).normalize_or_zero();
-                let denom = bis.dot(n0);
-                if denom.abs() > 0.25 {
-                    bis * (off / denom)
-                } else {
-                    n1 * off
-                }
-            } else if i == 0 {
-                seg_normal(p, pts[1]) * off
-            } else if i + 1 == pts.len() {
-                seg_normal(pts[i - 1], p) * off
-            } else {
-                let n0 = seg_normal(pts[i - 1], p);
-                let n1 = seg_normal(p, pts[i + 1]);
-                let bis = (n0 + n1).normalize_or_zero();
-                let denom = bis.dot(n0);
-                if denom.abs() > 0.25 {
-                    bis * (off / denom)
-                } else {
-                    n1 * off
-                }
-            };
-            out.push(p + n);
-        }
-        if closed {
-            out.push(out[0]);
-        }
-        Self::polyline(&out)
+        offset_nurbs_curve_in_plane(self, plane, distance, side_pt, OffsetCornerStyle::Sharp)
     }
 
-    /// Join contiguous curves whose endpoints match within `tol`.
+    /// Join contiguous curves whose endpoints match within `tol`, preserving exact NURBS geometry.
     pub fn join_curves(curves: &[NurbsCurve], tol: f64) -> Vec<NurbsCurve> {
-        let mut chains: Vec<Vec<DVec3>> = curves
+        let mut pool: Vec<NurbsCurve> = curves
             .iter()
-            .map(|c| {
-                if c.degree == 1 {
-                    c.control_points.iter().map(|cp| cp.position).collect()
-                } else {
-                    c.sample_polyline(32)
-                }
-            })
-            .filter(|pts| pts.len() >= 2)
+            .filter(|c| c.control_points.len() >= 2)
+            .cloned()
             .collect();
 
         let mut result = Vec::new();
-        while !chains.is_empty() {
-            let mut cur = chains.remove(0);
+        while !pool.is_empty() {
+            let mut cur = pool.remove(0);
             loop {
-                let mut merged = false;
-                let head = *cur.first().unwrap();
-                let tail = *cur.last().unwrap();
-                if head.distance(tail) <= tol && cur.len() > 2 {
+                if cur.is_closed() {
                     break;
                 }
-                let mut i = 0;
-                while i < chains.len() {
-                    let c_head = *chains[i].first().unwrap();
-                    let c_tail = *chains[i].last().unwrap();
+                let (u0, u1) = cur.domain();
+                let head = cur.evaluate(u0);
+                let tail = cur.evaluate(u1);
+                let mut merged = false;
+
+                for i in 0..pool.len() {
+                    let (cu0, cu1) = pool[i].domain();
+                    let c_head = pool[i].evaluate(cu0);
+                    let c_tail = pool[i].evaluate(cu1);
                     if tail.distance(c_head) <= tol {
-                        let mut next = chains.remove(i);
-                        cur.extend(next.drain(1..));
-                        merged = true;
-                        break;
+                        let next = pool.remove(i);
+                        if let Ok(joined) = join_two_exact(&cur, &next) {
+                            cur = joined;
+                            merged = true;
+                            break;
+                        }
                     } else if tail.distance(c_tail) <= tol {
-                        let mut next = chains.remove(i);
-                        next.reverse();
-                        cur.extend(next.drain(1..));
-                        merged = true;
-                        break;
+                        let next = pool.remove(i).reverse();
+                        if let Ok(joined) = join_two_exact(&cur, &next) {
+                            cur = joined;
+                            merged = true;
+                            break;
+                        }
                     } else if head.distance(c_tail) <= tol {
-                        let mut next = chains.remove(i);
-                        next.pop();
-                        next.extend(cur);
-                        cur = next;
-                        merged = true;
-                        break;
+                        let next = pool.remove(i);
+                        if let Ok(joined) = join_two_exact(&next, &cur) {
+                            cur = joined;
+                            merged = true;
+                            break;
+                        }
                     } else if head.distance(c_head) <= tol {
-                        let mut next = chains.remove(i);
-                        next.reverse();
-                        next.pop();
-                        next.extend(cur);
-                        cur = next;
-                        merged = true;
-                        break;
+                        let next = pool.remove(i).reverse();
+                        if let Ok(joined) = join_two_exact(&next, &cur) {
+                            cur = joined;
+                            merged = true;
+                            break;
+                        }
                     }
-                    i += 1;
                 }
                 if !merged {
                     break;
                 }
             }
-            if let Ok(poly) = Self::polyline(&cur) {
-                result.push(poly);
-            }
+            result.push(cur);
         }
         result
     }
@@ -784,6 +1525,108 @@ pub(crate) fn basis_function_derivatives(
     }
 
     ders
+}
+
+pub(crate) fn uniform_clamped_knots(num_cps: usize, degree: usize) -> Vec<f64> {
+    let mut knots = Vec::with_capacity(num_cps + degree + 1);
+    knots.extend(std::iter::repeat_n(0.0, degree + 1));
+    let interior = num_cps.saturating_sub(degree + 1);
+    for i in 1..=interior {
+        knots.push(i as f64 / (interior + 1) as f64);
+    }
+    knots.extend(std::iter::repeat_n(1.0, degree + 1));
+    knots
+}
+
+fn binomial_coeff(n: usize, k: usize) -> f64 {
+    let mut res = 1.0_f64;
+    for i in 1..=k.min(n - k) {
+        res = res * (n - i + 1) as f64 / i as f64;
+    }
+    res
+}
+
+fn fallback_frame_axes(t: DVec3) -> (DVec3, DVec3) {
+    let ref_v = if t.z.abs() < 0.9 { DVec3::Z } else { DVec3::X };
+    let n = ref_v.cross(t).normalize();
+    let b = t.cross(n).normalize();
+    (n, b)
+}
+
+fn interpolate_closed_periodic(pts: &[DVec3], degree: usize) -> Result<NurbsCurve, GeomError> {
+    let m = pts.len();
+    let p = degree.clamp(2, m);
+
+    let mut ts = vec![0.0_f64; m + 1];
+    let mut total = 0.0;
+    for i in 0..m {
+        total += pts[i].distance(pts[(i + 1) % m]).sqrt();
+        ts[i + 1] = total;
+    }
+    if total < 1e-12 {
+        return Err(GeomError::Degenerate("closed interpolation points are coincident"));
+    }
+    for t in &mut ts {
+        *t /= total;
+    }
+    ts[m] = 1.0;
+
+    let periodic_t = |idx: isize| -> f64 {
+        let m_i = m as isize;
+        let q = idx.div_euclid(m_i);
+        let r = idx.rem_euclid(m_i) as usize;
+        ts[r] + q as f64
+    };
+
+    // Knot sequence tau: for odd degree knots coincide with ts; for even degree knots sit at midpoints
+    let periodic_tau = |idx: isize| -> f64 {
+        if p % 2 == 1 {
+            periodic_t(idx)
+        } else {
+            0.5 * (periodic_t(idx - 1) + periodic_t(idx))
+        }
+    };
+
+    // Build padded unclamped B-spline covering [-1, m+1] so [0.0, 1.0] is strictly interior
+    let pad = 1_usize;
+    let n_ext = m + p + 2 * pad;
+    let knot_len = n_ext + p + 1;
+    let mut knots = Vec::with_capacity(knot_len);
+    for j in 0..knot_len {
+        let idx = j as isize - (p + pad) as isize;
+        knots.push(periodic_tau(idx));
+    }
+
+    // Build m x m collocation matrix by evaluating wrapped basis functions at t_0..t_{m-1}
+    let mut mat = vec![vec![0.0_f64; m]; m];
+    for row in 0..m {
+        let u = ts[row];
+        let span = find_span(n_ext - 1, p, u, &knots);
+        let basis = basis_functions(span, u, p, &knots);
+        for (i, &b) in basis.iter().enumerate() {
+            let ext_idx = span - p + i;
+            let col = (ext_idx as isize - pad as isize).rem_euclid(m as isize) as usize;
+            mat[row][col] += b;
+        }
+    }
+
+    let q_cps = solve_linear_system_vec3(&mat, pts)
+        .ok_or(GeomError::Degenerate("singular closed interpolation matrix"))?;
+
+    let mut ext_cps = Vec::with_capacity(n_ext);
+    for i in 0..n_ext {
+        let idx = (i as isize - pad as isize).rem_euclid(m as isize) as usize;
+        ext_cps.push(ControlPoint::unweighted(q_cps[idx]));
+    }
+
+    let unclamped = NurbsCurve::new(p, knots, ext_cps)?;
+    let (_, rest) = unclamped
+        .split_at(0.0)
+        .ok_or(GeomError::Degenerate("failed to clamp periodic start"))?;
+    let (closed_curve, _) = rest
+        .split_at(1.0)
+        .ok_or(GeomError::Degenerate("failed to clamp periodic end"))?;
+    Ok(closed_curve)
 }
 
 #[cfg(test)]

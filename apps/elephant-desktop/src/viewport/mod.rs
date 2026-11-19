@@ -519,6 +519,54 @@ impl ElephantApp {
                     }
                 }
 
+                // Draw CurvatureGraph combs for tracked curves
+                if !self.curvature_graph_objects.is_empty() {
+                    for &oid in &self.curvature_graph_objects {
+                        let Some(obj) = self.doc.objects.get(oid) else {
+                            continue;
+                        };
+                        if !obj.visible {
+                            continue;
+                        }
+                        let Geometry::Curve(curve) = &obj.geometry else {
+                            continue;
+                        };
+                        let samples = curve.curvature_samples(72);
+                        let max_k = samples
+                            .iter()
+                            .map(|s| s.curvature)
+                            .fold(0.0_f64, f64::max);
+                        if max_k <= 1e-10 {
+                            continue;
+                        }
+                        let diag = obj.aabb.size().length().max(1.0);
+                        let factor = (diag * 0.18 / max_k) * self.curvature_graph_scale;
+                        let mut envelope = Vec::with_capacity(samples.len());
+                        for s in &samples {
+                            let tip_w = s.point - s.curvature_vec * factor;
+                            if let (Some(p_scr), Some(t_scr)) = (
+                                world_to_screen(s.point, &vp_cols, rect),
+                                world_to_screen(tip_w, &vp_cols, rect),
+                            ) {
+                                painter.line_segment(
+                                    [p_scr, t_scr],
+                                    egui::Stroke::new(
+                                        1.0_f32,
+                                        egui::Color32::from_rgb(245, 115, 95),
+                                    ),
+                                );
+                                envelope.push(t_scr);
+                            }
+                        }
+                        if envelope.len() >= 2 {
+                            painter.add(egui::Shape::line(
+                                envelope,
+                                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(80, 225, 245)),
+                            ));
+                        }
+                    }
+                }
+
                 // Draw Annotations (Dimensions, Text, TextDots, Leaders)
                 for ann in &self.doc.annotations {
                     if let Some(layer) = self.doc.layers.get(ann.layer_id) {
