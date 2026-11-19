@@ -1,4 +1,7 @@
-use cad_doc::{AnnotationItem, AnnotationKind, Document, HistoryOp, HistoryRecord, Layer};
+use cad_doc::{
+    AnnotationItem, AnnotationKind, ClippingPlane, Document, GdtSpec, HistoryOp, HistoryRecord,
+    Layer, LayoutSheet, MaterialProps,
+};
 use cad_geom::{DVec3, Geometry, Tolerances, UnitSystem};
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +42,8 @@ struct SavedObject {
     visible: bool,
     #[serde(default)]
     group_id: Option<u64>,
+    #[serde(default)]
+    material: Option<MaterialProps>,
     geometry: Geometry,
 }
 
@@ -56,6 +61,8 @@ struct SavedAnnotation {
     p2: Option<DVec3>,
     #[serde(default)]
     offset_pt: Option<DVec3>,
+    #[serde(default)]
+    gdt: Option<GdtSpec>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,6 +84,10 @@ struct ElephantProject {
     annotations: Vec<SavedAnnotation>,
     #[serde(default)]
     history_records: Vec<SavedHistoryRecord>,
+    #[serde(default)]
+    clipping_planes: Vec<ClippingPlane>,
+    #[serde(default)]
+    layouts: Vec<LayoutSheet>,
     #[serde(default)]
     metadata: ProjectMetadata,
 }
@@ -120,6 +131,7 @@ pub fn save_project_with_meta(
                 color: obj.color,
                 visible: obj.visible,
                 group_id: obj.group_id,
+                material: obj.material,
                 geometry: obj.geometry.clone(),
             }
         })
@@ -142,6 +154,7 @@ pub fn save_project_with_meta(
                 p1: ann.p1,
                 p2: ann.p2,
                 offset_pt: ann.offset_pt,
+                gdt: ann.gdt.clone(),
             }
         })
         .collect();
@@ -172,6 +185,8 @@ pub fn save_project_with_meta(
         objects,
         annotations,
         history_records,
+        clipping_planes: doc.clipping_planes.clone(),
+        layouts: doc.layouts.clone(),
         metadata: meta.clone(),
     };
     Ok(serde_json::to_string_pretty(&proj)?)
@@ -230,6 +245,7 @@ pub fn load_project_with_meta(input: &str) -> Result<(Document, ProjectMetadata)
                 obj.color = so.color;
                 obj.visible = so.visible;
                 obj.group_id = so.group_id;
+                obj.material = so.material;
                 if let Some(gid) = so.group_id {
                     max_gid = max_gid.max(gid);
                 }
@@ -266,11 +282,15 @@ pub fn load_project_with_meta(input: &str) -> Result<(Document, ProjectMetadata)
                 p1: sa.p1,
                 p2: sa.p2,
                 offset_pt: sa.offset_pt,
+                gdt: sa.gdt,
             });
         }
         doc.active_layer = restore_active;
     }
 
+    doc.clipping_planes = proj.clipping_planes;
+    doc.layouts = proj.layouts;
+    doc.ensure_next_aux_ids();
     doc.last_created.clear();
     doc.clear_history();
     Ok((doc, proj.metadata))
@@ -322,6 +342,7 @@ mod tests {
             p1: None,
             p2: None,
             offset_pt: None,
+            gdt: None,
         });
 
         let meta = ProjectMetadata {
@@ -441,5 +462,50 @@ mod tests {
         );
         let restored_child = loaded.history_records[0].child_id;
         assert!((loaded.objects[restored_child].aabb.center().y - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn roundtrips_materials_clipping_layouts_and_gdt() {
+        use cad_doc::{GdtSymbol, PageSize};
+        let mut doc = Document::new();
+        let oid = doc.add_object("Part", Geometry::Point(DVec3::ZERO));
+        doc.objects[oid].material = Some(MaterialProps {
+            metallic: 0.85,
+            roughness: 0.18,
+            opacity: 1.0,
+        });
+        let cp_id = doc.add_clipping_plane("Section Y", Plane::world_zx());
+        let lid = doc.add_standard_4view_layout(Some("Main Sheet".to_string()), PageSize::A3);
+        doc.add_gdt_annotation(
+            GdtSpec {
+                symbol: GdtSymbol::Perpendicularity,
+                tolerance: 0.04,
+                diameter_zone: false,
+                modifier: None,
+                datums: vec!["A".to_string()],
+            },
+            DVec3::new(1.0, 2.0, 3.0),
+        );
+
+        let json = save_project_json(&doc).unwrap();
+        let loaded = load_project_json(&json).unwrap();
+        let obj = loaded.objects.values().next().unwrap();
+        assert_eq!(
+            obj.material,
+            Some(MaterialProps {
+                metallic: 0.85,
+                roughness: 0.18,
+                opacity: 1.0,
+            })
+        );
+        assert_eq!(loaded.clipping_planes.len(), 1);
+        assert_eq!(loaded.clipping_planes[0].id, cp_id);
+        assert_eq!(loaded.layouts.len(), 1);
+        assert_eq!(loaded.layouts[0].id, lid);
+        assert_eq!(loaded.annotations.len(), 1);
+        assert_eq!(
+            loaded.annotations[0].gdt.as_ref().unwrap().symbol,
+            GdtSymbol::Perpendicularity
+        );
     }
 }

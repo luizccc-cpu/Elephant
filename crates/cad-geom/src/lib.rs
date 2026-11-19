@@ -1,16 +1,29 @@
 //! Clean-room NURBS curves/surfaces, meshes, B-Rep solids, and geometric primitives for Elephant.
 
+pub mod analysis;
 pub mod brep;
 pub mod brep_ops;
 pub mod csg;
 pub mod curve_ops;
+pub mod drafting;
 pub mod error;
 pub mod mesh;
 pub mod nurbs_curve;
 pub mod nurbs_surface;
 pub mod surface_ops;
 
+pub use analysis::{
+    ContinuityGrade, ContinuityTolerances, CurvatureMesh, EdgeContinuitySample, MassProperties,
+    SeamContinuityReport, analyze_brep_edge_continuity, analyze_surface_pair_continuity,
+    combine_mass_properties, compute_geometry_mass_properties, compute_mesh_discrete_curvature,
+    compute_mesh_mass_properties, section_geometry_with_plane, section_mesh_with_plane,
+    tessellate_brep_with_curvature, tessellate_surface_with_curvature,
+};
 pub use brep::{BRep, BRepEdge, BRepFace, BRepVertex, SubObjectRef, TrimLoop2D};
+pub use drafting::{
+    DrawingProjection, Make2DLineKind, Make2DOptions, Make2DResult, Make2DSegment,
+    make_2d_projection,
+};
 pub use brep_ops::{
     FilletSurfaceResult, SurfaceIntersectionCurve, brep_boolean, brep_boolean_split,
     cap_planar_holes, chamfer_brep_edges, fillet_brep_edges, fillet_srf, inset_face,

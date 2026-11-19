@@ -1,20 +1,22 @@
-use cad_doc::{AnnotationItem, AnnotationKind, Document, HistoryOp, ObjectId};
-use cad_geom::{
-    BRep, BooleanOp, BoundaryLock, Continuity, DMat4, DVec3, Geometry, LoftStyle, NurbsCurve,
-    NurbsSurface, PatchBoundaryConstraint, PatchOptions, Plane, SoftTransformFalloff,
-    SubObjectRef, SurfaceEdge, UnitSystem, blend_curves, blend_srf, brep_boolean,
-    brep_boolean_split, cap_planar_holes, chamfer_brep_edges, chamfer_two_curves,
-    closest_edge_pair, edge_srf, extend_srf, fair_curve, fillet_brep_edges, fillet_srf,
-    fillet_two_curves, inset_face, intersect_breps, intersect_curves, intersect_surfaces,
-    loft_nurbs, match_curve, match_srf, mesh_boolean, network_srf, offset_srf,
-    partition_network_curves, patch_srf, project_curve_to_surface, pull_curve_to_surface,
-    push_pull_face, rebuild_adaptive, rebuild_srf, rebuild_uniform, shell_brep,
-    split_face_with_uv_curve, sweep1, sweep2, tangent_edge_chain, trim_face_with_curve,
-    tween_curves, untrim_brep,
+use cad_doc::{
+    AnnotationItem, AnnotationKind, Document, GdtSpec, GdtSymbol, HistoryOp, ObjectId, PageSize,
 };
-use cad_render::DisplayMode;
+use cad_geom::{
+    BRep, BooleanOp, BoundaryLock, Continuity, DMat4, DVec3, DrawingProjection, Geometry,
+    LoftStyle, Make2DLineKind, Make2DOptions, NurbsCurve, NurbsSurface, PatchBoundaryConstraint,
+    PatchOptions, Plane, SoftTransformFalloff, SubObjectRef, SurfaceEdge, UnitSystem, blend_curves,
+    blend_srf, brep_boolean, brep_boolean_split, cap_planar_holes, chamfer_brep_edges,
+    chamfer_two_curves, closest_edge_pair, edge_srf, extend_srf, fair_curve, fillet_brep_edges,
+    fillet_srf, fillet_two_curves, inset_face, intersect_breps, intersect_curves,
+    intersect_surfaces, loft_nurbs, make_2d_projection, match_curve, match_srf, mesh_boolean,
+    network_srf, offset_srf, partition_network_curves, patch_srf, project_curve_to_surface,
+    pull_curve_to_surface, push_pull_face, rebuild_adaptive, rebuild_srf, rebuild_uniform,
+    section_geometry_with_plane, shell_brep, split_face_with_uv_curve, sweep1, sweep2,
+    tangent_edge_chain, trim_face_with_curve, tween_curves, untrim_brep,
+};
+use cad_render::{DisplayMode, SurfaceAnalysisConfig, SurfaceAnalysisMode};
 
-use crate::state::ElephantApp;
+use crate::state::{ElephantApp, InspectorTab, WorkspaceViewMode};
 
 impl ElephantApp {
     pub fn execute_command(&mut self, raw: &str) {
@@ -2047,6 +2049,8 @@ impl ElephantApp {
             "ghosted" => self.set_active_viewport_display_mode(DisplayMode::Ghosted),
             "technical" => self.set_active_viewport_display_mode(DisplayMode::Technical),
             "arctic" => self.set_active_viewport_display_mode(DisplayMode::Arctic),
+            "rendered" | "pbr" => self.set_active_viewport_display_mode(DisplayMode::Rendered),
+            "concept" | "clay" => self.set_active_viewport_display_mode(DisplayMode::Concept),
             "units" => {
                 if args.is_empty() {
                     self.log(format!(
@@ -2091,6 +2095,7 @@ impl ElephantApp {
                     p1: None,
                     p2: None,
                     offset_pt: None,
+                    gdt: None,
                 });
                 self.mark_doc_dirty();
                 self.log(format!("Created Text '{label}' at CPlane origin."));
@@ -2117,6 +2122,15 @@ impl ElephantApp {
                 self.gumball_prompt = None;
                 self.marquee = None;
                 self.reset_phase4_interaction_state();
+                self.surface_analysis = SurfaceAnalysisConfig::default();
+                self.show_naked_edges = false;
+                self.show_non_manifold_edges = false;
+                self.edge_continuity_enabled = false;
+                self.edge_continuity_reports.clear();
+                self.last_mass_properties = None;
+                self.workspace_view = WorkspaceViewMode::Model;
+                self.cached_layout_projections.clear();
+                self.cached_clipping_overlay = None;
                 self.doc = Document::new();
                 self.mark_scene_dirty();
                 self.log("Created new empty document.");
@@ -2759,8 +2773,442 @@ impl ElephantApp {
                     self.radial_menu_pos = Some(eframe::egui::pos2(640.0, 400.0));
                 }
             }
+            "zebra" => {
+                let was_curv = matches!(
+                    self.surface_analysis.mode,
+                    SurfaceAnalysisMode::GaussianCurvature | SurfaceAnalysisMode::MeanCurvature
+                );
+                if self.surface_analysis.mode == SurfaceAnalysisMode::Zebra && args.is_empty() {
+                    self.surface_analysis.mode = SurfaceAnalysisMode::None;
+                    self.log("Zebra analysis: Off.");
+                } else {
+                    if let Some(v) = args.first().and_then(|s| s.parse::<f32>().ok()) {
+                        self.surface_analysis.zebra_stripes = v.clamp(2.0, 30.0);
+                    }
+                    self.surface_analysis.mode = SurfaceAnalysisMode::Zebra;
+                    self.inspector_tab = InspectorTab::Analyze;
+                    self.log("Zebra reflection stripe analysis active.");
+                }
+                if was_curv {
+                    self.mark_doc_dirty();
+                }
+            }
+            "emap" => {
+                let was_curv = matches!(
+                    self.surface_analysis.mode,
+                    SurfaceAnalysisMode::GaussianCurvature | SurfaceAnalysisMode::MeanCurvature
+                );
+                if self.surface_analysis.mode == SurfaceAnalysisMode::EnvironmentMap && args.is_empty() {
+                    self.surface_analysis.mode = SurfaceAnalysisMode::None;
+                    self.log("Environment Map analysis: Off.");
+                } else {
+                    if let Some(p) = args.first().and_then(|s| s.parse::<u32>().ok()) {
+                        self.surface_analysis.emap_preset = p.min(3);
+                    }
+                    self.surface_analysis.mode = SurfaceAnalysisMode::EnvironmentMap;
+                    self.inspector_tab = InspectorTab::Analyze;
+                    self.log("Environment Map (E-Map) analysis active.");
+                }
+                if was_curv {
+                    self.mark_doc_dirty();
+                }
+            }
+            "curvatureanalysis" | "gaussiancurvature" => {
+                let already = self.surface_analysis.mode == SurfaceAnalysisMode::GaussianCurvature;
+                self.surface_analysis.mode = if already {
+                    SurfaceAnalysisMode::None
+                } else {
+                    SurfaceAnalysisMode::GaussianCurvature
+                };
+                self.mark_doc_dirty();
+                self.inspector_tab = InspectorTab::Analyze;
+                self.log(format!(
+                    "Gaussian Curvature shader: {}.",
+                    if already { "Off" } else { "On" }
+                ));
+            }
+            "meancurvature" => {
+                let already = self.surface_analysis.mode == SurfaceAnalysisMode::MeanCurvature;
+                self.surface_analysis.mode = if already {
+                    SurfaceAnalysisMode::None
+                } else {
+                    SurfaceAnalysisMode::MeanCurvature
+                };
+                self.mark_doc_dirty();
+                self.inspector_tab = InspectorTab::Analyze;
+                self.log(format!(
+                    "Mean Curvature shader: {}.",
+                    if already { "Off" } else { "On" }
+                ));
+            }
+            "draftangle" => {
+                let was_curv = matches!(
+                    self.surface_analysis.mode,
+                    SurfaceAnalysisMode::GaussianCurvature | SurfaceAnalysisMode::MeanCurvature
+                );
+                if self.surface_analysis.mode == SurfaceAnalysisMode::DraftAngle && args.is_empty() {
+                    self.surface_analysis.mode = SurfaceAnalysisMode::None;
+                    self.log("Draft Angle analysis: Off.");
+                } else {
+                    if let Some(deg) = args.first().and_then(|s| s.parse::<f32>().ok()) {
+                        self.surface_analysis.draft_angle_deg = deg.clamp(0.2, 45.0);
+                    }
+                    self.surface_analysis.mode = SurfaceAnalysisMode::DraftAngle;
+                    self.inspector_tab = InspectorTab::Analyze;
+                    self.log(format!(
+                        "Draft Angle analysis active (parting band ±{:.1}°).",
+                        self.surface_analysis.draft_angle_deg
+                    ));
+                }
+                if was_curv {
+                    self.mark_doc_dirty();
+                }
+            }
+            "analysisoff" => {
+                let was_curv = matches!(
+                    self.surface_analysis.mode,
+                    SurfaceAnalysisMode::GaussianCurvature | SurfaceAnalysisMode::MeanCurvature
+                );
+                self.surface_analysis.mode = SurfaceAnalysisMode::None;
+                if was_curv {
+                    self.mark_doc_dirty();
+                }
+                self.log("Surface analysis shader turned off.");
+            }
+            "globaledgecontinuity" | "edgecontinuity" => {
+                let enable = match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
+                    Some("off" | "0" | "false") => false,
+                    Some("on" | "1" | "true") => true,
+                    _ => !self.edge_continuity_enabled,
+                };
+                self.edge_continuity_enabled = enable;
+                if enable {
+                    self.recompute_edge_continuity();
+                    self.inspector_tab = InspectorTab::Analyze;
+                    let total = self.edge_continuity_reports.len();
+                    let g2 = self
+                        .edge_continuity_reports
+                        .iter()
+                        .filter(|r| r.grade == cad_geom::ContinuityGrade::G2)
+                        .count();
+                    let g1 = self
+                        .edge_continuity_reports
+                        .iter()
+                        .filter(|r| r.grade == cad_geom::ContinuityGrade::G1)
+                        .count();
+                    let g0 = self
+                        .edge_continuity_reports
+                        .iter()
+                        .filter(|r| r.grade == cad_geom::ContinuityGrade::G0)
+                        .count();
+                    let gap = total.saturating_sub(g2 + g1 + g0);
+                    self.log(format!(
+                        "GlobalEdgeContinuity: {total} seam(s) -> G2:{g2}, G1:{g1}, G0:{g0}, Broken:{gap}."
+                    ));
+                } else {
+                    self.log("GlobalEdgeContinuity overlay hidden.");
+                }
+            }
+            "massproperties" | "volume" | "volumecentroid" => {
+                self.recompute_mass_properties();
+                self.inspector_tab = InspectorTab::Analyze;
+                if let Some(mp) = &self.last_mass_properties {
+                    let cm3_per_unit3 =
+                        self.doc.units.scale_to(UnitSystem::Centimeters).powi(3);
+                    let mass_g = mp.volume * cm3_per_unit3 * self.material_density_g_cm3;
+                    let u_lbl = self.doc.units.label();
+                    self.log(format!(
+                        "MassProperties: Area={:.3} {u_lbl}^2, Vol={:.4} {u_lbl}^3, Mass={:.2} g, Centroid=({:.3}, {:.3}, {:.3}), I=({:.2}, {:.2}, {:.2}).",
+                        mp.area,
+                        mp.volume,
+                        mass_g,
+                        mp.centroid.x,
+                        mp.centroid.y,
+                        mp.centroid.z,
+                        mp.principal_moments[0],
+                        mp.principal_moments[1],
+                        mp.principal_moments[2]
+                    ));
+                } else {
+                    self.log("No visible surfaces/B-Reps/meshes for MassProperties.");
+                }
+            }
+            "clippingplane" => {
+                let bbox = self.doc.visible_bounding_box();
+                let center = if bbox.is_empty() {
+                    DVec3::ZERO
+                } else {
+                    bbox.center()
+                };
+                let span = if bbox.is_empty() {
+                    16.0
+                } else {
+                    (bbox.size().max_element() * 1.6).max(8.0)
+                };
+                let mut plane = match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+                    Some("x") => Plane::world_yz(),
+                    Some("y") => Plane::world_zx(),
+                    Some("cplane") => cplane,
+                    _ => Plane::world_xy(),
+                };
+                plane.origin = center;
+                let id = self.doc.add_clipping_plane(format!("Clip {}", self.doc.clipping_planes.len() + 1), plane);
+                if let Some(cp) = self.doc.clipping_planes.iter_mut().find(|c| c.id == id) {
+                    cp.size = span;
+                }
+                self.inspector_tab = InspectorTab::Analyze;
+                self.mark_doc_dirty();
+                self.log("Added live GPU Clipping Plane (adjust offset in Analyze tab).");
+            }
+            "clippingplaneflip" => {
+                for cp in &mut self.doc.clipping_planes {
+                    cp.flip = !cp.flip;
+                }
+                self.mark_doc_dirty();
+                self.log("Flipped active clipping plane(s).");
+            }
+            "clippingplanetoggle" => {
+                let next = !self.doc.clipping_planes.iter().any(|c| c.enabled);
+                for cp in &mut self.doc.clipping_planes {
+                    cp.enabled = next;
+                }
+                self.mark_doc_dirty();
+                self.log(format!(
+                    "Clipping planes: {}.",
+                    if next { "Enabled" } else { "Disabled" }
+                ));
+            }
+            "section" => {
+                let plane = self
+                    .doc
+                    .active_clipping_planes()
+                    .first()
+                    .map(|c| c.plane)
+                    .unwrap_or(cplane);
+                let objs: Vec<_> = self
+                    .doc
+                    .objects
+                    .values()
+                    .filter(|o| o.visible && self.doc.is_layer_effectively_visible(o.layer_id))
+                    .map(|o| (o.layer_id, o.geometry.clone()))
+                    .collect();
+                let mut added = 0usize;
+                for (lid, geom) in objs {
+                    for poly in section_geometry_with_plane(&geom, &plane) {
+                        if let Ok(c) = NurbsCurve::polyline(&poly) {
+                            self.doc
+                                .add_object_on_layer("SectionCut", lid, Geometry::Curve(c));
+                            added += 1;
+                        }
+                    }
+                }
+                if added > 0 {
+                    self.mark_scene_dirty();
+                }
+                self.log(format!("Created {added} Section cut curve(s)."));
+            }
+            "make2d" => {
+                let projection = match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+                    Some("top") => DrawingProjection::Top,
+                    Some("front") => DrawingProjection::Front,
+                    Some("right") => DrawingProjection::Right,
+                    Some("back") => DrawingProjection::Back,
+                    Some("left") => DrawingProjection::Left,
+                    Some("bottom") => DrawingProjection::Bottom,
+                    Some("iso" | "isometric") => DrawingProjection::Isometric,
+                    Some("perspective" | "persp") => {
+                        let cam = &self.cameras[1];
+                        let (eye, up) = cam.eye_and_up();
+                        DrawingProjection::Perspective {
+                            eye,
+                            target: cam.target,
+                            up,
+                            fov_y_rad: cam.fov_y_rad,
+                            aspect: 1.5,
+                        }
+                    }
+                    _ => match self.cameras[self.active_viewport].kind {
+                        cad_render::ViewportKind::Top => DrawingProjection::Top,
+                        cad_render::ViewportKind::Front => DrawingProjection::Front,
+                        cad_render::ViewportKind::Right => DrawingProjection::Right,
+                        cad_render::ViewportKind::Perspective => {
+                            let cam = &self.cameras[self.active_viewport];
+                            let (eye, up) = cam.eye_and_up();
+                            DrawingProjection::Perspective {
+                                eye,
+                                target: cam.target,
+                                up,
+                                fov_y_rad: cam.fov_y_rad,
+                                aspect: 1.5,
+                            }
+                        }
+                    },
+                };
+                let mut items: Vec<(Geometry, Option<[u8; 4]>)> = self
+                    .doc
+                    .objects
+                    .values()
+                    .filter(|o| o.selected && o.visible && self.doc.is_layer_effectively_visible(o.layer_id))
+                    .map(|o| {
+                        let col = o
+                            .color
+                            .or_else(|| self.doc.layers.get(o.layer_id).map(|l| l.color));
+                        (o.geometry.clone(), col)
+                    })
+                    .collect();
+                if items.is_empty() {
+                    items = self
+                        .doc
+                        .objects
+                        .values()
+                        .filter(|o| o.visible && self.doc.is_layer_effectively_visible(o.layer_id))
+                        .map(|o| {
+                            let col = o
+                                .color
+                                .or_else(|| self.doc.layers.get(o.layer_id).map(|l| l.color));
+                            (o.geometry.clone(), col)
+                        })
+                        .collect();
+                }
+                if items.is_empty() {
+                    self.log("No visible geometry to project for Make2D.");
+                } else {
+                    let res = make_2d_projection(&items, projection, &Make2DOptions::default());
+                    let parent_l = self.doc.add_layer(
+                        format!("Make2D ({})", projection.label()),
+                        [190, 210, 235, 255],
+                    );
+                    let vis_l = self
+                        .doc
+                        .add_sublayer("Visible", [235, 240, 248, 255], parent_l);
+                    let sil_l = self
+                        .doc
+                        .add_sublayer("Silhouette", [255, 220, 120, 255], parent_l);
+                    let hid_l = self
+                        .doc
+                        .add_sublayer("Hidden", [130, 140, 158, 255], parent_l);
+                    let mut count = 0usize;
+                    for seg in &res.segments {
+                        if seg.points_2d.len() < 2 {
+                            continue;
+                        }
+                        let pts3: Vec<DVec3> = seg
+                            .points_2d
+                            .iter()
+                            .map(|p| DVec3::new(p[0], p[1], 0.0))
+                            .collect();
+                        if let Ok(c) = NurbsCurve::polyline(&pts3) {
+                            let lid = match seg.kind {
+                                Make2DLineKind::Visible => vis_l,
+                                Make2DLineKind::Silhouette => sil_l,
+                                Make2DLineKind::Hidden => hid_l,
+                            };
+                            self.doc
+                                .add_object_on_layer("Make2DCrv", lid, Geometry::Curve(c));
+                            count += 1;
+                        }
+                    }
+                    self.mark_scene_dirty();
+                    self.log(format!(
+                        "Make2D ({}) created {count} 2D curve(s) on World XY.",
+                        projection.label()
+                    ));
+                }
+            }
+            "layout" => {
+                let want_new = args
+                    .first()
+                    .is_some_and(|a| a.eq_ignore_ascii_case("new"));
+                let lid = if want_new || self.doc.layouts.is_empty() {
+                    self.doc.add_standard_4view_layout(None, PageSize::A3)
+                } else {
+                    self.doc.layouts[0].id
+                };
+                self.workspace_view = WorkspaceViewMode::Layout(lid);
+                self.layout_pan = eframe::egui::Vec2::ZERO;
+                self.layout_zoom = 1.0;
+                self.log("Switched to Paper Space 4-View Layout.");
+            }
+            "modelspace" => {
+                self.workspace_view = WorkspaceViewMode::Model;
+                self.log("Switched to 3D Model Space.");
+            }
+            "gdtframe" => {
+                let symbol = match args.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+                    Some("flatness" | "flt") => GdtSymbol::Flatness,
+                    Some("straightness" | "str") => GdtSymbol::Straightness,
+                    Some("circularity" | "cir") => GdtSymbol::Circularity,
+                    Some("cylindricity" | "cyl") => GdtSymbol::Cylindricity,
+                    Some("perpendicularity" | "perp" | "per") => GdtSymbol::Perpendicularity,
+                    Some("parallelism" | "par") => GdtSymbol::Parallelism,
+                    Some("angularity" | "ang") => GdtSymbol::Angularity,
+                    Some("profile" | "prs") => GdtSymbol::ProfileSurface,
+                    Some("concentricity" | "con") => GdtSymbol::Concentricity,
+                    Some("runout" | "run") => GdtSymbol::Runout,
+                    _ => GdtSymbol::Position,
+                };
+                let tolerance = args
+                    .get(1)
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.05)
+                    .abs();
+                let datums: Vec<String> = if args.len() > 2 {
+                    args[2..].iter().map(|s| s.to_ascii_uppercase()).collect()
+                } else {
+                    vec!["A".to_string(), "B".to_string()]
+                };
+                let pos = self
+                    .selection_object_plane()
+                    .map(|p| p.origin)
+                    .or_else(|| {
+                        self.doc
+                            .selected_ids_ordered()
+                            .last()
+                            .and_then(|&id| self.doc.objects.get(id))
+                            .map(|o| o.aabb.center())
+                    })
+                    .unwrap_or(cplane.origin + cplane.z_axis * 1.5);
+                self.doc.add_gdt_annotation(
+                    GdtSpec {
+                        symbol,
+                        tolerance,
+                        diameter_zone: symbol == GdtSymbol::Position,
+                        modifier: None,
+                        datums,
+                    },
+                    pos,
+                );
+                self.mark_doc_dirty();
+                self.log(format!(
+                    "Placed {} GD&T Feature Control Frame (tol={tolerance:.3}).",
+                    symbol.label()
+                ));
+            }
+            "datumtag" => {
+                let label = args
+                    .first()
+                    .map(|s| s.to_ascii_uppercase())
+                    .unwrap_or_else(|| "A".to_string());
+                let pos = self
+                    .selection_object_plane()
+                    .map(|p| p.origin)
+                    .or_else(|| {
+                        self.doc
+                            .selected_ids_ordered()
+                            .last()
+                            .and_then(|&id| self.doc.objects.get(id))
+                            .map(|o| o.aabb.center())
+                    })
+                    .unwrap_or(cplane.origin);
+                self.doc.add_datum_annotation(label.clone(), pos);
+                self.mark_doc_dirty();
+                self.log(format!("Placed Datum Tag [{label}]."));
+            }
+            "exportpdf" => {
+                self.export_pdf_dialog();
+            }
             "help" => {
-                self.log("Interactive: Line, Polyline, Curve, InterpCrv, HandleCurve, Conic, Helix, Rectangle, Arc, Circle, Polygon, Box, Cylinder, Cone, Revolve, RailRevolve, ExtractIsocurve, SplitSrf, Move, Copy, Rotate, Scale, Mirror, Offset, SplitCurve, Trim, InsertKnot, ArrayLinear, ArrayPolar, Distance, Dim, TextDot | B-Rep Solids & Surfacing: BooleanUnion/Difference/Intersection/Split, Intersect, Cap, Untrim, FilletSrf, FilletEdge, ChamferEdge, Shell, PushPull, Inset, ExtractSrf, ToBRep, ShowEdges (Ctrl+Shift+Click sub-objects) | Surfacing: Sphere, Torus, Plane, Extrude, PlanarSrf, Loft, Sweep1, Sweep2, EdgeSrf, NetworkSrf, BlendSrf, MatchSrf, OffsetSrf, ExtendSrf, Patch, RebuildSrf, DupBorder, DupEdge, Flip | Editing & UX: PointsOn/Off, UVN, SoftTransform, Join, Explode, Split, Fillet, Chamfer, BlendCrv, Match, Rebuild, RebuildAdaptive (Elmo), Fair, TweenCurves, ChangeDegree, CurvatureGraph, Area, AutoCPlane, SmartTrack, GumballAlign, GumballRelocate, GumballReset, History, BreakHistory, HistoryPurge, RadialMenu, Units [mm|cm|m|in|ft], ZoomExtents (ZE), Undo, Redo | Shortcuts: Q/Space=Radial Menu, Right/Left/Up=Axis Lock, T=SmartTrack point, Alt+Drag=Copy, Ctrl+Drag=Relocate Gumball");
+                self.log("Interactive: Line, Polyline, Curve, InterpCrv, HandleCurve, Conic, Helix, Rectangle, Arc, Circle, Polygon, Box, Cylinder, Cone, Revolve, RailRevolve, ExtractIsocurve, SplitSrf, Move, Copy, Rotate, Scale, Mirror, Offset, SplitCurve, Trim, InsertKnot, ArrayLinear, ArrayPolar, Distance, Dim, TextDot, GdtFrame, DatumTag | B-Rep & Surfacing: BooleanUnion/Difference/Intersection/Split, Intersect, Cap, Untrim, FilletSrf, FilletEdge, ChamferEdge, Shell, PushPull, Inset, ExtractSrf, ToBRep, ShowEdges (Ctrl+Shift+Click sub-objects), Sphere, Torus, Plane, Extrude, PlanarSrf, Loft, Sweep1, Sweep2, EdgeSrf, NetworkSrf, BlendSrf, MatchSrf, OffsetSrf, ExtendSrf, Patch, RebuildSrf, DupBorder, DupEdge, Flip | Display & Analysis: Rendered, Concept, Arctic, Shaded, Wireframe, Technical, Ghosted, Zebra, EMap, GaussianCurvature, MeanCurvature, DraftAngle, AnalysisOff, GlobalEdgeContinuity, MassProperties, ClippingPlane, ClippingPlaneFlip, Section | Drafting & PDF: Make2D, Layout, ModelSpace, ExportPDF | Editing & UX: PointsOn/Off, UVN, SoftTransform, Join, Explode, Split, Fillet, Chamfer, BlendCrv, Match, Rebuild, RebuildAdaptive (Elmo), Fair, TweenCurves, ChangeDegree, CurvatureGraph, Area, AutoCPlane, SmartTrack, GumballAlign, GumballRelocate, GumballReset, History, BreakHistory, HistoryPurge, RadialMenu, Units [mm|cm|m|in|ft], ZoomExtents (ZE), Undo, Redo | Shortcuts: Q/Space=Radial Menu, Right/Left/Up=Axis Lock, T=SmartTrack point, Alt+Drag=Copy, Ctrl+Drag=Relocate Gumball");
             }
             _ => {
                 self.log(format!(

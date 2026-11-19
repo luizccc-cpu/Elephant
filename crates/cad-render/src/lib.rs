@@ -5,5 +5,7 @@ pub mod scene;
 pub mod wgpu_pass;
 
 pub use camera::{ViewportCamera, ViewportKind};
-pub use scene::{DisplayMode, LineVertex, MeshVertex, RenderScene};
+pub use scene::{
+    DisplayMode, LineVertex, MeshVertex, RenderScene, SurfaceAnalysisConfig, SurfaceAnalysisMode,
+};
 pub use wgpu_pass::{CadWgpuState, ViewportPaintCallback};

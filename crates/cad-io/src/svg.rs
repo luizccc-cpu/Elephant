@@ -135,6 +135,135 @@ pub fn export_svg_string(doc: &Document) -> String {
     out
 }
 
+/// Export a paper-space `LayoutSheet` to pure vector SVG including projected visible/hidden lines and title block.
+pub fn export_layout_svg_string(doc: &Document, layout: &cad_doc::LayoutSheet) -> String {
+    use cad_geom::{Make2DLineKind, Make2DOptions, make_2d_projection};
+    let (pw, ph) = layout.page_size.dimensions_mm(layout.landscape);
+    let m = layout.margin_mm;
+    let items: Vec<_> = doc
+        .objects
+        .values()
+        .filter(|o| o.visible && doc.is_layer_effectively_visible(o.layer_id))
+        .map(|o| {
+            let col = o
+                .color
+                .or_else(|| doc.layers.get(o.layer_id).map(|l| l.color));
+            (o.geometry.clone(), col)
+        })
+        .collect();
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {pw:.3} {ph:.3}" width="{pw:.1}mm" height="{ph:.1}mm">"#
+    );
+    let _ = writeln!(out, r##"  <rect x="0" y="0" width="{pw:.3}" height="{ph:.3}" fill="#ffffff"/>"##);
+    let _ = writeln!(
+        out,
+        r##"  <rect x="{m:.3}" y="{m:.3}" width="{:.3}" height="{:.3}" fill="none" stroke="#1e222a" stroke-width="0.45"/>"##,
+        (pw - 2.0 * m).max(1.0),
+        (ph - 2.0 * m).max(1.0)
+    );
+
+    let tb_w = 88.0_f64.min((pw - 2.0 * m) * 0.48);
+    let tb_h = 28.0_f64;
+    let tb_x = pw - m - tb_w;
+    let tb_y = ph - m - tb_h;
+    let _ = writeln!(
+        out,
+        r##"  <rect x="{tb_x:.3}" y="{tb_y:.3}" width="{tb_w:.3}" height="{tb_h:.3}" fill="none" stroke="#1e222a" stroke-width="0.35"/>"##
+    );
+    let _ = writeln!(
+        out,
+        r##"  <text x="{:.3}" y="{:.3}" font-family="sans-serif" font-size="3.4" font-weight="bold" fill="#15181e">{}</text>"##,
+        tb_x + 2.5,
+        tb_y + 6.5,
+        escape_xml(&layout.title_block.title)
+    );
+    let _ = writeln!(
+        out,
+        r##"  <text x="{:.3}" y="{:.3}" font-family="sans-serif" font-size="2.4" fill="#333842">DWG: {} | REV: {} | UNITS: {}</text>"##,
+        tb_x + 2.5,
+        tb_y + 15.5,
+        escape_xml(&layout.title_block.drawing_number),
+        escape_xml(&layout.title_block.revision),
+        doc.units.label()
+    );
+
+    for detail in &layout.details {
+        let [rx, ry, rw, rh] = detail.rect_mm;
+        if rw <= 2.0 || rh <= 2.0 {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            r##"  <rect x="{rx:.3}" y="{ry:.3}" width="{rw:.3}" height="{rh:.3}" fill="none" stroke="#9aa0aa" stroke-width="0.25"/>"##
+        );
+        let _ = writeln!(
+            out,
+            r##"  <text x="{:.3}" y="{:.3}" font-family="sans-serif" font-size="2.6" font-weight="bold" fill="#20242c">{}</text>"##,
+            rx + 2.5,
+            ry + 4.2,
+            escape_xml(&detail.title)
+        );
+
+        let res = make_2d_projection(
+            &items,
+            detail.projection,
+            &Make2DOptions {
+                include_hidden: detail.show_hidden_lines,
+                ..Default::default()
+            },
+        );
+        let span_x = (res.bounds_max[0] - res.bounds_min[0]).max(1e-6);
+        let span_y = (res.bounds_max[1] - res.bounds_min[1]).max(1e-6);
+        let inner_w = (rw - 8.0).max(4.0);
+        let inner_h = (rh - 11.0).max(4.0);
+        let scale = if detail.scale > 1e-6 {
+            detail.scale
+        } else {
+            (inner_w / span_x).min(inner_h / span_y)
+        };
+        let mid_x = 0.5 * (res.bounds_min[0] + res.bounds_max[0]);
+        let mid_y = 0.5 * (res.bounds_min[1] + res.bounds_max[1]);
+        let cx = rx + rw * 0.5;
+        let cy = ry + 6.0 + inner_h * 0.5;
+
+        for seg in &res.segments {
+            if seg.points_2d.len() < 2 {
+                continue;
+            }
+            let (stroke, width, dash) = match seg.kind {
+                Make2DLineKind::Visible => ("#181c22", "0.22", ""),
+                Make2DLineKind::Silhouette => ("#090b0f", "0.38", ""),
+                Make2DLineKind::Hidden => ("#858d99", "0.14", r#" stroke-dasharray="1.8,1.2""#),
+            };
+            let _ = write!(
+                out,
+                r#"  <polyline fill="none" stroke="{stroke}" stroke-width="{width}"{dash} points=""#
+            );
+            for (i, pt) in seg.points_2d.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                let x = cx + (pt[0] - mid_x) * scale;
+                let y = cy - (pt[1] - mid_y) * scale;
+                let _ = write!(out, "{x:.3},{y:.3}");
+            }
+            let _ = writeln!(out, r#""/>"#);
+        }
+    }
+
+    let _ = writeln!(out, "</svg>");
+    out
+}
+
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

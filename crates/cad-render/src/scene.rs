@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use bytemuck::{Pod, Zeroable};
 use cad_doc::{AnnotationKind, Document};
-use cad_geom::{Aabb, Geometry};
+use cad_geom::{
+    Aabb, Geometry, compute_mesh_discrete_curvature, section_geometry_with_plane,
+    tessellate_brep_with_curvature, tessellate_surface_with_curvature,
+};
 use cad_math::{DVec3, Plane};
 use serde::{Deserialize, Serialize};
 
@@ -13,15 +16,19 @@ pub enum DisplayMode {
     Ghosted,
     Technical,
     Arctic,
+    Rendered,
+    Concept,
 }
 
 impl DisplayMode {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Wireframe,
         Self::Shaded,
         Self::Ghosted,
         Self::Technical,
         Self::Arctic,
+        Self::Rendered,
+        Self::Concept,
     ];
 
     pub fn label(self) -> &'static str {
@@ -31,6 +38,76 @@ impl DisplayMode {
             Self::Ghosted => "Ghosted",
             Self::Technical => "Technical",
             Self::Arctic => "Arctic",
+            Self::Rendered => "Rendered (PBR)",
+            Self::Concept => "Concept",
+        }
+    }
+}
+
+/// Real-time Class-A surface diagnostic shader mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SurfaceAnalysisMode {
+    None,
+    Zebra,
+    EnvironmentMap,
+    GaussianCurvature,
+    MeanCurvature,
+    DraftAngle,
+}
+
+impl Default for SurfaceAnalysisMode {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl SurfaceAnalysisMode {
+    pub const ALL: [Self; 6] = [
+        Self::None,
+        Self::Zebra,
+        Self::EnvironmentMap,
+        Self::GaussianCurvature,
+        Self::MeanCurvature,
+        Self::DraftAngle,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "Off",
+            Self::Zebra => "Zebra",
+            Self::EnvironmentMap => "E-Map",
+            Self::GaussianCurvature => "Gaussian Curvature",
+            Self::MeanCurvature => "Mean Curvature",
+            Self::DraftAngle => "Draft Angle",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceAnalysisConfig {
+    pub mode: SurfaceAnalysisMode,
+    pub zebra_stripes: f32,
+    pub zebra_angle_deg: f32,
+    pub emap_preset: u32,
+    pub curvature_min: f32,
+    pub curvature_max: f32,
+    pub draft_pull_dir: DVec3,
+    pub draft_angle_deg: f32,
+    pub cavity_ao_strength: f32,
+}
+
+impl Default for SurfaceAnalysisConfig {
+    fn default() -> Self {
+        Self {
+            mode: SurfaceAnalysisMode::None,
+            zebra_stripes: 10.0,
+            zebra_angle_deg: 0.0,
+            emap_preset: 0,
+            curvature_min: -0.5,
+            curvature_max: 0.5,
+            draft_pull_dir: DVec3::Z,
+            draft_angle_deg: 2.0,
+            cavity_ao_strength: 0.45,
         }
     }
 }
@@ -41,6 +118,8 @@ pub struct MeshVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub color: [f32; 4],
+    pub curvature: [f32; 2],
+    pub material: [f32; 2],
 }
 
 #[repr(C)]
@@ -72,6 +151,16 @@ impl RenderScene {
 
     /// Build only visible document geometry and annotations (without CPlane grid or transient previews).
     pub fn build_document(doc: &Document, mode: DisplayMode, version: u64) -> Self {
+        Self::build_document_with_options(doc, mode, version, false)
+    }
+
+    /// Build visible document geometry with optional analytical Gaussian/Mean curvature attributes.
+    pub fn build_document_with_options(
+        doc: &Document,
+        mode: DisplayMode,
+        version: u64,
+        compute_curvature: bool,
+    ) -> Self {
         let mut scene = Self {
             version,
             ..Default::default()
@@ -104,18 +193,25 @@ impl RenderScene {
                 layer_rgba
             };
 
-            let alpha = if mode == DisplayMode::Ghosted { 0.45 } else { 1.0 };
+            let mat = obj.material.unwrap_or_default();
+            let alpha = if mode == DisplayMode::Ghosted {
+                0.45 * mat.opacity
+            } else {
+                mat.opacity
+            };
+            let mat_pair = [mat.metallic, mat.roughness];
             let shaded_color = if obj.selected {
                 [1.0, 0.88, 0.25, alpha]
             } else if mode == DisplayMode::Technical {
-                [0.86, 0.88, 0.90, 1.0]
+                [0.86, 0.88, 0.90, alpha]
             } else if mode == DisplayMode::Arctic {
-                [0.94, 0.95, 0.97, 1.0]
+                [0.94, 0.95, 0.97, alpha]
             } else if is_pure_black {
                 [0.74, 0.77, 0.82, alpha]
             } else {
                 [layer_rgba[0], layer_rgba[1], layer_rgba[2], alpha]
             };
+            let suppress_edges = matches!(mode, DisplayMode::Arctic | DisplayMode::Rendered);
 
             match &obj.geometry {
                 Geometry::Point(p) => {
@@ -149,15 +245,29 @@ impl RenderScene {
                 }
                 Geometry::Surface(surf) => {
                     if mode != DisplayMode::Wireframe {
-                        let mesh = surf.tessellate_display();
-                        scene.push_mesh_triangles(
-                            &mesh.positions,
-                            &mesh.normals,
-                            &mesh.indices,
-                            shaded_color,
-                        );
+                        if compute_curvature {
+                            let cm = tessellate_surface_with_curvature(surf);
+                            scene.push_mesh_triangles_with_data(
+                                &cm.mesh.positions,
+                                &cm.mesh.normals,
+                                &cm.mesh.indices,
+                                shaded_color,
+                                Some((&cm.gaussian, &cm.mean)),
+                                mat_pair,
+                            );
+                        } else {
+                            let mesh = surf.tessellate_display();
+                            scene.push_mesh_triangles_with_data(
+                                &mesh.positions,
+                                &mesh.normals,
+                                &mesh.indices,
+                                shaded_color,
+                                None,
+                                mat_pair,
+                            );
+                        }
                     }
-                    if mode != DisplayMode::Arctic || obj.selected {
+                    if (!suppress_edges && mode != DisplayMode::Concept) || obj.selected {
                         let iso_color = if obj.selected {
                             SELECTION_COLOR
                         } else if mode == DisplayMode::Wireframe {
@@ -181,20 +291,34 @@ impl RenderScene {
                 }
                 Geometry::BRep(brep) => {
                     if mode != DisplayMode::Wireframe {
-                        let mesh = brep.tessellate_display();
-                        scene.push_mesh_triangles(
-                            &mesh.positions,
-                            &mesh.normals,
-                            &mesh.indices,
-                            shaded_color,
-                        );
+                        if compute_curvature {
+                            let cm = tessellate_brep_with_curvature(brep);
+                            scene.push_mesh_triangles_with_data(
+                                &cm.mesh.positions,
+                                &cm.mesh.normals,
+                                &cm.mesh.indices,
+                                shaded_color,
+                                Some((&cm.gaussian, &cm.mean)),
+                                mat_pair,
+                            );
+                        } else {
+                            let mesh = brep.tessellate_display();
+                            scene.push_mesh_triangles_with_data(
+                                &mesh.positions,
+                                &mesh.normals,
+                                &mesh.indices,
+                                shaded_color,
+                                None,
+                                mat_pair,
+                            );
+                        }
                     }
-                    if mode != DisplayMode::Arctic || obj.selected {
+                    if !suppress_edges || obj.selected {
                         let edge_color = if obj.selected {
                             SELECTION_COLOR
                         } else if mode == DisplayMode::Wireframe {
                             base_color
-                        } else if mode == DisplayMode::Technical {
+                        } else if mode == DisplayMode::Technical || mode == DisplayMode::Concept {
                             [0.08, 0.10, 0.14, 1.0]
                         } else {
                             [0.12, 0.14, 0.18, 0.92]
@@ -219,27 +343,29 @@ impl RenderScene {
                                 }
                             }
                         }
-                        let iso_color =
-                            [edge_color[0], edge_color[1], edge_color[2], 0.55];
-                        for f in &brep.faces {
-                            if (f.surface.degree_u > 1 || f.surface.degree_v > 1)
-                                && !f.is_trimmed()
-                            {
-                                for poly in f.surface.isocurve_polylines(1, 1, 32) {
-                                    for pair in poly.windows(2) {
-                                        scene.push_line(
-                                            [
-                                                pair[0].x as f32,
-                                                pair[0].y as f32,
-                                                pair[0].z as f32,
-                                            ],
-                                            [
-                                                pair[1].x as f32,
-                                                pair[1].y as f32,
-                                                pair[1].z as f32,
-                                            ],
-                                            iso_color,
-                                        );
+                        if mode != DisplayMode::Concept {
+                            let iso_color =
+                                [edge_color[0], edge_color[1], edge_color[2], 0.55];
+                            for f in &brep.faces {
+                                if (f.surface.degree_u > 1 || f.surface.degree_v > 1)
+                                    && !f.is_trimmed()
+                                {
+                                    for poly in f.surface.isocurve_polylines(1, 1, 32) {
+                                        for pair in poly.windows(2) {
+                                            scene.push_line(
+                                                [
+                                                    pair[0].x as f32,
+                                                    pair[0].y as f32,
+                                                    pair[0].z as f32,
+                                                ],
+                                                [
+                                                    pair[1].x as f32,
+                                                    pair[1].y as f32,
+                                                    pair[1].z as f32,
+                                                ],
+                                                iso_color,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -247,7 +373,15 @@ impl RenderScene {
                     }
                 }
                 Geometry::Mesh(mesh) => {
-                    scene.push_mesh(
+                    let curv = if compute_curvature && mode != DisplayMode::Wireframe {
+                        Some(compute_mesh_discrete_curvature(mesh))
+                    } else {
+                        None
+                    };
+                    let curv_ref = curv
+                        .as_ref()
+                        .map(|(g, m)| (g.as_slice(), m.as_slice()));
+                    scene.push_mesh_full(
                         &mesh.positions,
                         &mesh.normals,
                         &mesh.indices,
@@ -255,6 +389,8 @@ impl RenderScene {
                         base_color,
                         mode,
                         obj.selected,
+                        curv_ref,
+                        mat_pair,
                     );
                 }
             }
@@ -281,6 +417,54 @@ impl RenderScene {
             }
         }
 
+        scene
+    }
+
+    /// Build unclipped 3D frames, normal handles, and real-time section cut contours for active clipping planes.
+    pub fn build_clipping_overlay(doc: &Document, version: u64) -> Self {
+        let mut scene = Self {
+            version,
+            ..Default::default()
+        };
+        let frame_col = [0.98, 0.68, 0.22, 0.95];
+        let cut_col = [1.0, 0.28, 0.22, 1.0];
+        let norm_col = [0.35, 0.85, 1.0, 1.0];
+        let f = |v: DVec3| [v.x as f32, v.y as f32, v.z as f32];
+
+        for cp in &doc.clipping_planes {
+            if !cp.enabled {
+                continue;
+            }
+            let half = (cp.size * 0.5).max(1.0);
+            let o = cp.plane.origin;
+            let u = cp.plane.x_axis * half;
+            let v = cp.plane.y_axis * half;
+            let c0 = o - u - v;
+            let c1 = o + u - v;
+            let c2 = o + u + v;
+            let c3 = o - u + v;
+            scene.push_line(f(c0), f(c1), frame_col);
+            scene.push_line(f(c1), f(c2), frame_col);
+            scene.push_line(f(c2), f(c3), frame_col);
+            scene.push_line(f(c3), f(c0), frame_col);
+            scene.push_line(f(o - u * 0.3), f(o + u * 0.3), frame_col);
+            scene.push_line(f(o - v * 0.3), f(o + v * 0.3), frame_col);
+            let arrow_tip = o + cp.effective_normal() * (half * 0.35);
+            scene.push_line(f(o), f(arrow_tip), norm_col);
+
+            if cp.fill_caps {
+                for (_, obj) in &doc.objects {
+                    if !obj.visible || !doc.is_layer_effectively_visible(obj.layer_id) {
+                        continue;
+                    }
+                    for poly in section_geometry_with_plane(&obj.geometry, &cp.plane) {
+                        for pair in poly.windows(2) {
+                            scene.push_line(f(pair[0]), f(pair[1]), cut_col);
+                        }
+                    }
+                }
+            }
+        }
         scene
     }
 
@@ -396,19 +580,31 @@ impl RenderScene {
         }
     }
 
-    fn push_mesh_triangles(
+    fn push_mesh_triangles_with_data(
         &mut self,
         positions: &[[f64; 3]],
         normals: &[[f64; 3]],
         indices: &[[u32; 3]],
         shaded_color: [f32; 4],
+        curvature: Option<(&[f64], &[f64])>,
+        material: [f32; 2],
     ) {
         let base = self.mesh_vertices.len() as u32;
-        for (p, n) in positions.iter().zip(normals.iter()) {
+        for (i, (p, n)) in positions.iter().zip(normals.iter()).enumerate() {
+            let curv = if let Some((g, m)) = curvature {
+                [
+                    g.get(i).copied().unwrap_or(0.0) as f32,
+                    m.get(i).copied().unwrap_or(0.0) as f32,
+                ]
+            } else {
+                [0.0, 0.0]
+            };
             self.mesh_vertices.push(MeshVertex {
                 position: [p[0] as f32, p[1] as f32, p[2] as f32],
                 normal: [n[0] as f32, n[1] as f32, n[2] as f32],
                 color: shaded_color,
+                curvature: curv,
+                material,
             });
         }
         for &[a, b, c] in indices {
@@ -428,8 +624,41 @@ impl RenderScene {
         mode: DisplayMode,
         selected: bool,
     ) {
+        self.push_mesh_full(
+            positions,
+            normals,
+            indices,
+            shaded_color,
+            wire_color,
+            mode,
+            selected,
+            None,
+            [0.05, 0.42],
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_mesh_full(
+        &mut self,
+        positions: &[[f64; 3]],
+        normals: &[[f64; 3]],
+        indices: &[[u32; 3]],
+        shaded_color: [f32; 4],
+        wire_color: [f32; 4],
+        mode: DisplayMode,
+        selected: bool,
+        curvature: Option<(&[f64], &[f64])>,
+        material: [f32; 2],
+    ) {
         if mode != DisplayMode::Wireframe {
-            self.push_mesh_triangles(positions, normals, indices, shaded_color);
+            self.push_mesh_triangles_with_data(
+                positions,
+                normals,
+                indices,
+                shaded_color,
+                curvature,
+                material,
+            );
         }
 
         if mode == DisplayMode::Wireframe || mode == DisplayMode::Ghosted || selected {
@@ -445,7 +674,10 @@ impl RenderScene {
                 self.push_line(fb, fc, edge_color);
                 self.push_line(fc, fa, edge_color);
             }
-        } else if mode == DisplayMode::Shaded || mode == DisplayMode::Technical {
+        } else if matches!(
+            mode,
+            DisplayMode::Shaded | DisplayMode::Technical | DisplayMode::Concept
+        ) {
             let edge_color = if mode == DisplayMode::Technical {
                 [0.10, 0.12, 0.15, 1.0]
             } else {

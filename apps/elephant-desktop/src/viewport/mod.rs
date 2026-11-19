@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use cad_commands::{AxisLockMode, DimensionUnitKind, InferenceGuideKind, SnapKind};
 use cad_doc::{AnnotationKind, ObjectId};
-use cad_geom::{BoundaryLock, DMat4, DVec3, Geometry, SubObjectRef};
-use cad_render::{DisplayMode, ViewportPaintCallback};
+use cad_geom::{BoundaryLock, ContinuityGrade, DMat4, DVec3, Geometry, SubObjectRef};
+use cad_render::{DisplayMode, SurfaceAnalysisMode, ViewportPaintCallback};
 use eframe::egui;
 
 use crate::state::{
@@ -880,15 +880,33 @@ impl ElephantApp {
                     self.cached_doc_scenes.get(&mode),
                     self.cached_grids[idx].as_ref(),
                 ) {
+                    let (eye, _) = self.cameras[idx].eye_and_up();
+                    let fwd = (self.cameras[idx].target - eye).normalize_or_zero();
+                    let mut clip_planes = [[0.0_f32; 4]; 4];
+                    let mut clip_count = 0usize;
+                    for cp in self.doc.active_clipping_planes().into_iter().take(4) {
+                        clip_planes[clip_count] = cp.equation_f32();
+                        clip_count += 1;
+                    }
                     let cb = eframe::egui_wgpu::Callback::new_paint_callback(
                         rect,
                         ViewportPaintCallback {
                             kind: self.cameras[idx].kind,
                             display_mode: mode,
                             view_proj: self.cameras[idx].view_proj_f32(aspect),
+                            camera_pos: [eye.x as f32, eye.y as f32, eye.z as f32],
+                            camera_dir: [fwd.x as f32, fwd.y as f32, fwd.z as f32],
+                            is_perspective: self.cameras[idx].is_perspective,
+                            analysis: self.surface_analysis,
+                            clip_planes,
+                            clip_plane_count: clip_count as u32,
                             doc_scene: Arc::clone(doc_scene),
                             grid_scene: Arc::clone(grid_scene),
                             overlay_scene: self.cached_overlay.as_ref().map(Arc::clone),
+                            clipping_overlay: self
+                                .cached_clipping_overlay
+                                .as_ref()
+                                .map(Arc::clone),
                         },
                     );
                     ui.painter().add(cb);
@@ -1035,27 +1053,87 @@ impl ElephantApp {
                     }
                 }
 
-                // Draw Naked Edges overlay when ShowEdges is active
-                if self.show_naked_edges {
+                // Draw Naked & Non-Manifold Edges overlays when ShowEdges / Diagnostics are active
+                if self.show_naked_edges || self.show_non_manifold_edges {
                     let naked_stroke =
                         egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(255, 60, 210));
+                    let non_man_stroke =
+                        egui::Stroke::new(3.0_f32, egui::Color32::from_rgb(40, 235, 245));
                     for (_, obj) in &self.doc.objects {
                         if !obj.visible || !self.doc.is_layer_effectively_visible(obj.layer_id) {
                             continue;
                         }
                         if let Geometry::BRep(brep) = &obj.geometry {
-                            for ei in brep.naked_edges() {
-                                if let Some(edge) = brep.edges.get(ei) {
-                                    let screen_pts: Vec<egui::Pos2> = edge
-                                        .curve
-                                        .sample_polyline(24)
-                                        .into_iter()
-                                        .filter_map(|p| world_to_screen(p, &vp_cols, rect))
-                                        .collect();
-                                    if screen_pts.len() >= 2 {
-                                        painter.add(egui::Shape::line(screen_pts, naked_stroke));
+                            if self.show_naked_edges {
+                                for ei in brep.naked_edges() {
+                                    if let Some(edge) = brep.edges.get(ei) {
+                                        let screen_pts: Vec<egui::Pos2> = edge
+                                            .curve
+                                            .sample_polyline(24)
+                                            .into_iter()
+                                            .filter_map(|p| world_to_screen(p, &vp_cols, rect))
+                                            .collect();
+                                        if screen_pts.len() >= 2 {
+                                            painter.add(egui::Shape::line(screen_pts, naked_stroke));
+                                        }
                                     }
                                 }
+                            }
+                            if self.show_non_manifold_edges {
+                                for ei in brep.non_manifold_edges() {
+                                    if let Some(edge) = brep.edges.get(ei) {
+                                        let screen_pts: Vec<egui::Pos2> = edge
+                                            .curve
+                                            .sample_polyline(24)
+                                            .into_iter()
+                                            .filter_map(|p| world_to_screen(p, &vp_cols, rect))
+                                            .collect();
+                                        if screen_pts.len() >= 2 {
+                                            painter
+                                                .add(egui::Shape::line(screen_pts, non_man_stroke));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Draw Rhino 9 GlobalEdgeContinuity 3D seams and midpoint badges
+                if self.edge_continuity_enabled {
+                    for rep in &self.edge_continuity_reports {
+                        let (col, badge) = match rep.grade {
+                            ContinuityGrade::G2 => (
+                                egui::Color32::from_rgb(75, 225, 115),
+                                "G2".to_string(),
+                            ),
+                            ContinuityGrade::G1 => (
+                                egui::Color32::from_rgb(245, 210, 65),
+                                format!("G1 k:{:.0}%", rep.max_curvature_diff_rel * 100.0),
+                            ),
+                            ContinuityGrade::G0 => (
+                                egui::Color32::from_rgb(245, 145, 55),
+                                format!("G0 {:.1}°", rep.max_angle_deg),
+                            ),
+                            ContinuityGrade::Broken => (
+                                egui::Color32::from_rgb(245, 70, 70),
+                                format!("GAP {:.3}", rep.max_gap),
+                            ),
+                        };
+                        let seam_pts: Vec<egui::Pos2> = rep
+                            .polyline
+                            .iter()
+                            .filter_map(|&p| world_to_screen(p, &vp_cols, rect))
+                            .collect();
+                        if seam_pts.len() >= 2 {
+                            painter.add(egui::Shape::line(
+                                seam_pts,
+                                egui::Stroke::new(3.0_f32, col),
+                            ));
+                        }
+                        if is_active {
+                            if let Some(m_scr) = world_to_screen(rep.midpoint, &vp_cols, rect) {
+                                draw_screen_pill(&painter, m_scr, &badge, col);
                             }
                         }
                     }
@@ -1131,12 +1209,10 @@ impl ElephantApp {
                     }
                 }
 
-                // Draw Annotations (Dimensions, Text, TextDots, Leaders)
+                // Draw Annotations (Dimensions, Text, TextDots, Leaders, GD&T Frames, Datum Tags)
                 for ann in &self.doc.annotations {
-                    if let Some(layer) = self.doc.layers.get(ann.layer_id) {
-                        if !layer.visible {
-                            continue;
-                        }
+                    if !self.doc.is_layer_effectively_visible(ann.layer_id) {
+                        continue;
                     }
                     if let Some(sp) = world_to_screen(ann.position, &vp_cols, rect) {
                         match ann.kind {
@@ -1156,6 +1232,76 @@ impl ElephantApp {
                                     egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
                                 );
                                 painter.galley(pill.min + pad, galley, egui::Color32::WHITE);
+                            }
+                            AnnotationKind::GdtFrame => {
+                                let txt = if let Some(gdt) = &ann.gdt {
+                                    let dia = if gdt.diameter_zone { "Ø" } else { "" };
+                                    if gdt.datums.is_empty() {
+                                        format!("{} | {dia}{:.3}", gdt.symbol.short_code(), gdt.tolerance)
+                                    } else {
+                                        format!(
+                                            "{} | {dia}{:.3} | {}",
+                                            gdt.symbol.short_code(),
+                                            gdt.tolerance,
+                                            gdt.datums.join(" | ")
+                                        )
+                                    }
+                                } else {
+                                    ann.text.clone()
+                                };
+                                let galley = painter.layout_no_wrap(
+                                    txt,
+                                    egui::FontId::monospace(11.0),
+                                    egui::Color32::from_rgb(240, 245, 255),
+                                );
+                                let pad = egui::vec2(6.0, 3.0);
+                                let frame_rect =
+                                    egui::Rect::from_center_size(sp, galley.size() + pad * 2.0);
+                                painter.rect(
+                                    frame_rect,
+                                    1.0,
+                                    egui::Color32::from_rgba_unmultiplied(24, 34, 48, 225),
+                                    egui::Stroke::new(1.3_f32, egui::Color32::from_rgb(130, 200, 255)),
+                                );
+                                painter.galley(
+                                    frame_rect.min + pad,
+                                    galley,
+                                    egui::Color32::from_rgb(240, 245, 255),
+                                );
+                            }
+                            AnnotationKind::DatumTag => {
+                                let galley = painter.layout_no_wrap(
+                                    ann.text.clone(),
+                                    egui::FontId::monospace(11.0),
+                                    egui::Color32::from_rgb(245, 248, 255),
+                                );
+                                let box_sz = egui::vec2(galley.size().x.max(12.0) + 8.0, galley.size().y + 4.0);
+                                let tag_center = sp + egui::vec2(0.0, -box_sz.y * 0.5 - 8.0);
+                                let tag_rect = egui::Rect::from_center_size(tag_center, box_sz);
+                                painter.add(egui::Shape::convex_polygon(
+                                    vec![
+                                        sp,
+                                        sp + egui::vec2(-5.0, -6.0),
+                                        sp + egui::vec2(5.0, -6.0),
+                                    ],
+                                    egui::Color32::from_rgb(230, 195, 70),
+                                    egui::Stroke::NONE,
+                                ));
+                                painter.line_segment(
+                                    [sp + egui::vec2(0.0, -6.0), tag_rect.center_bottom()],
+                                    egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(230, 195, 70)),
+                                );
+                                painter.rect(
+                                    tag_rect,
+                                    0.0,
+                                    egui::Color32::from_rgba_unmultiplied(24, 30, 38, 225),
+                                    egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(230, 195, 70)),
+                                );
+                                painter.galley(
+                                    tag_rect.center() - galley.size() * 0.5,
+                                    galley,
+                                    egui::Color32::from_rgb(245, 248, 255),
+                                );
                             }
                             AnnotationKind::Dimension
                             | AnnotationKind::Text
@@ -1362,6 +1508,68 @@ impl ElephantApp {
                         };
                         if let Some(sp) = world_to_screen(anchor_w, &vp_cols, rect) {
                             draw_screen_pill(&painter, sp + egui::vec2(0.0, -24.0), &text, accent);
+                        }
+                    }
+                }
+
+                if is_active && self.surface_analysis.mode != SurfaceAnalysisMode::None {
+                    let origin = rect.left_bottom() + egui::vec2(12.0, -48.0);
+                    let badge_rect = egui::Rect::from_min_size(origin, egui::vec2(165.0, 36.0));
+                    painter.rect(
+                        badge_rect,
+                        4.0,
+                        egui::Color32::from_rgba_unmultiplied(18, 22, 28, 220),
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 82, 100)),
+                    );
+                    painter.text(
+                        badge_rect.left_top() + egui::vec2(8.0, 5.0),
+                        egui::Align2::LEFT_TOP,
+                        self.surface_analysis.mode.label(),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::from_rgb(225, 232, 244),
+                    );
+                    match self.surface_analysis.mode {
+                        SurfaceAnalysisMode::GaussianCurvature
+                        | SurfaceAnalysisMode::MeanCurvature => {
+                            let stops = [
+                                egui::Color32::from_rgb(26, 64, 235),
+                                egui::Color32::from_rgb(30, 199, 230),
+                                egui::Color32::from_rgb(46, 214, 92),
+                                egui::Color32::from_rgb(245, 209, 41),
+                                egui::Color32::from_rgb(240, 46, 41),
+                            ];
+                            let x0 = badge_rect.left() + 8.0;
+                            let w = badge_rect.width() - 16.0;
+                            let y = badge_rect.bottom() - 13.0;
+                            for (s, col) in stops.iter().enumerate() {
+                                let sw = w / stops.len() as f32;
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(x0 + sw * s as f32, y),
+                                        egui::vec2(sw, 7.0),
+                                    ),
+                                    0.0,
+                                    *col,
+                                );
+                            }
+                        }
+                        SurfaceAnalysisMode::DraftAngle => {
+                            painter.text(
+                                badge_rect.left_bottom() + egui::vec2(8.0, -5.0),
+                                egui::Align2::LEFT_BOTTOM,
+                                format!("±{:.1}°: Teal OK | Yel Band | Red Undercut", self.surface_analysis.draft_angle_deg),
+                                egui::FontId::proportional(9.0),
+                                egui::Color32::from_rgb(185, 200, 220),
+                            );
+                        }
+                        _ => {
+                            painter.text(
+                                badge_rect.left_bottom() + egui::vec2(8.0, -5.0),
+                                egui::Align2::LEFT_BOTTOM,
+                                "Class-A Surface Shader Active",
+                                egui::FontId::proportional(9.5),
+                                egui::Color32::from_rgb(135, 195, 245),
+                            );
                         }
                     }
                 }

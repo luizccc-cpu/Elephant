@@ -5,8 +5,9 @@ use slotmap::SlotMap;
 
 use crate::history::{UndoAction, UndoHistory, UndoTransaction};
 use crate::layer::{Layer, LayerId};
+use crate::layout::{ClippingPlane, LayoutSheet, PageSize};
 use crate::modeling_history::{HistoryOp, HistoryRecord};
-use crate::object::{AnnotationItem, CadObject, ObjectId, ObjectStore};
+use crate::object::{AnnotationItem, AnnotationKind, CadObject, GdtSpec, ObjectId, ObjectStore};
 use crate::spatial::{SpatialEntry, SpatialIndex};
 
 /// Central Elephant CAD document holding layers, objects, selection, spatial index, and Undo/Redo.
@@ -17,11 +18,15 @@ pub struct Document {
     pub active_layer: LayerId,
     pub objects: ObjectStore,
     pub annotations: Vec<AnnotationItem>,
+    pub clipping_planes: Vec<ClippingPlane>,
+    pub layouts: Vec<LayoutSheet>,
     pub last_created: Vec<ObjectId>,
     pub record_history: bool,
     pub history_records: Vec<HistoryRecord>,
     selection_order: Vec<ObjectId>,
     next_group_id: u64,
+    next_clipping_id: u64,
+    next_layout_id: u64,
     spatial: SpatialIndex,
     history: UndoHistory,
 }
@@ -44,11 +49,15 @@ impl Document {
             active_layer,
             objects: ObjectStore::new(),
             annotations: Vec::new(),
+            clipping_planes: Vec::new(),
+            layouts: Vec::new(),
             last_created: Vec::new(),
             record_history: true,
             history_records: Vec::new(),
             selection_order: Vec::new(),
             next_group_id: 1,
+            next_clipping_id: 1,
+            next_layout_id: 1,
             spatial: SpatialIndex::default(),
             history: UndoHistory::default(),
         }
@@ -869,6 +878,91 @@ impl Document {
             .collect();
         self.spatial.rebuild(entries);
     }
+
+    pub fn ensure_next_aux_ids(&mut self) {
+        let max_c = self.clipping_planes.iter().map(|c| c.id).max().unwrap_or(0);
+        self.next_clipping_id = self.next_clipping_id.max(max_c.saturating_add(1));
+        let max_l = self.layouts.iter().map(|l| l.id).max().unwrap_or(0);
+        self.next_layout_id = self.next_layout_id.max(max_l.saturating_add(1));
+    }
+
+    pub fn add_clipping_plane(&mut self, name: impl Into<String>, plane: cad_geom::Plane) -> u64 {
+        let id = self.next_clipping_id;
+        self.next_clipping_id = self.next_clipping_id.saturating_add(1);
+        self.clipping_planes.push(ClippingPlane::new(id, name, plane));
+        id
+    }
+
+    pub fn remove_clipping_plane(&mut self, id: u64) -> bool {
+        let before = self.clipping_planes.len();
+        self.clipping_planes.retain(|c| c.id != id);
+        self.clipping_planes.len() != before
+    }
+
+    pub fn active_clipping_planes(&self) -> Vec<&ClippingPlane> {
+        self.clipping_planes.iter().filter(|c| c.enabled).collect()
+    }
+
+    pub fn add_standard_4view_layout(
+        &mut self,
+        name: Option<String>,
+        page_size: PageSize,
+    ) -> u64 {
+        let id = self.next_layout_id;
+        self.next_layout_id = self.next_layout_id.saturating_add(1);
+        let sheet_name = name.unwrap_or_else(|| format!("Sheet {id}"));
+        self.layouts
+            .push(LayoutSheet::standard_4_view(id, sheet_name, page_size));
+        id
+    }
+
+    pub fn remove_layout(&mut self, id: u64) -> bool {
+        let before = self.layouts.len();
+        self.layouts.retain(|l| l.id != id);
+        self.layouts.len() != before
+    }
+
+    pub fn add_gdt_annotation(&mut self, spec: GdtSpec, position: DVec3) {
+        let datums_joined = if spec.datums.is_empty() {
+            String::new()
+        } else {
+            format!(" | {}", spec.datums.join(" | "))
+        };
+        let dia = if spec.diameter_zone { "dia " } else { "" };
+        let text = format!(
+            "{} | {}{:.3}{}",
+            spec.symbol.short_code(),
+            dia,
+            spec.tolerance,
+            datums_joined
+        );
+        self.add_annotation(AnnotationItem {
+            kind: AnnotationKind::GdtFrame,
+            layer_id: self.active_layer,
+            color: None,
+            text,
+            position,
+            p1: None,
+            p2: None,
+            offset_pt: None,
+            gdt: Some(spec),
+        });
+    }
+
+    pub fn add_datum_annotation(&mut self, datum_label: impl Into<String>, position: DVec3) {
+        let label = datum_label.into();
+        self.add_annotation(AnnotationItem {
+            kind: AnnotationKind::DatumTag,
+            layer_id: self.active_layer,
+            color: None,
+            text: label,
+            position,
+            p1: None,
+            p2: None,
+            offset_pt: None,
+            gdt: None,
+        });
+    }
 }
 
 fn layer_effectively_visible(layers: &SlotMap<LayerId, Layer>, lid: LayerId) -> bool {
@@ -1139,5 +1233,39 @@ mod tests {
         doc.set_selected(p_id, true);
         doc.transform_selected("MoveParentAgain", &DMat4::from_translation(DVec3::new(0.0, 10.0, 0.0)));
         assert!((doc.objects[ext_id].aabb.center().y - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn clipping_planes_layouts_and_gdt_work_on_document() {
+        use crate::GdtSymbol;
+        let mut doc = Document::new();
+        let cp_id = doc.add_clipping_plane("Section Z", cad_geom::Plane::world_xy());
+        assert_eq!(doc.active_clipping_planes().len(), 1);
+        let eq = doc.clipping_planes[0].equation_f32();
+        assert!((eq[2] - 1.0).abs() < 1e-6);
+        doc.clipping_planes[0].flip = true;
+        assert!((doc.clipping_planes[0].equation_f32()[2] + 1.0).abs() < 1e-6);
+        assert!(doc.remove_clipping_plane(cp_id));
+        assert!(doc.clipping_planes.is_empty());
+
+        let lid = doc.add_standard_4view_layout(None, PageSize::A3);
+        assert_eq!(doc.layouts.len(), 1);
+        assert_eq!(doc.layouts[0].details.len(), 4);
+        assert!(doc.remove_layout(lid));
+
+        doc.add_gdt_annotation(
+            GdtSpec {
+                symbol: GdtSymbol::Position,
+                tolerance: 0.05,
+                diameter_zone: true,
+                modifier: Some("M".to_string()),
+                datums: vec!["A".to_string(), "B".to_string()],
+            },
+            DVec3::new(2.0, 3.0, 0.0),
+        );
+        doc.add_datum_annotation("A", DVec3::ZERO);
+        assert_eq!(doc.annotations.len(), 2);
+        assert_eq!(doc.annotations[0].kind, AnnotationKind::GdtFrame);
+        assert_eq!(doc.annotations[1].kind, AnnotationKind::DatumTag);
     }
 }

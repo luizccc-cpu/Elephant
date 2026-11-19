@@ -377,6 +377,7 @@ pub fn import_3dm_bytes(bytes: &[u8], doc: &mut Document) -> Result<usize, IoErr
                 p1: None,
                 p2: None,
                 offset_pt: None,
+                gdt: None,
             });
             added += 1;
         }

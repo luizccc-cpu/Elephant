@@ -12,6 +12,93 @@ pub enum AnnotationKind {
     Text,
     TextDot,
     Leader,
+    GdtFrame,
+    DatumTag,
+}
+
+/// ISO 1101 / ASME Y14.5 Geometric Dimensioning & Tolerancing (GD&T) characteristic symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GdtSymbol {
+    Flatness,
+    Straightness,
+    Circularity,
+    Cylindricity,
+    ProfileSurface,
+    ProfileLine,
+    Perpendicularity,
+    Parallelism,
+    Angularity,
+    Position,
+    Concentricity,
+    Runout,
+    TotalRunout,
+}
+
+impl GdtSymbol {
+    pub const ALL: [Self; 13] = [
+        Self::Flatness,
+        Self::Straightness,
+        Self::Circularity,
+        Self::Cylindricity,
+        Self::ProfileSurface,
+        Self::ProfileLine,
+        Self::Perpendicularity,
+        Self::Parallelism,
+        Self::Angularity,
+        Self::Position,
+        Self::Concentricity,
+        Self::Runout,
+        Self::TotalRunout,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Flatness => "Flatness",
+            Self::Straightness => "Straightness",
+            Self::Circularity => "Circularity",
+            Self::Cylindricity => "Cylindricity",
+            Self::ProfileSurface => "Profile of a Surface",
+            Self::ProfileLine => "Profile of a Line",
+            Self::Perpendicularity => "Perpendicularity",
+            Self::Parallelism => "Parallelism",
+            Self::Angularity => "Angularity",
+            Self::Position => "Position",
+            Self::Concentricity => "Concentricity",
+            Self::Runout => "Circular Runout",
+            Self::TotalRunout => "Total Runout",
+        }
+    }
+
+    pub fn short_code(self) -> &'static str {
+        match self {
+            Self::Flatness => "FLT",
+            Self::Straightness => "STR",
+            Self::Circularity => "CIR",
+            Self::Cylindricity => "CYL",
+            Self::ProfileSurface => "PRS",
+            Self::ProfileLine => "PRL",
+            Self::Perpendicularity => "PER",
+            Self::Parallelism => "PAR",
+            Self::Angularity => "ANG",
+            Self::Position => "POS",
+            Self::Concentricity => "CON",
+            Self::Runout => "RUN",
+            Self::TotalRunout => "TRU",
+        }
+    }
+}
+
+/// GD&T Feature Control Frame specification attached to a document annotation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GdtSpec {
+    pub symbol: GdtSymbol,
+    pub tolerance: f64,
+    #[serde(default)]
+    pub diameter_zone: bool,
+    #[serde(default)]
+    pub modifier: Option<String>,
+    #[serde(default)]
+    pub datums: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -24,6 +111,26 @@ pub struct AnnotationItem {
     pub p1: Option<DVec3>,
     pub p2: Option<DVec3>,
     pub offset_pt: Option<DVec3>,
+    #[serde(default)]
+    pub gdt: Option<GdtSpec>,
+}
+
+/// Per-object physically based studio material properties.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MaterialProps {
+    pub metallic: f32,
+    pub roughness: f32,
+    pub opacity: f32,
+}
+
+impl Default for MaterialProps {
+    fn default() -> Self {
+        Self {
+            metallic: 0.05,
+            roughness: 0.42,
+            opacity: 1.0,
+        }
+    }
 }
 
 /// Stable monotonic object identifier preserved across Undo/Redo delete-and-restore cycles.
@@ -43,6 +150,8 @@ pub struct CadObject {
     pub visible: bool,
     #[serde(default)]
     pub group_id: Option<u64>,
+    #[serde(default)]
+    pub material: Option<MaterialProps>,
     pub geometry: Geometry,
     pub selected: bool,
     pub aabb: Aabb,
@@ -57,6 +166,7 @@ impl CadObject {
             color: None,
             visible: true,
             group_id: None,
+            material: None,
             geometry,
             selected: false,
             aabb,

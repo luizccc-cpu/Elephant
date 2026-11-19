@@ -4,6 +4,7 @@ pub mod dxf;
 pub mod error;
 pub mod gltf;
 pub mod obj;
+pub mod pdf;
 pub mod project;
 pub mod stl;
 pub mod svg;
@@ -13,7 +14,9 @@ use std::path::Path;
 
 use cad_doc::Document;
 pub use error::IoError;
+pub use pdf::{export_layout_pdf_bytes, export_pdf_bytes};
 pub use project::ProjectMetadata;
+pub use svg::export_layout_svg_string;
 
 pub fn import_into_document(path: &Path, doc: &mut Document) -> Result<usize, IoError> {
     let ext = path
@@ -68,6 +71,11 @@ pub fn export_from_document(path: &Path, doc: &Document) -> Result<(), IoError> 
         "svg" => {
             let text = svg::export_svg_string(doc);
             std::fs::write(path, text)?;
+            Ok(())
+        }
+        "pdf" => {
+            let bytes = pdf::export_pdf_bytes(doc);
+            std::fs::write(path, bytes)?;
             Ok(())
         }
         "glb" => {

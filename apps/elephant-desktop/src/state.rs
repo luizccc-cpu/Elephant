@@ -4,14 +4,19 @@ use std::sync::Arc;
 use cad_commands::{AxisLockMode, CommandSession, InferenceGuide, SnapConfig, SnapKind};
 use cad_doc::{CadObject, Document, LayerId, ObjectId};
 use cad_geom::{
-    BRep, BoundaryLock, DVec3, Geometry, NurbsCurve, NurbsSurface, Plane, SoftTransformFalloff,
-    SubObjectRef, UnitSystem,
+    BRep, BoundaryLock, ContinuityTolerances, DVec3, Geometry, Make2DResult, MassProperties,
+    NurbsCurve, NurbsSurface, Plane, SeamContinuityReport, SoftTransformFalloff, SubObjectRef,
+    UnitSystem, analyze_brep_edge_continuity, analyze_surface_pair_continuity,
+    combine_mass_properties, compute_geometry_mass_properties,
 };
 use cad_io::{
-    ProjectMetadata, export_from_document, import_into_document, open_project_with_meta,
-    save_project_file_with_meta,
+    ProjectMetadata, export_from_document, export_layout_pdf_bytes, export_pdf_bytes,
+    import_into_document, open_project_with_meta, save_project_file_with_meta,
 };
-use cad_render::{DisplayMode, RenderScene, ViewportCamera, ViewportKind};
+use cad_render::{
+    DisplayMode, RenderScene, SurfaceAnalysisConfig, SurfaceAnalysisMode, ViewportCamera,
+    ViewportKind,
+};
 use cad_script::{DEFAULT_SAMPLE_SCRIPT, ParametricGraph};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -129,6 +134,26 @@ pub const KNOWN_COMMANDS: &[&str] = &[
     "Ghosted",
     "Technical",
     "Arctic",
+    "Rendered",
+    "Concept",
+    "Zebra",
+    "EMap",
+    "GaussianCurvature",
+    "MeanCurvature",
+    "DraftAngle",
+    "AnalysisOff",
+    "GlobalEdgeContinuity",
+    "MassProperties",
+    "ClippingPlane",
+    "ClippingPlaneFlip",
+    "ClippingPlaneToggle",
+    "Section",
+    "Make2D",
+    "Layout",
+    "ModelSpace",
+    "GdtFrame",
+    "DatumTag",
+    "ExportPDF",
     "Units",
     "AutoCPlane",
     "SmartTrack",
@@ -233,6 +258,13 @@ pub enum InspectorTab {
     Outliner,
     Properties,
     History,
+    Analyze,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceViewMode {
+    Model,
+    Layout(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +360,13 @@ pub struct ElephantApp {
     pub selected_cps: Vec<(ObjectId, usize)>,
     pub selected_subobjects: Vec<(ObjectId, SubObjectRef)>,
     pub show_naked_edges: bool,
+    pub show_non_manifold_edges: bool,
+    pub surface_analysis: SurfaceAnalysisConfig,
+    pub edge_continuity_enabled: bool,
+    pub edge_continuity_tol: ContinuityTolerances,
+    pub edge_continuity_reports: Vec<SeamContinuityReport>,
+    pub last_mass_properties: Option<MassProperties>,
+    pub material_density_g_cm3: f64,
     pub uvn_gumball_enabled: bool,
     pub uvn_normal_drag_strength: f64,
     pub soft_transform_enabled: bool,
@@ -357,6 +396,10 @@ pub struct ElephantApp {
     pub collapsed_layers: HashSet<LayerId>,
     pub new_sublayer_parent: Option<LayerId>,
     pub radial_menu_pos: Option<egui::Pos2>,
+    pub workspace_view: WorkspaceViewMode,
+    pub layout_pan: egui::Vec2,
+    pub layout_zoom: f32,
+    pub cached_layout_projections: HashMap<(u64, u64), Make2DResult>,
     pub parametric_graph: ParametricGraph,
     pub script_source: String,
     pub rescale_on_unit_change: bool,
@@ -368,6 +411,8 @@ pub struct ElephantApp {
     pub grids_dirty: bool,
     pub cached_overlay: Option<Arc<RenderScene>>,
     pub overlay_version: u64,
+    pub cached_clipping_overlay: Option<Arc<RenderScene>>,
+    pub clipping_overlay_version: u64,
 }
 
 impl ElephantApp {
@@ -396,6 +441,13 @@ impl ElephantApp {
             selected_cps: Vec::new(),
             selected_subobjects: Vec::new(),
             show_naked_edges: false,
+            show_non_manifold_edges: false,
+            surface_analysis: SurfaceAnalysisConfig::default(),
+            edge_continuity_enabled: false,
+            edge_continuity_tol: ContinuityTolerances::default(),
+            edge_continuity_reports: Vec::new(),
+            last_mass_properties: None,
+            material_density_g_cm3: 2.70,
             uvn_gumball_enabled: true,
             uvn_normal_drag_strength: 0.35,
             soft_transform_enabled: false,
@@ -428,6 +480,10 @@ impl ElephantApp {
             collapsed_layers: HashSet::new(),
             new_sublayer_parent: None,
             radial_menu_pos: None,
+            workspace_view: WorkspaceViewMode::Model,
+            layout_pan: egui::Vec2::ZERO,
+            layout_zoom: 1.0,
+            cached_layout_projections: HashMap::new(),
             parametric_graph: ParametricGraph::default(),
             script_source: DEFAULT_SAMPLE_SCRIPT.to_string(),
             rescale_on_unit_change: true,
@@ -439,6 +495,8 @@ impl ElephantApp {
             grids_dirty: true,
             cached_overlay: None,
             overlay_version: 0,
+            cached_clipping_overlay: None,
+            clipping_overlay_version: 0,
         };
         app.populate_starter_scene();
         app
@@ -726,6 +784,7 @@ impl ElephantApp {
             .add_filter("glTF Binary (.glb)", &["glb"])
             .add_filter("AutoCAD DXF (.dxf)", &["dxf"])
             .add_filter("Scalable Vector Graphics (.svg)", &["svg"])
+            .add_filter("Vector PDF 1.4 (.pdf)", &["pdf"])
             .set_file_name("export.obj")
             .save_file()
         {
@@ -736,17 +795,134 @@ impl ElephantApp {
         }
     }
 
+    pub fn export_pdf_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Vector PDF 1.4 (.pdf)", &["pdf"])
+            .set_file_name("drawing.pdf")
+            .save_file()
+        {
+            let bytes = match self.workspace_view {
+                WorkspaceViewMode::Layout(lid) => {
+                    if let Some(sheet) = self.doc.layouts.iter().find(|l| l.id == lid) {
+                        export_layout_pdf_bytes(&self.doc, sheet)
+                    } else {
+                        export_pdf_bytes(&self.doc)
+                    }
+                }
+                WorkspaceViewMode::Model => export_pdf_bytes(&self.doc),
+            };
+            match std::fs::write(&path, bytes) {
+                Ok(()) => self.log(format!("Exported Vector PDF {}", path.display())),
+                Err(e) => self.log(format!("PDF export failed: {e}")),
+            }
+        }
+    }
+
+    pub fn recompute_edge_continuity(&mut self) {
+        let mut reports = Vec::new();
+        let mut surfaces: Vec<(String, &NurbsSurface)> = Vec::new();
+        for (oid, obj) in &self.doc.objects {
+            if !obj.visible || !self.doc.is_layer_effectively_visible(obj.layer_id) {
+                continue;
+            }
+            match &obj.geometry {
+                Geometry::BRep(brep) => {
+                    reports.extend(analyze_brep_edge_continuity(
+                        brep,
+                        self.edge_continuity_tol,
+                        7,
+                    ));
+                }
+                Geometry::Surface(srf) => {
+                    let label = obj
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("Srf#{}", oid.0));
+                    surfaces.push((label, srf));
+                }
+                _ => {}
+            }
+        }
+        for i in 0..surfaces.len() {
+            for j in (i + 1)..surfaces.len() {
+                if let Some(rep) = analyze_surface_pair_continuity(
+                    &surfaces[i].0,
+                    surfaces[i].1,
+                    &surfaces[j].0,
+                    surfaces[j].1,
+                    self.edge_continuity_tol,
+                    7,
+                ) {
+                    reports.push(rep);
+                }
+            }
+        }
+        self.edge_continuity_reports = reports;
+    }
+
+    pub fn recompute_mass_properties(&mut self) {
+        let selected: Vec<_> = self
+            .doc
+            .objects
+            .values()
+            .filter(|o| o.selected && o.visible && self.doc.is_layer_effectively_visible(o.layer_id))
+            .filter_map(|o| compute_geometry_mass_properties(&o.geometry))
+            .collect();
+        if !selected.is_empty() {
+            self.last_mass_properties = Some(combine_mass_properties(&selected));
+            return;
+        }
+        let all_visible: Vec<_> = self
+            .doc
+            .objects
+            .values()
+            .filter(|o| o.visible && self.doc.is_layer_effectively_visible(o.layer_id))
+            .filter_map(|o| compute_geometry_mass_properties(&o.geometry))
+            .collect();
+        self.last_mass_properties = if all_visible.is_empty() {
+            None
+        } else {
+            Some(combine_mass_properties(&all_visible))
+        };
+    }
+
     pub fn ensure_render_caches(&mut self) {
+        let doc_was_dirty = self.doc_dirty;
+        let needs_curv = matches!(
+            self.surface_analysis.mode,
+            SurfaceAnalysisMode::GaussianCurvature | SurfaceAnalysisMode::MeanCurvature
+        );
         if self.doc_dirty {
             self.doc_version = self.doc_version.wrapping_add(1).max(1);
             self.cached_doc_scenes.clear();
+            self.cached_layout_projections.clear();
             self.doc_dirty = false;
         }
         for cam in &self.cameras {
             let mode = cam.display_mode;
             if !self.cached_doc_scenes.contains_key(&mode) {
-                let built = RenderScene::build_document(&self.doc, mode, self.doc_version);
+                let built = RenderScene::build_document_with_options(
+                    &self.doc,
+                    mode,
+                    self.doc_version,
+                    needs_curv,
+                );
                 self.cached_doc_scenes.insert(mode, Arc::new(built));
+            }
+        }
+
+        if doc_was_dirty || (self.cached_clipping_overlay.is_some() && self.doc.clipping_planes.is_empty()) {
+            if self.doc.clipping_planes.iter().any(|c| c.enabled) {
+                self.clipping_overlay_version = self.clipping_overlay_version.wrapping_add(1).max(1);
+                self.cached_clipping_overlay = Some(Arc::new(RenderScene::build_clipping_overlay(
+                    &self.doc,
+                    self.clipping_overlay_version,
+                )));
+            } else {
+                self.cached_clipping_overlay = None;
+            }
+            if self.edge_continuity_enabled && doc_was_dirty {
+                self.recompute_edge_continuity();
             }
         }
 

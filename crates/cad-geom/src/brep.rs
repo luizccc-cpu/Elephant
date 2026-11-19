@@ -190,8 +190,13 @@ impl BRepFace {
 
     /// Conformal watertight display tessellation handling holes and curved trimmed surfaces.
     pub fn tessellate_display(&self) -> TriangleMesh {
+        self.tessellate_display_with_uv().0
+    }
+
+    /// Conformal watertight display tessellation paired with per-vertex `(u, v)` surface parameters.
+    pub fn tessellate_display_with_uv(&self) -> (TriangleMesh, Vec<[f64; 2]>) {
         if !self.is_trimmed() {
-            let mut mesh = self.surface.tessellate_display();
+            let (mut mesh, uvs) = self.surface.tessellate_display_with_uv();
             if self.orientation_reversed {
                 for tri in &mut mesh.indices {
                     tri.swap(1, 2);
@@ -200,7 +205,7 @@ impl BRepFace {
                     *n = [-n[0], -n[1], -n[2]];
                 }
             }
-            return mesh;
+            return (mesh, uvs);
         }
 
         let curved = self.surface.degree_u > 1 || self.surface.degree_v > 1;
@@ -214,11 +219,14 @@ impl BRepFace {
 
         let mut outer = self.effective_outer_loop();
         if outer.len() < 3 {
-            return TriangleMesh {
-                positions: Vec::new(),
-                normals: Vec::new(),
-                indices: Vec::new(),
-            };
+            return (
+                TriangleMesh {
+                    positions: Vec::new(),
+                    normals: Vec::new(),
+                    indices: Vec::new(),
+                },
+                Vec::new(),
+            );
         }
         if curved && self.inner_loops.is_empty() {
             let mut u_min = f64::INFINITY;
@@ -259,6 +267,7 @@ impl BRepFace {
                 };
                 let mut positions = Vec::with_capacity((nu + 1) * (nv + 1));
                 let mut normals = Vec::with_capacity((nu + 1) * (nv + 1));
+                let mut uvs = Vec::with_capacity((nu + 1) * (nv + 1));
                 for iu in 0..=nu {
                     let u = u_min + du * (iu as f64 / nu as f64);
                     for iv in 0..=nv {
@@ -266,6 +275,7 @@ impl BRepFace {
                         let (p, n) = self.evaluate_point_and_normal(u, v);
                         positions.push(p.to_array());
                         normals.push(n.to_array());
+                        uvs.push([u, v]);
                     }
                 }
                 let stride = nv + 1;
@@ -285,11 +295,14 @@ impl BRepFace {
                         }
                     }
                 }
-                return TriangleMesh {
-                    positions,
-                    normals,
-                    indices,
-                };
+                return (
+                    TriangleMesh {
+                        positions,
+                        normals,
+                        indices,
+                    },
+                    uvs,
+                );
             }
         }
         if curved {
@@ -317,11 +330,14 @@ impl BRepFace {
         let (mut uv_verts, _) = merge_holes_into_outer(&outer, &mut holes);
         let mut tris = triangulate_uv_polygon(&uv_verts);
         if tris.is_empty() {
-            return TriangleMesh {
-                positions: Vec::new(),
-                normals: Vec::new(),
-                indices: Vec::new(),
-            };
+            return (
+                TriangleMesh {
+                    positions: Vec::new(),
+                    normals: Vec::new(),
+                    indices: Vec::new(),
+                },
+                Vec::new(),
+            );
         }
 
         if curved {
@@ -360,11 +376,14 @@ impl BRepFace {
             }
         }
 
-        TriangleMesh {
-            positions,
-            normals,
-            indices,
-        }
+        (
+            TriangleMesh {
+                positions,
+                normals,
+                indices,
+            },
+            uv_verts,
+        )
     }
 
     pub fn boundary_curves_3d(&self) -> Vec<NurbsCurve> {

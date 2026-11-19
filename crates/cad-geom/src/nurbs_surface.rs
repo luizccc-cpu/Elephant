@@ -427,7 +427,7 @@ impl NurbsSurface {
         }
     }
 
-    fn non_degenerate_ders(&self, u: f64, v: f64) -> SurfaceDerivatives {
+    pub fn non_degenerate_ders(&self, u: f64, v: f64) -> SurfaceDerivatives {
         let base = self.evaluate_derivatives(u, v);
         if base.du.cross(base.dv).length_squared() > 1e-16 {
             return base;
@@ -983,25 +983,90 @@ impl NurbsSurface {
             }
         }
 
-        self.tessellate_at_params(&u_params, &v_params)
+        let (mesh, _) = self.tessellate_at_params_with_uv(&u_params, &v_params);
+        mesh
     }
 
     pub fn tessellate_display(&self) -> TriangleMesh {
-        let diag = self.bounding_box().size().length().max(1.0);
-        self.tessellate_adaptive(8.0_f64.to_radians(), diag * 0.002, 2, 64)
+        self.tessellate_display_with_uv().0
     }
 
-    fn tessellate_at_params(&self, u_params: &[f64], v_params: &[f64]) -> TriangleMesh {
+    pub fn tessellate_display_with_uv(&self) -> (TriangleMesh, Vec<[f64; 2]>) {
+        let diag = self.bounding_box().size().length().max(1.0);
+        let mut u_params = seed_span_params(
+            &self.knots_u,
+            self.degree_u,
+            if self.degree_u == 1 { 1 } else { 2 },
+        );
+        let mut v_params = seed_span_params(
+            &self.knots_v,
+            self.degree_v,
+            if self.degree_v == 1 { 1 } else { 2 },
+        );
+        let max_angle_rad = 8.0_f64.to_radians();
+        let max_chord_err = diag * 0.002;
+        if self.degree_u > 1 {
+            for _ in 0..6 {
+                let probe_v = sample_probes(&self.domain_v(), 7);
+                let mut next = Vec::with_capacity(u_params.len() * 2);
+                let mut split_any = false;
+                for w in u_params.windows(2) {
+                    next.push(w[0]);
+                    if next.len() + 1 < 64
+                        && needs_split_u(self, w[0], w[1], &probe_v, max_angle_rad, max_chord_err)
+                    {
+                        next.push(0.5 * (w[0] + w[1]));
+                        split_any = true;
+                    }
+                }
+                next.push(*u_params.last().unwrap());
+                u_params = next;
+                if !split_any {
+                    break;
+                }
+            }
+        }
+        if self.degree_v > 1 {
+            for _ in 0..6 {
+                let probe_u = sample_probes(&self.domain_u(), 7);
+                let mut next = Vec::with_capacity(v_params.len() * 2);
+                let mut split_any = false;
+                for w in v_params.windows(2) {
+                    next.push(w[0]);
+                    if next.len() + 1 < 64
+                        && needs_split_v(self, w[0], w[1], &probe_u, max_angle_rad, max_chord_err)
+                    {
+                        next.push(0.5 * (w[0] + w[1]));
+                        split_any = true;
+                    }
+                }
+                next.push(*v_params.last().unwrap());
+                v_params = next;
+                if !split_any {
+                    break;
+                }
+            }
+        }
+        self.tessellate_at_params_with_uv(&u_params, &v_params)
+    }
+
+    fn tessellate_at_params_with_uv(
+        &self,
+        u_params: &[f64],
+        v_params: &[f64],
+    ) -> (TriangleMesh, Vec<[f64; 2]>) {
         let nu = u_params.len();
         let nv = v_params.len();
         let mut positions = Vec::with_capacity(nu * nv);
         let mut normals = Vec::with_capacity(nu * nv);
+        let mut uvs = Vec::with_capacity(nu * nv);
 
         for &u in u_params {
             for &v in v_params {
                 let (p, n) = self.evaluate_point_and_normal(u, v);
                 positions.push(p.to_array());
                 normals.push(n.to_array());
+                uvs.push([u, v]);
             }
         }
 
@@ -1018,11 +1083,14 @@ impl NurbsSurface {
             }
         }
 
-        TriangleMesh {
-            positions,
-            normals,
-            indices,
-        }
+        (
+            TriangleMesh {
+                positions,
+                normals,
+                indices,
+            },
+            uvs,
+        )
     }
 
     /// Tessellate the surface into a `TriangleMesh` with uniform `steps_u x steps_v` quads.
@@ -1037,7 +1105,7 @@ impl NurbsSurface {
         let v_params: Vec<f64> = (0..=sv)
             .map(|iv| v0 + (v1 - v0) * (iv as f64 / sv as f64))
             .collect();
-        self.tessellate_at_params(&u_params, &v_params)
+        self.tessellate_at_params_with_uv(&u_params, &v_params).0
     }
 
     pub fn bounding_box(&self) -> Aabb {

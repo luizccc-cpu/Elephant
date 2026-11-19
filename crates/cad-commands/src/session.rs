@@ -1454,6 +1454,7 @@ impl CommandSession {
                         p1: Some(a),
                         p2: Some(b),
                         offset_pt: Some(pt),
+                        gdt: None,
                     });
                     self.tool = ActiveTool::Idle;
                     CommandOutcome::done(format!("Created Dimension: {text}"))
@@ -1470,6 +1471,7 @@ impl CommandSession {
                     p1: None,
                     p2: None,
                     offset_pt: None,
+                    gdt: None,
                 });
                 self.tool = ActiveTool::Idle;
                 CommandOutcome::done(format!("Created TextDot '{text}'."))

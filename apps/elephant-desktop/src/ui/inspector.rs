@@ -1,7 +1,9 @@
-use cad_doc::HistoryOp;
+use cad_doc::{HistoryOp, MaterialProps};
 use cad_geom::{
-    BoundaryLock, Continuity, Geometry, LoftStyle, SoftTransformFalloff, UnitSystem,
+    BoundaryLock, Continuity, ContinuityGrade, DVec3, Geometry, LoftStyle, Plane,
+    SoftTransformFalloff, UnitSystem, section_geometry_with_plane,
 };
+use cad_render::SurfaceAnalysisMode;
 use eframe::egui;
 
 use crate::state::{ElephantApp, GumballAlignMode, InspectorTab};
@@ -9,9 +11,9 @@ use crate::state::{ElephantApp, GumballAlignMode, InspectorTab};
 impl ElephantApp {
     pub fn draw_inspector(&mut self, ctx: &egui::Context) {
         egui::SidePanel::right("inspector")
-            .default_width(265.0)
+            .default_width(275.0)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(
                         &mut self.inspector_tab,
                         InspectorTab::Outliner,
@@ -27,6 +29,11 @@ impl ElephantApp {
                         InspectorTab::History,
                         format!("History ({})", self.doc.history_records.len()),
                     );
+                    ui.selectable_value(
+                        &mut self.inspector_tab,
+                        InspectorTab::Analyze,
+                        "Analyze",
+                    );
                 });
                 ui.separator();
 
@@ -34,6 +41,7 @@ impl ElephantApp {
                     InspectorTab::Outliner => self.draw_inspector_outliner(ui),
                     InspectorTab::Properties => self.draw_inspector_properties(ui),
                     InspectorTab::History => self.draw_inspector_history(ui),
+                    InspectorTab::Analyze => self.draw_inspector_analyze(ui),
                 });
             });
     }
@@ -484,6 +492,51 @@ impl ElephantApp {
                 let s = obj.aabb.size();
                 ui.label(format!("Center: ({:.2}, {:.2}, {:.2})", c.x, c.y, c.z));
                 ui.label(format!("Size: ({:.2}, {:.2}, {:.2})", s.x, s.y, s.z));
+
+                ui.separator();
+                ui.strong("PBR Material");
+                let mut mat = obj.material.unwrap_or_default();
+                let mut mat_edited = false;
+                ui.horizontal(|ui| {
+                    if ui.small_button("Clay").clicked() {
+                        mat = MaterialProps { metallic: 0.0, roughness: 0.72, opacity: 1.0 };
+                        mat_edited = true;
+                    }
+                    if ui.small_button("Plastic").clicked() {
+                        mat = MaterialProps { metallic: 0.02, roughness: 0.28, opacity: 1.0 };
+                        mat_edited = true;
+                    }
+                    if ui.small_button("Metal").clicked() {
+                        mat = MaterialProps { metallic: 0.85, roughness: 0.25, opacity: 1.0 };
+                        mat_edited = true;
+                    }
+                    if ui.small_button("Chrome").clicked() {
+                        mat = MaterialProps { metallic: 1.0, roughness: 0.08, opacity: 1.0 };
+                        mat_edited = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    mat_edited |= ui
+                        .add(
+                            egui::DragValue::new(&mut mat.metallic)
+                                .speed(0.02)
+                                .range(0.0..=1.0)
+                                .prefix("Metal: "),
+                        )
+                        .changed();
+                    mat_edited |= ui
+                        .add(
+                            egui::DragValue::new(&mut mat.roughness)
+                                .speed(0.02)
+                                .range(0.05..=1.0)
+                                .prefix("Rough: "),
+                        )
+                        .changed();
+                });
+                if mat_edited {
+                    obj.material = Some(mat);
+                    prop_changed = true;
+                }
             }
             if let Some(cmd) = queued_cmd {
                 self.execute_command(cmd);
@@ -839,6 +892,408 @@ impl ElephantApp {
         if let Some(cid) = pick_child {
             self.doc.clear_selection();
             self.doc.set_selected(cid, true);
+            self.mark_doc_dirty();
+        }
+    }
+
+    fn draw_inspector_analyze(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Surface Analysis Shaders");
+        let prev_mode = self.surface_analysis.mode;
+        ui.horizontal_wrapped(|ui| {
+            for mode in SurfaceAnalysisMode::ALL {
+                let short = match mode {
+                    SurfaceAnalysisMode::None => "Off",
+                    SurfaceAnalysisMode::Zebra => "Zebra",
+                    SurfaceAnalysisMode::EnvironmentMap => "E-Map",
+                    SurfaceAnalysisMode::GaussianCurvature => "Gaussian",
+                    SurfaceAnalysisMode::MeanCurvature => "Mean",
+                    SurfaceAnalysisMode::DraftAngle => "Draft",
+                };
+                if ui
+                    .selectable_label(self.surface_analysis.mode == mode, short)
+                    .on_hover_text(mode.label())
+                    .clicked()
+                {
+                    self.surface_analysis.mode = mode;
+                }
+            }
+        });
+        let was_curv = matches!(
+            prev_mode,
+            SurfaceAnalysisMode::GaussianCurvature | SurfaceAnalysisMode::MeanCurvature
+        );
+        let now_curv = matches!(
+            self.surface_analysis.mode,
+            SurfaceAnalysisMode::GaussianCurvature | SurfaceAnalysisMode::MeanCurvature
+        );
+        if prev_mode != self.surface_analysis.mode && (was_curv || now_curv) {
+            self.doc_dirty = true;
+        }
+
+        match self.surface_analysis.mode {
+            SurfaceAnalysisMode::Zebra => {
+                ui.add(
+                    egui::Slider::new(&mut self.surface_analysis.zebra_stripes, 2.0..=30.0)
+                        .text("Stripes"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.surface_analysis.zebra_angle_deg, 0.0..=180.0)
+                        .text("Angle deg"),
+                );
+            }
+            SurfaceAnalysisMode::EnvironmentMap => {
+                let names = [
+                    "0: Studio Softbox",
+                    "1: Liquid Chrome",
+                    "2: Glossy Car Paint",
+                    "3: Fluorescent Tubes",
+                ];
+                let idx = (self.surface_analysis.emap_preset as usize).min(names.len() - 1);
+                egui::ComboBox::from_label("E-Map Preset")
+                    .selected_text(names[idx])
+                    .show_ui(ui, |ui| {
+                        for (i, n) in names.iter().enumerate() {
+                            ui.selectable_value(&mut self.surface_analysis.emap_preset, i as u32, *n);
+                        }
+                    });
+            }
+            SurfaceAnalysisMode::GaussianCurvature | SurfaceAnalysisMode::MeanCurvature => {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.surface_analysis.curvature_min)
+                            .speed(0.02)
+                            .prefix("Min: "),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.surface_analysis.curvature_max)
+                            .speed(0.02)
+                            .prefix("Max: "),
+                    );
+                });
+                let (bar_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(ui.available_width(), 12.0), egui::Sense::hover());
+                let p = ui.painter_at(bar_rect);
+                let stops = [
+                    egui::Color32::from_rgb(26, 64, 235),
+                    egui::Color32::from_rgb(30, 199, 230),
+                    egui::Color32::from_rgb(46, 214, 92),
+                    egui::Color32::from_rgb(245, 209, 41),
+                    egui::Color32::from_rgb(240, 46, 41),
+                ];
+                for s in 0..stops.len() - 1 {
+                    let t0 = s as f32 / (stops.len() - 1) as f32;
+                    let t1 = (s + 1) as f32 / (stops.len() - 1) as f32;
+                    let seg = egui::Rect::from_x_y_ranges(
+                        egui::lerp(bar_rect.left()..=bar_rect.right(), t0)
+                            ..=egui::lerp(bar_rect.left()..=bar_rect.right(), t1),
+                        bar_rect.top()..=bar_rect.bottom(),
+                    );
+                    p.rect_filled(seg, 0.0, stops[s]);
+                }
+            }
+            SurfaceAnalysisMode::DraftAngle => {
+                ui.horizontal(|ui| {
+                    ui.label("Pull:");
+                    if ui.small_button("+Z").clicked() {
+                        self.surface_analysis.draft_pull_dir = DVec3::Z;
+                    }
+                    if ui.small_button("-Z").clicked() {
+                        self.surface_analysis.draft_pull_dir = DVec3::NEG_Z;
+                    }
+                    if ui.small_button("+Y").clicked() {
+                        self.surface_analysis.draft_pull_dir = DVec3::Y;
+                    }
+                    if ui.small_button("+X").clicked() {
+                        self.surface_analysis.draft_pull_dir = DVec3::X;
+                    }
+                });
+                ui.add(
+                    egui::Slider::new(&mut self.surface_analysis.draft_angle_deg, 0.5..=20.0)
+                        .text("Parting Band deg"),
+                );
+                ui.small("Blue = Positive Draft | Yellow = Parting | Red = Undercut");
+            }
+            SurfaceAnalysisMode::None => {}
+        }
+        ui.add(
+            egui::Slider::new(&mut self.surface_analysis.cavity_ao_strength, 0.0..=1.0)
+                .text("Cavity AO"),
+        );
+
+        ui.separator();
+        ui.heading("Global Edge Continuity");
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut self.edge_continuity_enabled, "Show GEC Overlay")
+                .changed()
+                && self.edge_continuity_enabled
+            {
+                self.recompute_edge_continuity();
+            }
+            if ui.small_button("Recompute").clicked() {
+                self.recompute_edge_continuity();
+                self.edge_continuity_enabled = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            let mut changed = false;
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut self.edge_continuity_tol.g0_tol)
+                        .speed(0.001)
+                        .range(1e-5..=1.0)
+                        .prefix("G0:"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut self.edge_continuity_tol.g1_tol_deg)
+                        .speed(0.1)
+                        .range(0.01..=45.0)
+                        .prefix("G1°:"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut self.edge_continuity_tol.g2_tol_rel)
+                        .speed(0.01)
+                        .range(0.001..=1.0)
+                        .prefix("G2:"),
+                )
+                .changed();
+            if changed && self.edge_continuity_enabled {
+                self.recompute_edge_continuity();
+            }
+        });
+
+        let mut counts = [0usize; 4];
+        for r in &self.edge_continuity_reports {
+            let idx = match r.grade {
+                ContinuityGrade::G2 => 0,
+                ContinuityGrade::G1 => 1,
+                ContinuityGrade::G0 => 2,
+                ContinuityGrade::Broken => 3,
+            };
+            counts[idx] += 1;
+        }
+        if !self.edge_continuity_reports.is_empty() {
+            ui.horizontal(|ui| {
+                ui.colored_label(egui::Color32::from_rgb(75, 225, 115), format!("G2:{}", counts[0]));
+                ui.colored_label(egui::Color32::from_rgb(245, 210, 65), format!("G1:{}", counts[1]));
+                ui.colored_label(egui::Color32::from_rgb(245, 145, 55), format!("G0:{}", counts[2]));
+                ui.colored_label(egui::Color32::from_rgb(245, 70, 70), format!("GAP:{}", counts[3]));
+            });
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                for r in self.edge_continuity_reports.iter().take(12) {
+                    let col = match r.grade {
+                        ContinuityGrade::G2 => egui::Color32::from_rgb(75, 225, 115),
+                        ContinuityGrade::G1 => egui::Color32::from_rgb(245, 210, 65),
+                        ContinuityGrade::G0 => egui::Color32::from_rgb(245, 145, 55),
+                        ContinuityGrade::Broken => egui::Color32::from_rgb(245, 70, 70),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.colored_label(col, r.grade.short_label());
+                        ui.small(format!(
+                            "{}: d={:.4}, {:.1}°, k={:.0}%",
+                            r.label,
+                            r.max_gap,
+                            r.max_angle_deg,
+                            r.max_curvature_diff_rel * 100.0
+                        ));
+                    });
+                }
+            });
+        } else {
+            ui.weak("No interior B-Rep or adjacent NURBS seams analyzed yet.");
+        }
+
+        ui.separator();
+        ui.heading("Edge Diagnostics");
+        let mut naked_cnt = 0usize;
+        let mut non_man_cnt = 0usize;
+        for (_, o) in &self.doc.objects {
+            if o.visible && self.doc.is_layer_effectively_visible(o.layer_id) {
+                if let Geometry::BRep(b) = &o.geometry {
+                    naked_cnt += b.naked_edges().len();
+                    non_man_cnt += b.non_manifold_edges().len();
+                }
+            }
+        }
+        ui.checkbox(
+            &mut self.show_naked_edges,
+            format!("Naked Edges ({naked_cnt})"),
+        );
+        ui.checkbox(
+            &mut self.show_non_manifold_edges,
+            format!("Non-Manifold Edges ({non_man_cnt})"),
+        );
+
+        ui.separator();
+        ui.heading("Mass Properties");
+        ui.horizontal(|ui| {
+            if ui.button("Compute Mass Props").clicked() {
+                self.recompute_mass_properties();
+            }
+            ui.add(
+                egui::DragValue::new(&mut self.material_density_g_cm3)
+                    .speed(0.05)
+                    .range(0.05..=25.0)
+                    .suffix(" g/cm3"),
+            );
+        });
+        ui.horizontal(|ui| {
+            if ui.small_button("Al 2.70").clicked() {
+                self.material_density_g_cm3 = 2.70;
+            }
+            if ui.small_button("Steel 7.85").clicked() {
+                self.material_density_g_cm3 = 7.85;
+            }
+            if ui.small_button("ABS 1.04").clicked() {
+                self.material_density_g_cm3 = 1.04;
+            }
+            if ui.small_button("Ti 4.43").clicked() {
+                self.material_density_g_cm3 = 4.43;
+            }
+        });
+        if let Some(mp) = &self.last_mass_properties {
+            let cm3_per_unit3 = (self.doc.units.scale_to(UnitSystem::Centimeters)).powi(3);
+            let mass_g = mp.volume * cm3_per_unit3 * self.material_density_g_cm3;
+            let u_lbl = self.doc.units.label();
+            ui.small(format!(
+                "Solid: {} | Area: {:.3} {u_lbl}^2",
+                if mp.is_closed_solid { "Yes" } else { "Open" },
+                mp.area
+            ));
+            ui.small(format!("Volume: {:.4} {u_lbl}^3 | Mass: {:.2} g", mp.volume, mass_g));
+            ui.small(format!(
+                "Centroid: ({:.3}, {:.3}, {:.3})",
+                mp.centroid.x, mp.centroid.y, mp.centroid.z
+            ));
+            ui.small(format!(
+                "I1..I3: ({:.2}, {:.2}, {:.2})",
+                mp.principal_moments[0], mp.principal_moments[1], mp.principal_moments[2]
+            ));
+        }
+
+        ui.separator();
+        ui.heading("Live Clipping Planes");
+        let bbox = self.doc.visible_bounding_box();
+        let center = if bbox.is_empty() {
+            DVec3::ZERO
+        } else {
+            bbox.center()
+        };
+        let span = if bbox.is_empty() {
+            16.0
+        } else {
+            (bbox.size().max_element() * 1.6).max(8.0)
+        };
+        ui.horizontal(|ui| {
+            if ui.small_button("+ Z").clicked() {
+                let mut p = Plane::world_xy();
+                p.origin = center;
+                let id = self.doc.add_clipping_plane("Clip Z", p);
+                if let Some(cp) = self.doc.clipping_planes.iter_mut().find(|c| c.id == id) {
+                    cp.size = span;
+                }
+                self.mark_doc_dirty();
+            }
+            if ui.small_button("+ X").clicked() {
+                let mut p = Plane::world_yz();
+                p.origin = center;
+                let id = self.doc.add_clipping_plane("Clip X", p);
+                if let Some(cp) = self.doc.clipping_planes.iter_mut().find(|c| c.id == id) {
+                    cp.size = span;
+                }
+                self.mark_doc_dirty();
+            }
+            if ui.small_button("+ Y").clicked() {
+                let mut p = Plane::world_zx();
+                p.origin = center;
+                let id = self.doc.add_clipping_plane("Clip Y", p);
+                if let Some(cp) = self.doc.clipping_planes.iter_mut().find(|c| c.id == id) {
+                    cp.size = span;
+                }
+                self.mark_doc_dirty();
+            }
+            if ui.small_button("+ CPlane").clicked() {
+                let p = self.cameras[self.active_viewport].cplane;
+                let id = self.doc.add_clipping_plane("Clip CP", p);
+                if let Some(cp) = self.doc.clipping_planes.iter_mut().find(|c| c.id == id) {
+                    cp.size = span;
+                }
+                self.mark_doc_dirty();
+            }
+        });
+
+        let mut remove_cp_id = None;
+        let mut bake_cp_plane: Option<Plane> = None;
+        let mut clip_changed = false;
+        for cp in &mut self.doc.clipping_planes {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut cp.enabled, &cp.name).changed() {
+                        clip_changed = true;
+                    }
+                    if ui.small_button("Flip").clicked() {
+                        cp.flip = !cp.flip;
+                        clip_changed = true;
+                    }
+                    if ui.small_button("Bake").clicked() {
+                        bake_cp_plane = Some(cp.plane);
+                    }
+                    if ui.small_button("X").clicked() {
+                        remove_cp_id = Some(cp.id);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let mut offset = cp.plane.origin.dot(cp.plane.z_axis);
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut offset)
+                                .speed(0.05)
+                                .prefix("Offset: "),
+                        )
+                        .changed()
+                    {
+                        let prev = cp.plane.origin.dot(cp.plane.z_axis);
+                        cp.plane.origin += cp.plane.z_axis * (offset - prev);
+                        clip_changed = true;
+                    }
+                    if ui.checkbox(&mut cp.fill_caps, "Section Cut").changed() {
+                        clip_changed = true;
+                    }
+                });
+            });
+        }
+        if let Some(id) = remove_cp_id {
+            self.doc.remove_clipping_plane(id);
+            clip_changed = true;
+        }
+        if let Some(plane) = bake_cp_plane {
+            let mut added = 0usize;
+            let objs: Vec<_> = self
+                .doc
+                .objects
+                .values()
+                .filter(|o| o.visible && self.doc.is_layer_effectively_visible(o.layer_id))
+                .map(|o| (o.layer_id, o.geometry.clone()))
+                .collect();
+            for (lid, geom) in objs {
+                for poly in section_geometry_with_plane(&geom, &plane) {
+                    if let Ok(c) = cad_geom::NurbsCurve::polyline(&poly) {
+                        self.doc
+                            .add_object_on_layer("SectionCut", lid, Geometry::Curve(c));
+                        added += 1;
+                    }
+                }
+            }
+            if added > 0 {
+                self.mark_scene_dirty();
+            }
+            self.log(format!("Baked {added} section cut curve(s)."));
+        }
+        if clip_changed {
             self.mark_doc_dirty();
         }
     }

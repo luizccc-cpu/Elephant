@@ -1,4 +1,5 @@
 pub mod inspector;
+pub mod layout_view;
 pub mod radial_menu;
 pub mod status_bar;
 pub mod tool_palette;
@@ -8,7 +9,7 @@ pub mod top_bar;
 use cad_commands::AxisLockMode;
 use eframe::egui;
 
-use crate::state::ElephantApp;
+use crate::state::{ElephantApp, WorkspaceViewMode};
 
 impl eframe::App for ElephantApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -79,45 +80,76 @@ impl eframe::App for ElephantApp {
         self.draw_tools_panel(ctx);
         self.draw_tool_palette(ctx);
 
+        egui::TopBottomPanel::bottom("sheet_tabs")
+            .exact_height(24.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let is_model = matches!(self.workspace_view, WorkspaceViewMode::Model);
+                    if ui.selectable_label(is_model, "Model").clicked() {
+                        self.workspace_view = WorkspaceViewMode::Model;
+                    }
+                    let layouts: Vec<(u64, String)> =
+                        self.doc.layouts.iter().map(|l| (l.id, l.name.clone())).collect();
+                    for (lid, lname) in layouts {
+                        let active = self.workspace_view == WorkspaceViewMode::Layout(lid);
+                        if ui.selectable_label(active, lname).clicked() {
+                            self.workspace_view = WorkspaceViewMode::Layout(lid);
+                        }
+                    }
+                    if ui.small_button("+ Layout").clicked() {
+                        let lid = self
+                            .doc
+                            .add_standard_4view_layout(None, cad_doc::PageSize::A3);
+                        self.workspace_view = WorkspaceViewMode::Layout(lid);
+                        self.cached_layout_projections.clear();
+                    }
+                });
+            });
+
         self.ensure_render_caches();
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::from_rgb(28, 30, 34)))
-            .show(ctx, |ui| {
-                if let Some(max_idx) = self.maximized_viewport {
-                    self.draw_viewport(ui, max_idx);
-                } else {
-                    ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
-                    let avail = ui.available_size();
-                    let half_w = (avail.x - 2.0).max(32.0) * 0.5;
-                    let half_h = (avail.y - 2.0).max(32.0) * 0.5;
+            .show(ctx, |ui| match self.workspace_view {
+                WorkspaceViewMode::Layout(lid) => {
+                    self.draw_layout_view(ui, lid);
+                }
+                WorkspaceViewMode::Model => {
+                    if let Some(max_idx) = self.maximized_viewport {
+                        self.draw_viewport(ui, max_idx);
+                    } else {
+                        ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                        let avail = ui.available_size();
+                        let half_w = (avail.x - 2.0).max(32.0) * 0.5;
+                        let half_h = (avail.y - 2.0).max(32.0) * 0.5;
 
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(half_w, half_h),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| self.draw_viewport(ui, 0),
-                            );
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(half_w, half_h),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| self.draw_viewport(ui, 1),
-                            );
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(half_w, half_h),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| self.draw_viewport(ui, 0),
+                                );
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(half_w, half_h),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| self.draw_viewport(ui, 1),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(half_w, half_h),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| self.draw_viewport(ui, 2),
+                                );
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(half_w, half_h),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| self.draw_viewport(ui, 3),
+                                );
+                            });
                         });
-                        ui.horizontal(|ui| {
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(half_w, half_h),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| self.draw_viewport(ui, 2),
-                            );
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(half_w, half_h),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| self.draw_viewport(ui, 3),
-                            );
-                        });
-                    });
+                    }
                 }
             });
 

@@ -216,8 +216,55 @@ impl ElephantApp {
                     }
                 });
                 ui.menu_button("Annotate", |ui| {
-                    for cmd in ["Dim", "TextDot", "Text"] {
+                    for cmd in ["Dim", "TextDot", "Text", "GdtFrame", "DatumTag"] {
                         if ui.button(cmd).clicked() {
+                            self.execute_command(cmd);
+                            ui.close_menu();
+                        }
+                    }
+                });
+                ui.menu_button("Analyze", |ui| {
+                    for (lbl, cmd) in [
+                        ("Zebra Analysis", "Zebra"),
+                        ("Environment Map (E-Map)", "EMap"),
+                        ("Gaussian Curvature", "GaussianCurvature"),
+                        ("Mean Curvature", "MeanCurvature"),
+                        ("Draft Angle", "DraftAngle"),
+                        ("Turn Analysis Off", "AnalysisOff"),
+                    ] {
+                        if ui.button(lbl).clicked() {
+                            self.execute_command(cmd);
+                            ui.close_menu();
+                        }
+                    }
+                    ui.separator();
+                    for (lbl, cmd) in [
+                        ("Global Edge Continuity", "GlobalEdgeContinuity"),
+                        ("Show Naked Edges", "ShowEdges"),
+                        ("Mass Properties", "MassProperties"),
+                    ] {
+                        if ui.button(lbl).clicked() {
+                            self.execute_command(cmd);
+                            ui.close_menu();
+                        }
+                    }
+                    ui.separator();
+                    for (lbl, cmd) in [
+                        ("Add Clipping Plane", "ClippingPlane"),
+                        ("Bake Section Cut", "Section"),
+                    ] {
+                        if ui.button(lbl).clicked() {
+                            self.execute_command(cmd);
+                            ui.close_menu();
+                        }
+                    }
+                    ui.separator();
+                    for (lbl, cmd) in [
+                        ("Make2D (Active View)", "Make2D"),
+                        ("New 4-View Layout", "Layout"),
+                        ("Export Vector PDF", "ExportPDF"),
+                    ] {
+                        if ui.button(lbl).clicked() {
                             self.execute_command(cmd);
                             ui.close_menu();
                         }

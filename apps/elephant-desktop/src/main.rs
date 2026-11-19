@@ -17,6 +17,7 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([800.0, 540.0]),
         renderer: eframe::Renderer::Wgpu,
         depth_buffer: 32,
+        multisampling: 4,
         ..Default::default()
     };
 
@@ -29,6 +30,7 @@ fn main() -> eframe::Result<()> {
                     &wgpu_state.device,
                     wgpu_state.target_format,
                     Some(eframe::egui_wgpu::wgpu::TextureFormat::Depth32Float),
+                    4,
                 );
                 wgpu_state
                     .renderer
